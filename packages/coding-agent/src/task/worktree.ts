@@ -6,7 +6,7 @@ import * as path from "node:path";
 import type { VcsCommitAuthor, VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { formatBytes, getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { formatBytes, getWorktreeDir, isEnoent, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { SettingValueOf } from "../config/registry";
 
 import { withRepoLock } from "../utils/repo-lock";
@@ -581,13 +581,18 @@ export function formatIsolationBackend(backend: IsoBackendKind): Exclude<Isolati
 
 /**
  * Run a new linked worktree's `post-checkout` hook, as `git worktree add` does.
- * Returns undefined on success, else the exit status and the hook's last output line.
+ * Returns undefined on success, else the exit status and the hook's last output line,
+ * sanitized for display. Aborting `signal` stops the hook and rejects.
  */
-export async function runWorktreeCheckoutHook(worktreeRoot: string, head: string): Promise<string | undefined> {
-	const hook = await vcs.runPostCheckoutHook(worktreeRoot, head);
+export async function runWorktreeCheckoutHook(
+	worktreeRoot: string,
+	head: string,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	const hook = await vcs.runPostCheckoutHook(worktreeRoot, head, signal);
 	if (hook.exitCode === 0) return undefined;
 	const decoder = new TextDecoder();
-	const output = `${decoder.decode(hook.stdout)}\n${decoder.decode(hook.stderr)}`.trim();
+	const output = sanitizeText(`${decoder.decode(hook.stdout)}\n${decoder.decode(hook.stderr)}`).trim();
 	const lastLine = output.split("\n").at(-1)?.trim();
 	return lastLine
 		? `post-checkout hook exited with ${hook.exitCode}: ${lastLine}`

@@ -84,10 +84,14 @@ export declare function detachGitDir(
 /** Preserve isolation-local Git objects in the source without changing its refs or index. */
 export declare function copyGitObjects(isolationRoot: string, sourceRoot: string): Promise<void>;
 
-/** Run Git's checkout hook in a new linked worktree and return its output and exit status. */
+/**
+ * Run Git's checkout hook in a new linked worktree and return its output and exit status.
+ * Aborting `signal` kills the hook's process group and rejects with the abort reason.
+ */
 export declare function runPostCheckoutHook(
 	worktreeRoot: string,
 	head: string,
+	signal?: AbortSignal,
 ): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array }>;
 
 /** Join patch fragments, preserving each part's trailing newline. */

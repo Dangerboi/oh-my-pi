@@ -516,7 +516,7 @@ export async function checkoutPullRequest(
 					});
 				}
 				const head = await repository.resolveRef(`refs/heads/${localBranch}`, signal);
-				if (head) hookError = await runWorktreeCheckoutHook(finalWorktreePath, head);
+				if (head) hookError = await runWorktreeCheckoutHook(finalWorktreePath, head, signal);
 			}
 			const resolvedWorktreePath = await fs.realpath(finalWorktreePath);
 

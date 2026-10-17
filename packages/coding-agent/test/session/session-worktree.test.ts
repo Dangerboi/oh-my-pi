@@ -16,6 +16,7 @@ import {
 	type SessionWorktreeState,
 	type WorktreeExitAction,
 } from "../../src/session/session-worktree";
+import { runWorktreeCheckoutHook } from "../../src/task/worktree";
 
 const clean: SessionWorktreeState = { dirty: false, moved: false, offBranch: false };
 
@@ -306,12 +307,35 @@ describe("session worktree helpers (real git)", () => {
 			expect(wt.hookError).toBeUndefined();
 		});
 
-		it("keeps the worktree and reports a failing hook", async () => {
-			await hook("echo setup-failed >&2; exit 17");
+		it("keeps the worktree and reports a failing hook without terminal escapes", async () => {
+			await hook("printf '\\033[31msetup-failed\\033[0m\\n' >&2; exit 17");
 			const wt = await create();
 
 			expect(worktreePaths(repo)).toContain(wt.path);
 			expect(wt.hookError).toBe("post-checkout hook exited with 17: setup-failed");
+		});
+
+		it("abort rejects promptly and kills what the hook spawned", async () => {
+			const wt = await create();
+			const ready = path.join(root, "hook-ready");
+			expect(Bun.spawnSync(["mkfifo", ready]).exitCode).toBe(0);
+			// The background sleep keeps the hook's pipes open, so only a process-group kill plus the race returns early.
+			await hook(`sleep 30 &\necho $! > "${ready}"\nwait`);
+			const controller = new AbortController();
+			const pending = runWorktreeCheckoutHook(wt.path, wt.baseCommit, controller.signal);
+			const sleeper = Number((await fs.readFile(ready, "utf8")).trim());
+			try {
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+				const state = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(sleeper)])
+					.stdout.toString()
+					.trim();
+				expect(state === "" || state.startsWith("Z")).toBe(true);
+			} finally {
+				try {
+					process.kill(sleeper, "SIGKILL");
+				} catch {}
+			}
 		});
 	});
 });

@@ -1,4 +1,3 @@
-import { $ } from "bun";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadNative } from "./loader-state.js";
@@ -151,15 +150,44 @@ export async function copyGitObjects(isolationRoot, sourceRoot) {
 
 /**
  * Run Git's checkout hook in a newly created linked worktree, using the same
- * null old HEAD and branch-switch flag as `git worktree add`.
+ * null old HEAD and branch-switch flag as `git worktree add`. Aborting
+ * `signal` kills the hook's whole process group and rejects with the reason.
  */
-export async function runPostCheckoutHook(worktreeRoot, head) {
+export async function runPostCheckoutHook(worktreeRoot, head, signal) {
+	signal?.throwIfAborted();
 	const nullOid = "0".repeat(head.length);
-	const result = await $`git hook run --ignore-missing post-checkout -- ${nullOid} ${head} 1`
-		.cwd(worktreeRoot)
-		.quiet()
-		.nothrow();
-	return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+	// With a signal, own process group (setsid) so an abort also stops what the hook spawned, e.g. `npm install`.
+	const killGroup = signal !== undefined && process.platform !== "win32";
+	const child = Bun.spawn(["git", "hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
+		cwd: worktreeRoot,
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		detached: killGroup,
+	});
+	const done = Promise.all([new Response(child.stdout).bytes(), new Response(child.stderr).bytes(), child.exited]);
+	if (!signal) {
+		const [stdout, stderr, exitCode] = await done;
+		return { exitCode, stdout, stderr };
+	}
+	const aborted = Promise.withResolvers();
+	const onAbort = () => {
+		try {
+			if (killGroup) process.kill(-child.pid, "SIGKILL");
+			else child.kill();
+		} catch {
+			// Already exited.
+		}
+		aborted.reject(signal.reason);
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		// Race so a descendant still holding the pipes cannot keep the caller waiting.
+		const [stdout, stderr, exitCode] = await Promise.race([done, aborted.promise]);
+		return { exitCode, stdout, stderr };
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
 }
 
 /** Join patch fragments, preserving each part's trailing newline. */
