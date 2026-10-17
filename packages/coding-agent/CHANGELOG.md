@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `/wt` and `github` `pr_checkout` now run the new worktree's `post-checkout` hook, like `git worktree add`; a failing hook keeps the worktree and shows a warning
+
 ## [18.12.1] - 2026-10-17
 
 ### Breaking Changes

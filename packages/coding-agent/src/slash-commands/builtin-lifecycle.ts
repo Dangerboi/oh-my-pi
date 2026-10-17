@@ -753,6 +753,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					`Warning: Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`,
 				);
 			}
+			if (worktree.hookError) await runtime.output(`Warning: Worktree created, but ${worktree.hookError}`);
 			await runtime.output(formatSessionWorktreeSummary(worktree, cleanup.cleaned));
 			return commandConsumed();
 		},

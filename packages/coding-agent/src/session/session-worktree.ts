@@ -15,7 +15,7 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreeDir, hashPath, logger } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { Settings } from "../config/settings";
-import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+import { formatIsolationBackend, parseIsolationBackend, runWorktreeCheckoutHook } from "../task/worktree";
 import { resolveAvailableWorktreePath } from "../tools/gh-pr-checkout";
 
 import { cfgIsolationBackend, cfgWorktreeCleanSource, cfgWorktreeClone } from "../task/settings";
@@ -29,6 +29,8 @@ export interface SessionWorktree {
 	clonedWith?: IsoBackendKind;
 	/** Why the clone fell back to a plain checkout, when it did. */
 	cloneError?: string;
+	/** Why the worktree's `post-checkout` hook failed, when it did; the worktree is kept, as with `git worktree add`. */
+	hookError?: string;
 	/** Checkout the worktree was forked from. */
 	sourceCwd: string;
 	/** Source `HEAD` the worktree branch was created at. */
@@ -153,11 +155,13 @@ export async function createSessionWorktree(
 		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
 		keepChanges,
 	});
+	const hookError = await runWorktreeCheckoutHook(worktreePath, baseCommit);
 	return {
 		path: await fs.realpath(worktreePath),
 		branch,
 		clonedWith: result.clonedWith ?? undefined,
 		cloneError: result.cloneError ?? undefined,
+		hookError,
 		sourceCwd: cwd,
 		baseCommit,
 		keptChanges: keepChanges,

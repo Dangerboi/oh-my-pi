@@ -579,6 +579,21 @@ export function formatIsolationBackend(backend: IsoBackendKind): Exclude<Isolati
 	}
 }
 
+/**
+ * Run a new linked worktree's `post-checkout` hook, as `git worktree add` does.
+ * Returns undefined on success, else the exit status and the hook's last output line.
+ */
+export async function runWorktreeCheckoutHook(worktreeRoot: string, head: string): Promise<string | undefined> {
+	const hook = await vcs.runPostCheckoutHook(worktreeRoot, head);
+	if (hook.exitCode === 0) return undefined;
+	const decoder = new TextDecoder();
+	const output = `${decoder.decode(hook.stdout)}\n${decoder.decode(hook.stderr)}`.trim();
+	const lastLine = output.split("\n").at(-1)?.trim();
+	return lastLine
+		? `post-checkout hook exited with ${hook.exitCode}: ${lastLine}`
+		: `post-checkout hook exited with ${hook.exitCode}`;
+}
+
 export interface IsolationHandle {
 	/** Merged view materialised by the backend; pass this to the task. */
 	mergedDir: string;

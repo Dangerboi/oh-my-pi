@@ -288,4 +288,30 @@ describe("session worktree helpers (real git)", () => {
 		expect(messages).toEqual([`Failed to remove worktree ${wt.path}; branch '${branch}' kept.`]);
 		expect(branchSha(repo, branch)).toBe(wt.baseCommit);
 	});
+
+	describe.skipIf(process.platform === "win32")("post-checkout hook", () => {
+		const hook = async (script: string) => {
+			const hooks = path.join(repo, ".git", "hooks");
+			git(repo, "config", "core.hooksPath", hooks);
+			await Bun.write(path.join(hooks, "post-checkout"), `#!/bin/sh\n${script}\n`);
+			await fs.chmod(path.join(hooks, "post-checkout"), 0o755);
+		};
+
+		it("runs in the new worktree with git's new-worktree arguments", async () => {
+			await hook('printf "%s\\n" "$PWD" "$1" "$2" "$3" > .post-checkout-ran');
+			const wt = await create();
+			const marker = (await Bun.file(path.join(wt.path, ".post-checkout-ran")).text()).trim().split("\n");
+
+			expect(marker).toEqual([wt.path, "0".repeat(wt.baseCommit.length), wt.baseCommit, "1"]);
+			expect(wt.hookError).toBeUndefined();
+		});
+
+		it("keeps the worktree and reports a failing hook", async () => {
+			await hook("echo setup-failed >&2; exit 17");
+			const wt = await create();
+
+			expect(worktreePaths(repo)).toContain(wt.path);
+			expect(wt.hookError).toBe("post-checkout hook exited with 17: setup-failed");
+		});
+	});
 });

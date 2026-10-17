@@ -1171,6 +1171,13 @@ describe("github tool", () => {
 					sshUrl: fixture.forkBare,
 					url: fixture.forkBare,
 				});
+			const runsHooks = process.platform !== "win32";
+			if (runsHooks) {
+				const hooks = path.join(fixture.baseDir, "hooks");
+				await Bun.write(path.join(hooks, "post-checkout"), '#!/bin/sh\necho "$2" > .post-checkout-ran\n');
+				await fs.chmod(path.join(hooks, "post-checkout"), 0o755);
+				runGit(fixture.repoRoot, ["config", "core.hooksPath", hooks]);
+			}
 
 			const tool = new GithubTool(createSession(fixture.repoRoot));
 			const result = await tool.execute("pr-checkout", { op: "pr_checkout", pr: "123" });
@@ -1191,6 +1198,11 @@ describe("github tool", () => {
 				.map(line => normalizePathForComparison(line.slice("worktree ".length)));
 			expect(listedWorktrees).toContain(normalizePathForComparison(worktreePath));
 			expect(runGit(worktreePath, ["branch", "--show-current"])).toBe("pr-123");
+			if (runsHooks) {
+				expect((await Bun.file(path.join(worktreePath, ".post-checkout-ran")).text()).trim()).toBe(
+					fixture.headRefOid,
+				);
+			}
 		});
 
 		// These assertions are non-mutating (a no-op add and rejected adds), so

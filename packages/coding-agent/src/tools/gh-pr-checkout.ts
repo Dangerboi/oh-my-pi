@@ -6,7 +6,7 @@ import type { IsoBackendKind, VcsGitRepo, VcsWorktreeEntry } from "@oh-my-pi/pi-
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreeDir, hashPath, isEnoent, logger, slugify } from "@oh-my-pi/pi-utils";
 import { github } from "../utils/github";
-import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+import { formatIsolationBackend, parseIsolationBackend, runWorktreeCheckoutHook } from "../task/worktree";
 import { withRepoLock } from "../utils/repo-lock";
 import type { ToolSession } from ".";
 import type { GhPrCheckoutSummary, GhToolDetails } from "@oh-my-pi/pi-tui/tools/github";
@@ -256,8 +256,9 @@ export function formatPrCheckoutResult(options: {
 	remoteUrl: string;
 	reused: boolean;
 	clonedWith?: IsoBackendKind;
+	hookError?: string;
 }): string {
-	const { data, localBranch, worktreePath, remoteName, remoteUrl, reused, clonedWith } = options;
+	const { data, localBranch, worktreePath, remoteName, remoteUrl, reused, clonedWith, hookError } = options;
 	const lines: string[] = [
 		reused ? `# Pull Request #${data.number ?? "?"} Worktree` : `# Checked Out Pull Request #${data.number ?? "?"}`,
 		"",
@@ -282,6 +283,7 @@ export function formatPrCheckoutResult(options: {
 			? "Reused the existing PR worktree."
 			: "Created a dedicated worktree for this PR and configured the local branch to push back to the PR head branch.",
 	);
+	if (hookError) lines.push("", `Warning: ${hookError}`);
 	return lines.join("\n").trim();
 }
 
@@ -392,6 +394,8 @@ export interface PrCheckoutOutcome {
 	headRefName: string;
 	reused: boolean;
 	clonedWith?: IsoBackendKind;
+	/** Why the new worktree's `post-checkout` hook failed, when it did. */
+	hookError?: string;
 }
 
 export async function checkoutPullRequest(
@@ -490,6 +494,7 @@ export async function checkoutPullRequest(
 
 			let finalWorktreePath = existingWorktree?.path ?? worktreePath;
 			let clonedWith: IsoBackendKind | undefined;
+			let hookError: string | undefined;
 			if (!existingWorktree) {
 				finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
 				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
@@ -510,6 +515,8 @@ export async function checkoutPullRequest(
 						error: result.cloneError,
 					});
 				}
+				const head = await repository.resolveRef(`refs/heads/${localBranch}`, signal);
+				if (head) hookError = await runWorktreeCheckoutHook(finalWorktreePath, head);
 			}
 			const resolvedWorktreePath = await fs.realpath(finalWorktreePath);
 
@@ -522,6 +529,7 @@ export async function checkoutPullRequest(
 				headRefName,
 				reused: Boolean(existingWorktree),
 				clonedWith,
+				hookError,
 			};
 		},
 		signal,
