@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `/wt` and `github` `pr_checkout` now run the new worktree's `post-checkout` hook, like `git worktree add`; a failing hook keeps the worktree and shows a warning
+- `/wt` and `github` `pr_checkout` now run the new worktree's `post-checkout` hook, like `git worktree add`; a failing hook keeps the worktree and shows a warning ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ## [18.12.1] - 2026-10-17
 
