@@ -394,7 +394,7 @@ export interface PrCheckoutOutcome {
 	headRefName: string;
 	reused: boolean;
 	clonedWith?: IsoBackendKind;
-	/** Why the new worktree's `post-checkout` hook failed, when it did. */
+	/** Why the new worktree's `post-checkout` hook failed or was skipped, when it was. */
 	hookError?: string;
 }
 

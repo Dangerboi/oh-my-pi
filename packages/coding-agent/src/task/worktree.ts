@@ -595,9 +595,10 @@ export function formatIsolationBackend(backend: IsoBackendKind): Exclude<Isolati
 
 /**
  * Run a new linked worktree's `post-checkout` hook, as `git worktree add` does, without the
- * agent's own `GIT_DIR`-family variables. Returns undefined on success, else the exit status and
- * the hook's last output line, sanitized, home-shortened and truncated for display. Aborting `signal` stops the
- * hook and rejects.
+ * agent's own `GIT_DIR`-family variables. Returns undefined on success; when the hook failed, its
+ * exit status and last output line; when git skipped it (e.g. not executable), git's hint. The
+ * line is sanitized, home-shortened and truncated for display. Aborting `signal` stops the hook
+ * and rejects.
  */
 export async function runWorktreeCheckoutHook(
 	worktreeRoot: string,
@@ -606,11 +607,19 @@ export async function runWorktreeCheckoutHook(
 ): Promise<string | undefined> {
 	const env = filterChildShellEnv(process.env);
 	const hook = await vcs.runPostCheckoutHook(worktreeRoot, head, { signal, env });
-	if (hook.exitCode === 0) return undefined;
 	const decoder = new TextDecoder();
+	const display = (line: string) =>
+		truncateToWidth(replaceTabs(shortenEmbeddedPaths(line.trim())), TRUNCATE_LENGTHS.LINE);
+	if (hook.exitCode === 0) {
+		// Git exits 0 when it skips a hook it can't run and says why in a `hint:` naming the hook.
+		// shortcut: git translates "hint:", so non-English locales get no notice; a stat of the hook path would not depend on it.
+		const hint = sanitizeText(decoder.decode(hook.stderr))
+			.split("\n")
+			.find(line => line.startsWith("hint: ") && line.includes("post-checkout"));
+		return hint ? `post-checkout hook skipped: ${display(hint.slice("hint: ".length))}` : undefined;
+	}
 	const output = sanitizeText(`${decoder.decode(hook.stdout)}\n${decoder.decode(hook.stderr)}`).trim();
-	const lastLine = output.split("\n").at(-1)?.trim() ?? "";
-	const shown = truncateToWidth(replaceTabs(shortenEmbeddedPaths(lastLine)), TRUNCATE_LENGTHS.LINE);
+	const shown = display(output.split("\n").at(-1) ?? "");
 	return shown
 		? `post-checkout hook exited with ${hook.exitCode}: ${shown}`
 		: `post-checkout hook exited with ${hook.exitCode}`;

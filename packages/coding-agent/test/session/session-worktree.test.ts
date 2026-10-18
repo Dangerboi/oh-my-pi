@@ -333,6 +333,17 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(wt.hookError).toBe("post-checkout hook exited with 17: setup failed in ~/proj");
 		});
 
+		it("reports a hook git skipped because it is not executable", async () => {
+			await hook("touch .post-checkout-ran");
+			await fs.chmod(path.join(repo, ".git", "hooks", "post-checkout"), 0o644);
+			// Repo-local, so a developer's global `advice.ignoredHook false` can't silence git's hint.
+			git(repo, "config", "advice.ignoredHook", "true");
+			const wt = await create();
+
+			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
+			expect(wt.hookError).toStartWith("post-checkout hook skipped: The '");
+		});
+
 		it("returns when the hook exits even if it left a background process running", async () => {
 			await hook("sleep 30 &\necho $! > .sleeper");
 			const wt = await create();

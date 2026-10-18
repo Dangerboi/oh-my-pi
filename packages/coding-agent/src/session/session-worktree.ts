@@ -29,7 +29,7 @@ export interface SessionWorktree {
 	clonedWith?: IsoBackendKind;
 	/** Why the clone fell back to a plain checkout, when it did. */
 	cloneError?: string;
-	/** Why the worktree's `post-checkout` hook failed, when it did; the worktree is kept, as with `git worktree add`. */
+	/** Why the worktree's `post-checkout` hook failed or was skipped, when it was; the worktree is kept, as with `git worktree add`. */
 	hookError?: string;
 	/** Checkout the worktree was forked from. */
 	sourceCwd: string;
