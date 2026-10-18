@@ -212,10 +212,19 @@ impl Mpx {
 			for index in 0..count {
 				this.check_target(target, x, y)?;
 				this.button(detail, true)?;
-				confirmed &= this.wait_raw(this.pointer_slave, Raw::ButtonPress(detail), 1)?;
-				control::wait(PRESS_HOLD)?;
-				this.button(detail, false)?;
-				confirmed &= this.wait_raw(this.pointer_slave, Raw::ButtonRelease(detail), 1)?;
+				let mut finish = || -> CoreResult<bool> {
+					let pressed = this.wait_raw(this.pointer_slave, Raw::ButtonPress(detail), 1)?;
+					control::wait(PRESS_HOLD)?;
+					this.button(detail, false)?;
+					let released = this.wait_raw(this.pointer_slave, Raw::ButtonRelease(detail), 1)?;
+					Ok(pressed && released)
+				};
+				// The last press is out: a cancel no longer cuts its click short.
+				confirmed &= if index + 1 == count {
+					control::cleanup(finish)?
+				} else {
+					finish()?
+				};
 				if index + 1 < count {
 					control::wait(CLICK_GAP)?;
 				}
@@ -248,17 +257,22 @@ impl Mpx {
 			let mut confirmed = this.wait_raw(this.pointer_slave, Raw::ButtonPress(detail), 1)?;
 			control::wait(DRAG_ARM)?;
 			this.drain();
-			for &(dx, dy) in &steps {
+			for (index, &(dx, dy)) in steps.iter().enumerate() {
 				this.motion(dx, dy)?;
-				control::wait(DRAG_STEP_DELAY)?;
+				control::sent_gap_wait(DRAG_STEP_DELAY, index + 1 == steps.len())?;
 			}
-			// The end warp must not overtake a relative step still in flight.
-			confirmed &= this.wait_raw(this.pointer_slave, Raw::Motion, steps.len())?;
-			this.warp(end.0, end.1)?;
-			control::wait(DRAG_RELEASE_SETTLE)?;
-			this.drain();
-			this.button(detail, false)?;
-			confirmed &= this.wait_raw(this.pointer_slave, Raw::ButtonRelease(detail), 1)?;
+			// Every step is out: the end and the release follow even after a
+			// cancel.
+			confirmed &= control::cleanup(|| -> CoreResult<bool> {
+				// The end warp must not overtake a relative step still in flight.
+				let moved = this.wait_raw(this.pointer_slave, Raw::Motion, steps.len())?;
+				this.warp(end.0, end.1)?;
+				control::wait(DRAG_RELEASE_SETTLE)?;
+				this.drain();
+				this.button(detail, false)?;
+				let released = this.wait_raw(this.pointer_slave, Raw::ButtonRelease(detail), 1)?;
+				Ok(moved && released)
+			})?;
 			Ok(confirmed)
 		})
 	}
@@ -287,7 +301,8 @@ impl Mpx {
 			this.drain();
 			this.check_target(target, x, y)?;
 			this.wheel(horizontal, value)?;
-			this.wait_raw(this.pointer_slave, Raw::Wheel, 1)
+			// The last detent is out: its confirmation is not cancelled.
+			control::cleanup(|| this.wait_raw(this.pointer_slave, Raw::Wheel, 1))
 		})
 	}
 
@@ -302,9 +317,12 @@ impl Mpx {
 			this.warp(x - step, y)?;
 			this.drain();
 			this.motion(i32::from(step), 0)?;
-			let confirmed = this.wait_raw(this.pointer_slave, Raw::Motion, 1)?;
-			this.warp(x, y)?;
-			Ok(confirmed)
+			// The motion is out: its confirmation and the final warp follow.
+			control::cleanup(|| {
+				let confirmed = this.wait_raw(this.pointer_slave, Raw::Motion, 1)?;
+				this.warp(x, y)?;
+				Ok(confirmed)
+			})
 		})
 	}
 
@@ -361,7 +379,7 @@ impl Mpx {
 			self.uncertain = true;
 			return Err(error);
 		}
-		control::wait(KEY_SETTLE)?;
+		control::settle(KEY_SETTLE);
 		Ok(())
 	}
 
@@ -477,7 +495,8 @@ impl Mpx {
 	}
 
 	/// Emits `steps` through the keyboard slave and waits until the server
-	/// reports the last one.
+	/// reports the last one. Once the last press is out, a cancel no longer
+	/// fails the call: the releases and the server's report follow anyway.
 	fn emit_keys(&mut self, steps: &[KeyStep]) -> CoreResult<()> {
 		self.drain();
 		self.sent = true;
@@ -486,10 +505,18 @@ impl Mpx {
 			.as_mut()
 			.ok_or_else(|| DesktopError::internal("virtual keyboard used before it was attached"))?;
 		let slave = keyboard.slave;
+		let last_press = steps.iter().rposition(|step| step.press);
+		let mut index = 0;
 		keymap::run_steps(steps, |step| {
-			keyboard.device.key(step.keycode, step.press)?;
-			control::wait(KEY_DELAY)?;
-			Ok(())
+			if index > 0 {
+				if last_press.is_none_or(|last| index > last) {
+					control::settle(KEY_DELAY);
+				} else {
+					control::wait(KEY_DELAY)?;
+				}
+			}
+			index += 1;
+			keyboard.device.key(step.keycode, step.press)
 		})?;
 		let Some(last) = steps.last() else {
 			return Ok(());
@@ -499,7 +526,7 @@ impl Mpx {
 		} else {
 			Raw::KeyRelease(last.keycode)
 		};
-		if self.wait_raw(slave, raw, 1)? {
+		if control::cleanup(|| self.wait_raw(slave, raw, 1))? {
 			Ok(())
 		} else {
 			Err(DesktopError::input_failed(format!(

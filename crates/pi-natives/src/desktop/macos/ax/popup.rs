@@ -15,7 +15,7 @@ use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
 
 use super::{
-	CoreResult, DesktopError, copy_bool, copy_elements_optional, copy_string,
+	CoreResult, DesktopError, control, copy_bool, copy_elements_optional, copy_string,
 	copy_strings_from_action_names, perform_action,
 };
 
@@ -150,6 +150,9 @@ fn open_menu(popup: &AXUIElement) -> CoreResult<Vec<CFRetained<AXUIElement>>> {
 		if !actions.iter().any(|name| name == action) {
 			continue;
 		}
+		// The probes before can block; an app the user used meanwhile is left
+		// to them ([`control::intervention::check_press`]).
+		control::intervention::check_press()?;
 		if let Err(error) = perform_action(popup, action) {
 			attempts.push(error.message);
 			continue;
@@ -200,7 +203,10 @@ fn press_option(popup: &AXUIElement, item: &AXUIElement, title: &str) -> CoreRes
 	settle_choice(
 		title,
 		(PRESSED_MENU_CLOSE_WAIT, CHOICE_SETTLE_WAIT),
-		|| perform_action(item, "AXPress"),
+		|| {
+			control::intervention::check_press()?;
+			perform_action(item, "AXPress")
+		},
 		|| {
 			if let Some(menu) = open_menu_element(popup) {
 				let _ = perform_action(&menu, "AXCancel");

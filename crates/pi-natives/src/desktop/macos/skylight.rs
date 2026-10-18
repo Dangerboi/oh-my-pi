@@ -45,9 +45,12 @@ const FOCUS_MARKER: u8 = 0x01;
 const CPS_USER_GENERATED: u32 = 0x200;
 /// `kCPSNoWindows`: changes the front process without raising its windows.
 const CPS_NO_WINDOWS: u32 = 0x400;
-/// Covers delayed AX/AppKit activation after the synchronous action returns.
-/// The lease is joined before returning; it never continues fighting the user.
-const BACKGROUND_SETTLE: Duration = Duration::from_millis(200);
+/// Covers delayed AX/AppKit activation after the synchronous action returns:
+/// its end is the action's last act on its target ([`note_send`]), so the
+/// guard watches the whole [`ACTION_REFLEX`] after it, and an app left in
+/// front then still fails the action. The lease is joined before returning;
+/// it never continues fighting the user.
+const BACKGROUND_SETTLE: Duration = ACTION_REFLEX;
 /// Upper bound on waiting for a foreground activation to become observable.
 const ACTIVATION_TIMEOUT: Duration = Duration::from_millis(400);
 const ACTIVATION_POLL: Duration = Duration::from_millis(10);
@@ -592,8 +595,29 @@ const MOUSE_BUTTON_EVENTS: [u32; 6] = [1, 2, 3, 4, 25, 26];
 /// characters on German, Polish, French and Nordic layouts, and alone it
 /// picks no app (⌥-click counts as a click).
 const SWITCH_MODIFIERS: u64 = 0x0010_0000 | 0x0004_0000;
-/// How soon after a click a reading still places it where the pointer is.
+/// How soon after a click [`ClickPlacer`] still places it where the pointer is.
 const CLICK_PLACE: Duration = Duration::from_millis(30);
+
+/// The HID counters of `MOUSE_BUTTON_EVENTS`.
+fn hid_buttons() -> [u32; 6] {
+	MOUSE_BUTTON_EVENTS.map(|event_type| {
+		// SAFETY: HIDSystemState and these public CGEventType values are
+		// defined by CGEventSource.h / CGEventTypes.h; a read-only query.
+		unsafe { CGEventSourceCounterForEventType(HID_SYSTEM_STATE, event_type) }
+	})
+}
+
+/// How long ago a mouse button last went down or up.
+fn since_last_click() -> Option<Duration> {
+	MOUSE_BUTTON_EVENTS
+		.into_iter()
+		// SAFETY: as in `hid_buttons`.
+		.map(|event_type| unsafe {
+			CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, event_type)
+		})
+		.filter_map(|seconds| Duration::try_from_secs_f64(seconds).ok())
+		.min()
+}
 
 /// What one reading sees of how the user could be switching apps. Typing,
 /// Shift and Caps Lock pick no app, so none of them appear here.
@@ -609,9 +633,8 @@ struct SwitchSignals {
 	key_focus:   Option<ProcessSerialNumber>,
 	/// When the action last acted on its target ([`note_send`]).
 	last_send:   Option<Instant>,
-	/// The latest click, read within [`CLICK_PLACE`] of it, landed on the
-	/// user's own app, by the accessibility hit-test the pointer's position
-	/// gets: menus and Dock tiles over a window count as theirs, not the
+	/// The latest click landed on the user's own app, as [`ClickPlacer`]
+	/// placed it: menus and Dock tiles over a window count as theirs, not the
 	/// window's.
 	in_user_app: bool,
 }
@@ -644,23 +667,11 @@ impl SwitchSignals {
 		Self { in_user_app: true, ..self }
 	}
 
-	/// Reads the signals at `now`; a click within [`CLICK_PLACE`] is placed by
-	/// hit-test, so one in the app of process `user` is told apart.
-	fn read(spi: &ForegroundSpi, now: Instant, user: Option<pid_t>) -> Self {
-		// SAFETY: HIDSystemState and these public CGEventType values are defined
-		// by CGEventSource.h / CGEventTypes.h; these are read-only queries.
-		let buttons = MOUSE_BUTTON_EVENTS.map(|event_type| unsafe {
-			CGEventSourceCounterForEventType(HID_SYSTEM_STATE, event_type)
-		});
-		let last_click = MOUSE_BUTTON_EVENTS
-			.into_iter()
-			// SAFETY: as above.
-			.map(|event_type| unsafe {
-				CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, event_type)
-			})
-			.filter_map(|seconds| Duration::try_from_secs_f64(seconds).ok())
-			.min()
-			.and_then(|since| now.checked_sub(since));
+	/// Reads the signals at `now`, with whether `placer` has placed the latest
+	/// click in the user's own app. Nothing here waits on an AX probe.
+	fn read(spi: &ForegroundSpi, now: Instant, placer: &ClickPlacer) -> Self {
+		let buttons = hid_buttons();
+		let last_click = since_last_click().and_then(|since| now.checked_sub(since));
 		// SAFETY: HIDSystemState is defined by CGEventSource.h; a read-only
 		// query.
 		let flags = unsafe { CGEventSourceFlagsState(HID_SYSTEM_STATE) };
@@ -671,17 +682,67 @@ impl SwitchSignals {
 			// which writes the 8-byte PSN and one status byte.
 			(unsafe { get_key_focus(&mut psn, &mut status) } == 0).then_some(psn)
 		});
-		let in_user_app = user.is_some_and(|pid| {
-			last_click.is_some_and(|at| now.saturating_duration_since(at) <= CLICK_PLACE)
-				&& pointer_over(pid)
-		});
 		let mut signals = Self::new(buttons, last_click, flags, key_focus);
-		signals.in_user_app = in_user_app;
+		signals.in_user_app = placer.in_user_app(buttons);
 		let last_send = *LAST_SEND.lock();
 		match last_send {
 			Some(at) => signals.sent_at(at),
 			None => signals,
 		}
+	}
+}
+
+/// The click that left the HID button counters at `buttons`, and whether it
+/// landed on the user's own app.
+#[derive(Clone, Copy)]
+struct ClickPlace {
+	buttons:     [u32; 6],
+	in_user_app: bool,
+}
+
+/// Places the user's clicks by the accessibility hit-test the pointer's
+/// position gets, on a thread of its own: the hit-test can block for an AX
+/// probe's half-second timeout, and the switch sampler must never wait on it.
+/// A reading the placement has not reached yet counts the click as outside
+/// the user's app; [`UserSwitchWatch`] takes that back once it arrives.
+struct ClickPlacer {
+	/// The user's app.
+	user:   Option<pid_t>,
+	latest: Mutex<Option<ClickPlace>>,
+}
+
+impl ClickPlacer {
+	const fn new(user: Option<pid_t>) -> Self {
+		Self { user, latest: Mutex::new(None) }
+	}
+
+	/// Places the latest click unless it is placed already: one within
+	/// [`CLICK_PLACE`] where the pointer is now, an older one nowhere. Blocks
+	/// for as long as the hit-test does.
+	fn place(&self) {
+		let Some(user) = self.user else {
+			return;
+		};
+		let buttons = hid_buttons();
+		if self
+			.latest
+			.lock()
+			.is_some_and(|place| place.buttons == buttons)
+		{
+			return;
+		}
+		let in_user_app =
+			since_last_click().is_some_and(|since| since <= CLICK_PLACE) && pointer_over(user);
+		*self.latest.lock() = Some(ClickPlace { buttons, in_user_app });
+	}
+
+	/// Whether the click that left the button counters at `buttons` has been
+	/// placed in the user's own app.
+	fn in_user_app(&self, buttons: [u32; 6]) -> bool {
+		self
+			.latest
+			.lock()
+			.is_some_and(|place| place.buttons == buttons && place.in_user_app)
 	}
 }
 
@@ -699,6 +760,18 @@ enum UserSwitch {
 	Panel,
 }
 
+/// Whether [`UserSwitchWatch`]'s latest button change, counted as a click
+/// outside the user's app, may still be placed in their app.
+#[derive(Clone, Copy)]
+enum ClickPlacement {
+	Settled,
+	/// [`ClickPlacer`] may place the change in the user's app only some
+	/// readings later; `previous` is the click to put back then.
+	Pending {
+		previous: Option<Instant>,
+	},
+}
+
 /// Answers "did the user switch to this app on purpose, and how?" for an
 /// action between the user's app and the `target`, whose own focus grabs are
 /// not the user's doing. It sees every reading of the switch sampler, which
@@ -706,16 +779,17 @@ enum UserSwitch {
 /// observer's polls is still seen when it happened. Clicks are timed exactly
 /// from the HID state.
 struct UserSwitchWatch {
-	user:    ProcessSerialNumber,
-	target:  ProcessSerialNumber,
-	buttons: [u32; 6],
-	click:   Option<Instant>,
-	chord:   Option<Instant>,
+	user:      ProcessSerialNumber,
+	target:    ProcessSerialNumber,
+	buttons:   [u32; 6],
+	click:     Option<Instant>,
+	placement: ClickPlacement,
+	chord:     Option<Instant>,
 	/// The other process last seen holding the keyboard, and when.
-	panel:   Option<(ProcessSerialNumber, Instant)>,
+	panel:     Option<(ProcessSerialNumber, Instant)>,
 	/// The one seen before it: Spotlight's panel, once the app picked from it
 	/// takes the keyboard a moment before `WindowServer` lists it in front.
-	before:  Option<(ProcessSerialNumber, Instant)>,
+	before:    Option<(ProcessSerialNumber, Instant)>,
 }
 
 impl UserSwitchWatch {
@@ -735,6 +809,11 @@ impl UserSwitchWatch {
 			click: signals
 				.last_click
 				.filter(|at| !signals.in_user_app && now.saturating_duration_since(*at) <= lookback),
+			placement: if signals.in_user_app {
+				ClickPlacement::Settled
+			} else {
+				ClickPlacement::Pending { previous: None }
+			},
 			chord: None,
 			panel: None,
 			before: None,
@@ -748,9 +827,17 @@ impl UserSwitchWatch {
 			self.buttons = signals.buttons;
 			// A click in the user's own app, menus included, picks no app: the
 			// target activating itself right after is still sent back.
+			self.placement = ClickPlacement::Settled;
 			if !signals.in_user_app {
+				self.placement = ClickPlacement::Pending { previous: self.click };
 				self.click = Some(signals.last_click.unwrap_or(now));
 			}
+		} else if signals.in_user_app
+			&& let ClickPlacement::Pending { previous } = self.placement
+		{
+			// Placed in the user's app after a reading had counted it.
+			self.placement = ClickPlacement::Settled;
+			self.click = previous;
 		}
 		self.observe_held(signals, front, now);
 	}
@@ -1008,12 +1095,16 @@ pub(super) fn with_background_watch<T>(
 		|| previous.pid.and_then(restoration_key),
 		|| front_process(spi.get_front),
 	)?;
+	// A click just before the action is placed before the guard starts; later
+	// ones on the placer's own thread.
+	let placer = ClickPlacer::new(previous.pid);
+	placer.place();
 	let now = Instant::now();
 	let lease = Mutex::new(BackgroundFocusLease::new(
 		previous.psn,
 		target,
 		previous_key,
-		SwitchSignals::read(spi, now, previous.pid),
+		SwitchSignals::read(spi, now, &placer),
 		now,
 	));
 	// Sends the user's keys back to their app while the target holds the
@@ -1029,7 +1120,9 @@ pub(super) fn with_background_watch<T>(
 	thread::scope(|scope| {
 		let visit = &visited;
 		let lease = &lease;
-		let desktop = WindowServerDesktop { spi, previous, key: previous_key, stopped: &stopped };
+		let placer = &placer;
+		let desktop =
+			WindowServerDesktop { spi, previous, key: previous_key, placer, stopped: &stopped };
 		let observer = thread::Builder::new()
 			.name("desktop-focus-lease".to_string())
 			.spawn_scoped(scope, move || guard_focus(lease, &desktop, visit))
@@ -1055,9 +1148,22 @@ pub(super) fn with_background_watch<T>(
 				while !stopped.load(Ordering::Acquire) {
 					let now = Instant::now();
 					if let Some(front) = front_process(spi.get_front) {
-						let signals = SwitchSignals::read(spi, now, previous.pid);
+						// The placement taken after the front app: one that has
+						// arrived meanwhile is used already.
+						let signals = SwitchSignals::read(spi, now, placer);
 						sample_switches(lease, front.psn, signals, now, visit);
 					}
+					thread::sleep(SWITCH_SAMPLE);
+				}
+			})
+			.map_err(start_failed)?;
+		// Places each click for the readings, apart from the sampler, which
+		// its AX hit-test must never hold up.
+		thread::Builder::new()
+			.name("desktop-click-placer".to_string())
+			.spawn_scoped(scope, move || {
+				while !stopped.load(Ordering::Acquire) {
+					placer.place();
 					thread::sleep(SWITCH_SAMPLE);
 				}
 			})
@@ -1069,7 +1175,7 @@ pub(super) fn with_background_watch<T>(
 				note_send();
 				result
 			},
-			|| control::wait(BACKGROUND_SETTLE),
+			BACKGROUND_SETTLE,
 		);
 		drop(stop);
 		let cleanup = observer.join().unwrap_or_else(|_| {
@@ -1110,6 +1216,7 @@ struct WindowServerDesktop<'a> {
 	previous: FrontProcess,
 	/// Its key window; `None` when it showed no window.
 	key:      Option<u32>,
+	placer:   &'a ClickPlacer,
 	stopped:  &'a AtomicBool,
 }
 
@@ -1127,7 +1234,7 @@ impl GuardedDesktop for WindowServerDesktop<'_> {
 	}
 
 	fn signals(&self, now: Instant) -> SwitchSignals {
-		SwitchSignals::read(self.spi, now, self.previous.pid)
+		SwitchSignals::read(self.spi, now, self.placer)
 	}
 
 	fn event_clock(&self) -> u64 {
@@ -1260,18 +1367,16 @@ fn guard_focus(
 }
 
 /// Runs a guarded action, then the settle during which the guard still sends
-/// back an app the action brought forward. The settle follows a failed action
-/// too: an AX action can report an error and still activate its app, as
-/// `AXOpen` on a file in Chrome's Open panel fails with -25205 within 20 ms
-/// and Chrome comes to the front some 20 ms later. The action's own error wins
-/// over the settle's.
-fn run_then_settle<T>(
-	action: impl FnOnce() -> CoreResult<T>,
-	settle: impl FnOnce() -> CoreResult<()>,
-) -> CoreResult<T> {
+/// back an app the action brought forward, or takeover still holds the front
+/// for its input. The settle follows a failed action too: an AX action can
+/// report an error and still activate its app, as `AXOpen` on a file in
+/// Chrome's Open panel fails with -25205 within 20 ms and Chrome comes to the
+/// front some 20 ms later. A cancel during the settle leaves the action's
+/// result as it was ([`control::settle`]).
+fn run_then_settle<T>(action: impl FnOnce() -> CoreResult<T>, settle: Duration) -> CoreResult<T> {
 	let result = action();
-	let settled = settle();
-	result.and_then(|value| settled.map(|()| value))
+	control::settle(settle);
+	result
 }
 
 fn set_front(spi: &ForegroundSpi, psn: ProcessSerialNumber, wid: u32) -> CoreResult<()> {
@@ -1502,7 +1607,7 @@ pub(super) fn with_foreground<T>(
 	})?;
 	let focused = ax::focused_window_id(pid);
 	if preserves_exact_existing_focus(Some(previous.psn), target, focused, wid) {
-		let result = action(false).and_then(|value| control::wait(FOREGROUND_SETTLE).map(|()| value));
+		let result = run_then_settle(|| action(false), FOREGROUND_SETTLE);
 		report_focus_return(false, previous.pid);
 		return result;
 	}
@@ -1581,7 +1686,7 @@ pub(super) fn with_foreground<T>(
 	let result = if let Err(error) = prepare {
 		after_cleanup(Err(error), control::cleanup(restore))
 	} else {
-		let result = action(true).and_then(|value| control::wait(FOREGROUND_SETTLE).map(|()| value));
+		let result = run_then_settle(|| action(true), FOREGROUND_SETTLE);
 		after_cleanup(result, control::cleanup(restore))
 	};
 	report_focus_return(handed_back.get(), previous.pid);
@@ -2362,6 +2467,27 @@ mod tests {
 	}
 
 	#[test]
+	fn a_click_placed_in_the_users_app_after_a_reading_counted_it_still_sends_the_target_back() {
+		// The click placer's AX hit-test, off the switch sampler, is still
+		// running when a reading first sees the user's click in their own app:
+		// that reading counts it as a click elsewhere. The placement arrives with
+		// the target activating itself.
+		let t0 = Instant::now();
+		let click = clicked_at(t0 + ms(5));
+		let mut guard = lease_at(t0, None);
+		assert_eq!(guard.observe(PREVIOUS, Some(42), click, t0 + ms(10)), FocusDecision::Observe);
+		let placed = click.in_user_app();
+		assert_eq!(guard.observe(TARGET, None, placed, t0 + ms(60)), FocusDecision::Restore);
+		// A click elsewhere before it still counts once it is taken back.
+		let mut guard = lease_at(t0, None);
+		let own = SwitchSignals::new([2, 2, 0, 0, 0, 0], Some(t0 + ms(40)), NO_MODIFIERS, None);
+		assert_eq!(guard.observe(PREVIOUS, Some(42), click, t0 + ms(10)), FocusDecision::Observe);
+		assert_eq!(guard.observe(PREVIOUS, Some(42), own, t0 + ms(45)), FocusDecision::Observe);
+		let placed = own.in_user_app();
+		assert_eq!(guard.observe(TARGET, None, placed, t0 + ms(60)), FocusDecision::Disarm);
+	}
+
+	#[test]
 	fn the_switch_sampler_sees_what_a_blocked_observer_misses() {
 		// The observer polls at 10 ms and next at 700 ms, after an AX probe's
 		// 0.5 s timeout; by then any switch during the stall is older than the
@@ -2502,35 +2628,48 @@ mod tests {
 	fn a_failed_action_still_settles_under_the_guard() {
 		// AXOpen in Chrome's Open panel fails with -25205, then Chrome comes
 		// forward: the guard must still be watching.
-		let mut settled = false;
+		let started = Instant::now();
 		let result: CoreResult<()> = run_then_settle(
 			|| Err(DesktopError::ax_failed("AX action 'AXOpen' failed (AXError(-25205))")),
-			|| {
-				settled = true;
-				Err(DesktopError::cancelled("stopped"))
-			},
+			BACKGROUND_SETTLE,
 		);
-		assert!(settled);
+		assert!(started.elapsed() >= BACKGROUND_SETTLE);
 		let error = result.expect_err("the action failed");
 		assert_eq!(
 			(error.code, error.message.as_str()),
 			(ErrorCode::AxFailed, "AX action 'AXOpen' failed (AXError(-25205))")
 		);
+	}
 
-		let result = run_then_settle(|| Ok(7), || Err(DesktopError::cancelled("stopped")));
-		assert_eq!(result.expect_err("the settle was cancelled").code, ErrorCode::Cancelled);
-		assert_eq!(run_then_settle(|| Ok(7), || Ok(())).ok(), Some(7));
+	#[test]
+	fn a_cancel_once_the_input_is_out_keeps_it_through_the_settle() {
+		// Escape or an abort arriving once takeover's keys are out.
+		let source = control::CancellationSource::default();
+		let token = source.token();
+		let result = control::with_token_for_test(&token, || {
+			run_then_settle(
+				|| {
+					source.cancel();
+					Ok(7)
+				},
+				FOREGROUND_SETTLE,
+			)
+		});
+		assert_eq!(result.ok(), Some(7));
+		assert!(token.check().is_err(), "the cancel still stops what follows");
 	}
 
 	/// The guard's view of a desktop where the target has just come forward over
 	/// the user's app. `WindowServer` puts the user's app back, except that the
 	/// first request is refused for input the user gives after the guard's
 	/// check, which leaves `refused_for` as the signals the next poll reads.
-	/// Polls are 10 ms apart; the action and its settle end at `end`.
+	/// Polls are 10 ms apart; an app comes forward of itself at `arrives`; the
+	/// action and its settle end at `end`.
 	struct FakeDesktop {
 		clock:       Cell<Instant>,
 		end:         Instant,
 		front:       Cell<ProcessSerialNumber>,
+		arrives:     Cell<Option<(Instant, ProcessSerialNumber)>>,
 		signals:     Cell<SwitchSignals>,
 		refused_for: Cell<Option<SwitchSignals>>,
 		hand_backs:  Cell<usize>,
@@ -2582,7 +2721,14 @@ mod tests {
 		}
 
 		fn wait(&self) {
-			self.clock.set(self.clock.get() + ACTIVATION_POLL);
+			let now = self.clock.get() + ACTIVATION_POLL;
+			self.clock.set(now);
+			if let Some((at, app)) = self.arrives.get()
+				&& now >= at
+			{
+				self.arrives.set(None);
+				self.front.set(app);
+			}
 		}
 	}
 
@@ -2598,6 +2744,7 @@ mod tests {
 				clock:       Cell::new(t0 + ms(20)),
 				end:         t0 + ms(120),
 				front:       Cell::new(TARGET),
+				arrives:     Cell::new(None),
 				signals:     Cell::new(idle),
 				refused_for: Cell::new(Some(input)),
 				hand_backs:  Cell::new(0),
@@ -2637,6 +2784,7 @@ mod tests {
 				clock:       Cell::new(t0 + ms(20)),
 				end:         t0 + ms(20),
 				front:       Cell::new(brought),
+				arrives:     Cell::new(None),
 				signals:     Cell::new(input(0, NO_MODIFIERS)),
 				refused_for: Cell::new(Some(input(0, SHIFT))),
 				hand_backs:  Cell::new(0),
@@ -2651,6 +2799,30 @@ mod tests {
 			assert!(error.message.starts_with(&names), "{}", error.message);
 			assert!(error.message.contains("still in front of app 7"), "{}", error.message);
 		}
+	}
+
+	#[test]
+	fn an_app_the_last_act_brings_forward_late_in_its_reflex_is_sent_back_before_the_guard_ends() {
+		// The action's last act on its target, Finder's ⌘O say, returns at
+		// `sent`, and `TextEdit` comes forward just inside the action reflex
+		// after it, while the guard settles.
+		let t0 = Instant::now();
+		let sent = t0 + ms(100);
+		let desktop = FakeDesktop {
+			clock:       Cell::new(sent),
+			end:         sent + BACKGROUND_SETTLE,
+			front:       Cell::new(PREVIOUS),
+			arrives:     Cell::new(Some((sent + ACTION_REFLEX - ms(10), THIRD))),
+			signals:     Cell::new(input(0, NO_MODIFIERS).sent_at(sent)),
+			refused_for: Cell::new(None),
+			hand_backs:  Cell::new(0),
+			keys:        std::cell::RefCell::default(),
+		};
+		let lease = Mutex::new(lease_at(t0, None));
+		let result = guard_focus(&lease, &desktop, &AtomicBool::new(false));
+		assert!(result.is_ok(), "the guard sent it back before it ended");
+		assert_eq!((desktop.hand_backs.get(), desktop.keys.into_inner()), (1, vec![42]));
+		assert!(desktop.front.get() == PREVIOUS, "the user's app is back in front");
 	}
 
 	#[test]

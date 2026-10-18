@@ -346,7 +346,7 @@ impl X11Input {
 		let result = body(self);
 		self.takeover_target = None;
 		let pointer_after = self.takeover_pointer.take();
-		let settled = control::wait(FOREGROUND_RESTORE_SETTLE);
+		control::settle(FOREGROUND_RESTORE_SETTLE);
 		control::cleanup(|| {
 			// A physical motion during the action is the user's new position.
 			// Keyboard-only actions never warp the pointer, even during restore.
@@ -358,7 +358,7 @@ impl X11Input {
 			}
 			self.restore_activation(window, ewmh, previous_active, previous_focus);
 		});
-		result.and_then(|value| settled.map(|()| value))
+		result
 	}
 
 	fn activate_confirmed(
@@ -490,14 +490,16 @@ impl X11Input {
 				let (root_x, root_y, event_x, event_y) = self.coordinates(window, *x, *y)?;
 				let detail = button_detail(*button);
 				let mut state = modifier_mask(*modifiers);
-				for _ in 0..(*count).max(1) {
+				let count = (*count).max(1);
+				for index in 0..count {
+					let sent = index + 1 == count;
 					control::check()?;
 					let pressed =
 						self.send_button(window, detail, true, root_x, root_y, event_x, event_y, state);
 					if let Some(mask) = button_mask(detail) {
 						state |= mask;
 					}
-					let held = pressed.and_then(|()| control::wait(CLICK_DELAY));
+					let held = pressed.and_then(|()| control::sent_gap_wait(CLICK_DELAY, sent));
 					let released = control::cleanup(|| {
 						self.send_button(window, detail, false, root_x, root_y, event_x, event_y, state)
 					});
@@ -505,7 +507,7 @@ impl X11Input {
 					if let Some(mask) = button_mask(detail) {
 						state = KeyButMask::from(u16::from(state) & !u16::from(mask));
 					}
-					control::wait(CLICK_DELAY)?;
+					control::sent_gap_wait(CLICK_DELAY, sent)?;
 				}
 			},
 			PointerEvent::Hold { x, y, button, keys, duration } => {
@@ -536,11 +538,12 @@ impl X11Input {
 				let mut last = (root_x, root_y, event_x, event_y);
 				let moved = (|| {
 					pressed?;
-					for &(x, y) in path.iter().skip(1) {
+					let final_point = path.len().saturating_sub(2);
+					for (index, &(x, y)) in path.iter().skip(1).enumerate() {
 						control::check()?;
 						last = self.coordinates(window, x, y)?;
 						self.send_motion(window, last.0, last.1, last.2, last.3, state)?;
-						control::wait(DRAG_STEP_DELAY)?;
+						control::sent_gap_wait(DRAG_STEP_DELAY, index == final_point)?;
 					}
 					Ok(())
 				})();
@@ -607,14 +610,15 @@ impl X11Input {
 				let (x, y) = validate_xtest_point(*x, *y)?;
 				self.xtest_motion(x, y)?;
 				let detail = button_detail(*button);
-				for index in 0..(*count).max(1) {
+				let count = (*count).max(1);
+				for index in 0..count {
 					if index > 0 {
 						control::wait(MULTI_CLICK_GAP)?;
 					}
 					control::check()?;
 					let pressed = self
 						.xtest_button(detail, true)
-						.and_then(|()| control::wait(CLICK_DELAY));
+						.and_then(|()| control::sent_gap_wait(CLICK_DELAY, index + 1 == count));
 					let released = control::cleanup(|| self.xtest_button(detail, false));
 					pressed.and(released)?;
 				}
@@ -640,10 +644,11 @@ impl X11Input {
 				control::check()?;
 				let dragged = (|| {
 					self.xtest_button(detail, true)?;
-					for &(x, y) in path.iter().skip(1) {
+					let final_point = path.len().saturating_sub(2);
+					for (index, &(x, y)) in path.iter().skip(1).enumerate() {
 						let (x, y) = validate_xtest_point(x, y)?;
 						self.xtest_motion(x, y)?;
-						control::wait(DRAG_STEP_DELAY)?;
+						control::sent_gap_wait(DRAG_STEP_DELAY, index == final_point)?;
 					}
 					Ok(())
 				})();
@@ -694,8 +699,9 @@ impl X11Input {
 	}
 
 	fn xtest_key(&self, keycode: u8, press: bool) -> CoreResult<()> {
-		control::check()?;
+		// A release always goes out: a cancel stops only the next press.
 		if press {
+			control::check()?;
 			self.check_takeover_focus()?;
 		}
 		self
@@ -725,7 +731,9 @@ impl X11Input {
 		press: bool,
 		state: KeyButMask,
 	) -> CoreResult<()> {
-		control::check()?;
+		if press {
+			control::check()?;
+		}
 		let event = KeyPressEvent {
 			response_type: if press {
 				KEY_PRESS_EVENT

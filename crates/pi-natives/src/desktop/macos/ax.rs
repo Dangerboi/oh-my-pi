@@ -1083,9 +1083,11 @@ impl AxBackend for MacAx {
 			if replace_native_text(element, pid, started_in_background, value)? {
 				return Ok(());
 			}
-			// The probes above can block; a run cancelled meanwhile writes
-			// nothing.
+			// The probes above can block; a run cancelled meanwhile, or an app
+			// the user used meanwhile ([`control::intervention::check_press`]),
+			// gets nothing written.
 			control::check()?;
+			control::intervention::check_press()?;
 			set_string_value(element, "AXValue", value)?;
 			verify_text_value(element, value, value)
 		})
@@ -1093,7 +1095,10 @@ impl AxBackend for MacAx {
 
 	fn focus(&mut self, h: &AxHandle) -> CoreResult<()> {
 		let element = mac_handle(h)?;
-		skylight::with_background_guard(element_pid(element)?, || set_focused(element))
+		skylight::with_background_guard(element_pid(element)?, || {
+			control::intervention::check_press()?;
+			set_focused(element)
+		})
 	}
 
 	fn select_text(
@@ -1583,6 +1588,8 @@ fn set_date_value(element: &AXUIElement, text: &str, current: f64) -> CoreResult
 		.ok_or_else(|| DesktopError::ax_failed("creating the CFDate to write failed"))?;
 	let attribute = CFString::from_str("AXValue");
 	skylight::with_background_guard(element_pid(element)?, || {
+		// The probes before can block; an app the user used meanwhile is theirs.
+		control::intervention::check_press()?;
 		// SAFETY: The element, attribute and date remain retained for the setter.
 		let error = unsafe { element.set_attribute_value(&attribute, &value) };
 		ax_result(error, "setting AXValue to a date failed")?;
@@ -1642,6 +1649,9 @@ pub(super) fn keyboard_focus(pid: libc::pid_t) -> KeyboardFocus {
 /// partial delivery. `behind_user` runs after the probes, right before the
 /// write: the user may have brought the application forward while a probe
 /// blocked, and the write would then land in the field they just took over.
+/// Nor is anything written once the user has pressed a key or clicked in the
+/// application since the call was admitted
+/// ([`control::intervention::check_press`]).
 pub(super) fn insert_native_text(
 	pid: libc::pid_t,
 	wid: u32,
@@ -1695,6 +1705,7 @@ fn insert_selected_text(
 	};
 	behind_user()?;
 	skylight::with_background_guard(pid, || {
+		control::intervention::check_press()?;
 		set_string_value(element, "AXSelectedText", text)?;
 		verify_text_value(element, text, &expected)
 	})?;
@@ -1759,8 +1770,10 @@ fn replace_whole_value<F: TextField>(field: &F, text: &str) -> CoreResult<bool> 
 		if !field.in_background() {
 			return Ok(false);
 		}
-		// A run cancelled while the probes blocked changes nothing.
+		// A run cancelled, or an app the user used, while the probes blocked
+		// changes nothing.
 		control::check()?;
+		control::intervention::check_press()?;
 		match field.focus() {
 			AXError::Success => {},
 			AXError::CannotComplete => unanswered = Some("AXFocused"),
@@ -1772,13 +1785,15 @@ fn replace_whole_value<F: TextField>(field: &F, text: &str) -> CoreResult<bool> 
 	// The user may bring the app forward while those reads or the selection
 	// write block: a borrowed caret is theirs again, and a field the app had
 	// focused is theirs to type in, so neither is selected or typed over. Nor
-	// does a run cancelled meanwhile go on to write.
+	// does a run cancelled meanwhile go on to write, nor one whose app the user
+	// pressed a key or clicked in.
 	let still_borrowed = || {
 		(if previous.is_none() {
 			!field.brought_forward()
 		} else {
 			field.in_background()
 		}) && control::check().is_ok()
+			&& control::intervention::check_press().is_ok()
 	};
 	let selected = unanswered.is_none()
 		&& field.selectable_length().is_some_and(|length| {
@@ -1807,6 +1822,7 @@ fn replace_whole_value<F: TextField>(field: &F, text: &str) -> CoreResult<bool> 
 			}
 		}
 		control::check()?;
+		control::intervention::check_press()?;
 		if let Some(attribute) = unanswered {
 			return Err(DesktopError::ax_unconfirmed(format!(
 				"setting {attribute} to replace the field's text got no reply in time \
@@ -1936,15 +1952,19 @@ fn scrolls_before_press(native: &str, actions: &[String], uikit: impl FnOnce() -
 
 /// Sends `native`, after [`SCROLL_TO_VISIBLE`] when `scroll_first`. A failed
 /// scroll leaves the action to report its own outcome; a run cancelled during
-/// the scroll sends nothing more.
+/// the scroll sends nothing more, and nothing is sent once the user has
+/// pressed a key or clicked in the app since the call was admitted
+/// ([`control::intervention::check_press`]).
 fn press_into_view(
 	native: &str,
 	scroll_first: bool,
 	mut send: impl FnMut(&str) -> AXError,
 ) -> CoreResult<()> {
+	control::intervention::check_press()?;
 	if scroll_first {
 		let _ = send(SCROLL_TO_VISIBLE);
 		control::check()?;
+		control::intervention::check_press()?;
 	}
 	element_action_result(native, send(native))
 }
@@ -2632,6 +2652,9 @@ mod tests {
 		/// Cancelled while the selection write blocks, as a run stopped then
 		/// would be.
 		cancel_on_select:   Option<crate::desktop::control::CancellationSource>,
+		/// The user types into the field's app (process 7) while the selection
+		/// write blocks.
+		types_on_select:    Option<crate::desktop::control::intervention::Listener>,
 	}
 
 	impl ScriptedField {
@@ -2646,6 +2669,7 @@ mod tests {
 				select_reply: AXError::Success,
 				calls: RefCell::default(),
 				cancel_on_select: None,
+				types_on_select: None,
 			}
 		}
 
@@ -2702,6 +2726,9 @@ mod tests {
 			}
 			if let Some(source) = &self.cancel_on_select {
 				source.cancel();
+			}
+			if let Some(listener) = &self.types_on_select {
+				listener.record_for_test(7, std::time::Instant::now());
 			}
 			self.select_reply
 		}
@@ -2790,6 +2817,24 @@ mod tests {
 			..ScriptedField::new(false, false)
 		};
 		assert!(!replace_whole_value(&field, "abc").unwrap());
+		assert_eq!(field.calls(), ["focus", "select", "hand back"]);
+	}
+
+	#[test]
+	fn a_user_typing_during_the_selection_write_gets_the_field_handed_back_and_nothing_written() {
+		use crate::desktop::control::{CancellationSource, intervention::Listener};
+
+		let field = ScriptedField {
+			types_on_select: Some(Listener::simulated()),
+			..ScriptedField::new(false, false)
+		};
+		let listener = field.types_on_select.as_ref().unwrap();
+		listener.touch(7, Some(1), || "Contacts".to_string());
+		let _watch = listener
+			.admit(7, &CancellationSource::default().token())
+			.unwrap();
+		let result = replace_whole_value(&field, "abc");
+		assert_eq!(result.map_err(|error| error.code), Err(ErrorCode::UserIntervened));
 		assert_eq!(field.calls(), ["focus", "select", "hand back"]);
 	}
 
@@ -2892,6 +2937,33 @@ mod tests {
 			run(true, AXError::Success, true),
 			(Err(ErrorCode::Cancelled), vec![SCROLL_TO_VISIBLE.to_owned()])
 		);
+	}
+
+	#[test]
+	fn no_action_is_sent_once_the_user_used_the_app() {
+		use super::{SCROLL_TO_VISIBLE, press_into_view};
+		use crate::desktop::control::{CancellationSource, intervention::Listener};
+
+		let run = |used_before: bool| {
+			let listener = Listener::simulated();
+			listener.touch(7, Some(1), || "Music".to_string());
+			let _watch = listener
+				.admit(7, &CancellationSource::default().token())
+				.unwrap();
+			if used_before {
+				listener.record_for_test(7, std::time::Instant::now());
+			}
+			let mut sent = Vec::new();
+			let result = press_into_view("AXPress", true, |action| {
+				sent.push(action.to_owned());
+				// The user clicks in the app while the scroll runs.
+				listener.record_for_test(7, std::time::Instant::now());
+				AXError::Success
+			});
+			(result.map_err(|error| error.code), sent)
+		};
+		assert_eq!(run(true), (Err(ErrorCode::UserIntervened), vec![]));
+		assert_eq!(run(false), (Err(ErrorCode::UserIntervened), vec![SCROLL_TO_VISIBLE.to_owned()]));
 	}
 
 	#[test]

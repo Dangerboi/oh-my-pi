@@ -293,6 +293,25 @@ pub(crate) fn wait(duration: Duration) -> CoreResult<()> {
 	})
 }
 
+/// Waits after a call's input went out, for the target to take it in before
+/// the call goes on. A cancel neither cuts it short nor fails the call: the
+/// input already landed, so the call reports it, and the cancel stops the next
+/// call instead.
+pub(crate) fn settle(duration: Duration) {
+	thread::sleep(duration);
+}
+
+/// The pause `gap` after a press. Once a call's last press is out (`sent`)
+/// it is a [`settle`]; before that a cancel ends it.
+pub(crate) fn sent_gap_wait(gap: Duration, sent: bool) -> CoreResult<()> {
+	if sent {
+		settle(gap);
+		Ok(())
+	} else {
+		wait(gap)
+	}
+}
+
 /// Cleanup must release already-held input even after cancellation. This does
 /// not clear a token or authorize any later operation. Nested cleanup is safe.
 pub(crate) fn cleanup<T>(action: impl FnOnce() -> T) -> T {
@@ -648,6 +667,22 @@ pub(crate) fn shared_ownership() -> Option<(std::os::fd::OwnedFd, HandedOwnershi
 	Some((duplicate.into(), HandedOwnership { lease: published.lease }))
 }
 
+/// Whether a release helper handed this process's ownership has not been
+/// reaped: one an earlier operation stopped waiting for may still post its
+/// releases, which would cut short what a new operation presses.
+#[cfg(target_os = "macos")]
+fn release_helper_running() -> bool {
+	SHARED_OWNERSHIP
+		.lock()
+		.as_ref()
+		.is_some_and(|published| published.unreaped > 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn release_helper_running() -> bool {
+	false
+}
+
 pub(crate) struct InputLease {
 	_scope:  OperationScope,
 	owner:   Arc<ControlLease>,
@@ -672,6 +707,11 @@ impl InputLease {
 			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
 			.map_err(|_| busy())?;
 		let lease = Self { _scope: token.enter(), owner, _thread: PhantomData };
+		// Held control keeps ownership between operations, so the kernel lock
+		// a lingering helper shares does not keep the next one out.
+		if release_helper_running() {
+			return Err(busy());
+		}
 		token.check()?;
 		Ok(lease)
 	}
@@ -834,13 +874,28 @@ impl Drop for KernelLease {
 
 /// Real ownership without OS event monitoring: lifecycle regressions must
 /// not depend on an interactive desktop or Accessibility permissions.
+///
+/// Under a runner that runs every test in one process (bazel, `cargo test`)
+/// the previous test can still be dropping a source that holds the
+/// process's one lease after it released `OWNERSHIP_TEST`, as a test's
+/// locals outlive the worker that held the lock. Waiting for that release
+/// keeps the grant from failing on a neighbour's teardown.
 #[cfg(test)]
 pub(crate) fn grant_for_test(source: &CancellationSource) {
-	let owner = ControlLease {
-		_escape: None,
-		_kernel: KernelOwner::acquire().expect("test kernel owner"),
-		running: AtomicBool::new(false),
+	let deadline = std::time::Instant::now() + Duration::from_secs(10);
+	let kernel = loop {
+		match KernelOwner::acquire() {
+			Ok(kernel) => break kernel,
+			Err(error)
+				if error.code == crate::desktop::error::ErrorCode::InputBusy
+					&& std::time::Instant::now() < deadline =>
+			{
+				thread::sleep(Duration::from_millis(5));
+			},
+			Err(error) => panic!("test kernel owner: {error:?}"),
+		}
 	};
+	let owner = ControlLease { _escape: None, _kernel: kernel, running: AtomicBool::new(false) };
 	*source.0.state.lock() = Some(Arc::new(owner));
 }
 
@@ -1282,6 +1337,29 @@ mod tests {
 		child_probe(&KernelLease::path(), true);
 		drop(copy.stdin.take());
 		assert!(copy.wait().expect("copy exits").success());
+		remove_test_lock();
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn held_control_refuses_input_until_an_earlier_operations_helper_is_reaped() {
+		use crate::desktop::error::ErrorCode;
+
+		if !alone(
+			"desktop::control::tests::held_control_refuses_input_until_an_earlier_operations_helper_is_reaped",
+		) {
+			return;
+		}
+		let source = CancellationSource::default();
+		grant_for_test(&source);
+		// An earlier operation stopped waiting for its helper, which still holds
+		// its share of ownership.
+		let (_descriptor, handed) = shared_ownership().expect("held lock is shared");
+		let refused = InputLease::acquire(&source.token(), false).map(drop);
+		assert_eq!(refused.map_err(|error| error.code), Err(ErrorCode::InputBusy));
+		drop(handed);
+		drop(InputLease::acquire(&source.token(), false).expect("input once the helper is reaped"));
+		source.release_control();
 		remove_test_lock();
 	}
 }

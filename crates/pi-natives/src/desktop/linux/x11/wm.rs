@@ -535,11 +535,11 @@ impl FocusSnapshot {
 	/// Observe only. Re-activation can raise windows, and the old "focus
 	/// bounce" deliberately sent the user's keystrokes to the target for
 	/// 60ms. Neither belongs in a background operation. An unrelated focus
-	/// change is the user's, not permission to undo it.
+	/// change is the user's, not permission to undo it. It follows the
+	/// action's input, so a cancel does not cut it short.
 	pub(super) fn check(&self, wm: Wm<'_>, target: Window) -> CoreResult<()> {
 		let watch_until = Instant::now() + FOCUS_SETTLE_WATCH;
 		loop {
-			control::check()?;
 			if self.changed(wm) {
 				let moved_to_target = (self.active != Some(target)
 					&& wm.active_window() == Some(target))
@@ -559,7 +559,7 @@ impl FocusSnapshot {
 			if Instant::now() >= watch_until {
 				return Ok(());
 			}
-			control::wait(FOCUS_POLL)?;
+			control::settle(FOCUS_POLL);
 		}
 	}
 }

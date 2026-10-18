@@ -87,13 +87,34 @@ struct TapContext<C> {
 
 /// The ports of this process's live taps, so the process can invalidate them
 /// before it exits ([`close_taps`]).
-struct LiveTaps(Mutex<Vec<usize>>);
+struct LiveTaps(Mutex<Live>);
 
-static LIVE_TAPS: LiveTaps = LiveTaps(Mutex::new(Vec::new()));
+struct Live {
+	ports:  Vec<usize>,
+	/// The process closed its taps: it is exiting, and a tap that starts after
+	/// that is invalidated as it is listed.
+	closed: bool,
+}
+
+static LIVE_TAPS: LiveTaps = LiveTaps::new();
 
 impl LiveTaps {
-	fn add(&self, port: Ref) {
-		self.0.lock().push(port as usize);
+	const fn new() -> Self {
+		Self(Mutex::new(Live { ports: Vec::new(), closed: false }))
+	}
+
+	/// Lists `port`, or invalidates it at once after [`Self::close`].
+	///
+	/// # Safety
+	/// `port` must be a live `CFMachPort`.
+	unsafe fn add(&self, port: Ref) {
+		let mut live = self.0.lock();
+		if live.closed {
+			// SAFETY: forwarded caller contract.
+			unsafe { CFMachPortInvalidate(port) };
+		} else {
+			live.ports.push(port as usize);
+		}
 	}
 
 	/// Removes `port` and invalidates it under the same lock as
@@ -103,13 +124,15 @@ impl LiveTaps {
 	/// `port` must be a live `CFMachPort`.
 	unsafe fn invalidate(&self, port: Ref) {
 		let mut live = self.0.lock();
-		live.retain(|&live| live != port as usize);
+		live.ports.retain(|&live| live != port as usize);
 		// SAFETY: forwarded caller contract.
 		unsafe { CFMachPortInvalidate(port) };
 	}
 
 	fn close(&self) {
-		for port in self.0.lock().drain(..) {
+		let mut live = self.0.lock();
+		live.closed = true;
+		for port in live.ports.drain(..) {
 			// SAFETY: a port is listed only while its tap thread holds it, and
 			// that thread unlists it under this lock before releasing it.
 			unsafe { CFMachPortInvalidate(port as Ref) };
@@ -130,10 +153,15 @@ pub(super) fn close_taps() {
 }
 
 /// Lists `port`, a tap made elsewhere in the desktop backend, among the taps
-/// [`close_taps`] invalidates. Its thread must later unlist it through
-/// [`invalidate_live_tap`] before releasing it.
-pub(crate) fn add_live_tap(port: Ref) {
-	LIVE_TAPS.add(port);
+/// [`close_taps`] invalidates, or invalidates it at once if they are already
+/// closed. Its thread must later unlist it through [`invalidate_live_tap`]
+/// before releasing it.
+///
+/// # Safety
+/// `port` must be a live `CFMachPort`.
+pub(crate) unsafe fn add_live_tap(port: Ref) {
+	// SAFETY: forwarded caller contract.
+	unsafe { LIVE_TAPS.add(port) };
 }
 
 /// Unlists and invalidates `port`, which may never have been listed.
@@ -682,10 +710,13 @@ mod tests {
 
 	#[test]
 	fn closing_invalidates_every_live_tap_and_none_its_thread_already_ended() {
-		let taps = LiveTaps(Mutex::new(Vec::new()));
+		let taps = LiveTaps::new();
 		let (live, ended) = (port(), port());
-		taps.add(live);
-		taps.add(ended);
+		// SAFETY: live ports created above.
+		unsafe {
+			taps.add(live);
+			taps.add(ended);
+		}
 		// SAFETY: `ended` is a live port, released below.
 		unsafe { taps.invalidate(ended) };
 		let other = port();
@@ -696,7 +727,7 @@ mod tests {
 			assert!(!CFMachPortIsValid(ended));
 			assert!(CFMachPortIsValid(other), "close touched a port it was never given");
 		}
-		assert!(taps.0.lock().is_empty());
+		assert!(taps.0.lock().ports.is_empty());
 		// A tap thread ending after close finds its port already gone.
 		// SAFETY: still a live (invalid) CFMachPort.
 		unsafe { taps.invalidate(live) };
@@ -705,6 +736,25 @@ mod tests {
 			for port in [live, ended, other] {
 				CFRelease(port);
 			}
+		}
+	}
+
+	#[test]
+	fn a_tap_that_starts_after_closing_is_invalidated_as_it_is_listed() {
+		let taps = LiveTaps::new();
+		taps.close();
+		let late = port();
+		// SAFETY: a live port created above, released below.
+		unsafe {
+			taps.add(late);
+			assert!(!CFMachPortIsValid(late), "a tap started after close stayed live");
+		}
+		assert!(taps.0.lock().ports.is_empty());
+		// SAFETY: still a live (invalid) CFMachPort, then its create-rule
+		// release.
+		unsafe {
+			taps.invalidate(late);
+			CFRelease(late);
 		}
 	}
 

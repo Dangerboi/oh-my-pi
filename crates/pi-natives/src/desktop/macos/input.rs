@@ -230,8 +230,9 @@ impl MacInput {
 		element: Option<&AXUIElement>,
 	) -> CoreResult<ElementDelivery> {
 		let (pid, wid) = window_identity(window)?;
-		let remote = process::remote_screen(pid);
+		// Read before anything about the target ([`EntryFront::before`]).
 		let entry_front = EntryFront::now();
+		let remote = process::remote_screen(pid);
 		// A takeover write goes to the window brought to the front for it.
 		let behind_user = || match mode {
 			DeliveryMode::Background => entry_front.require_behind(skylight::front_pid(), pid, wid),
@@ -318,12 +319,14 @@ impl MacInput {
 		element: Option<&AXUIElement>,
 	) -> CoreResult<ElementDelivery> {
 		let (pid, wid) = window_identity(window)?;
+		// Read before anything about the target ([`EntryFront::before`]): the
+		// layout lookup below may run a helper process.
+		let entry_front = EntryFront::now();
 		let remote = process::remote_screen(pid);
 		let gap = key_gap(remote);
 		let chord = chord_keys(window, keys, remote, layout_strokes)?;
 		match mode {
 			DeliveryMode::Background => {
-				let entry_front = EntryFront::now();
 				if remote == Some(RemoteScreen::KeyEvents)
 					&& chord.iter().any(|key| key.name.is_modifier())
 				{
@@ -352,7 +355,7 @@ impl MacInput {
 					confirm_shortcut_answered(window, keys, || {
 						// The shortcut is out: a cancel now must not report it
 						// unsent.
-						std::thread::sleep(SHORTCUT_REPLY_DELAY);
+						control::settle(SHORTCUT_REPLY_DELAY);
 						Ok(ax::stopped_answering(pid, SHORTCUT_REPLY_TIMEOUT_SECONDS))
 					})?;
 				}
@@ -395,12 +398,13 @@ impl MacInput {
 			Target::Window(id) => {
 				let window = capture.window(id)?;
 				let (pid, wid) = window_identity(&window)?;
+				// Read before anything about the target ([`EntryFront::before`]).
+				let entry_front = EntryFront::now();
 				let remote = process::remote_screen(pid);
 				let gap = key_gap(remote);
 				let held = chord_keys(&window, keys, remote, layout_strokes)?;
 				match mode {
 					DeliveryMode::Background => {
-						let entry_front = EntryFront::now();
 						if remote == Some(RemoteScreen::KeyEvents)
 							&& held.iter().any(|key| key.name.is_modifier())
 						{
@@ -525,7 +529,9 @@ const fn holds_modifier(flags: u64) -> bool {
 /// window: Screen Sharing gives the key the modifiers the physical keyboard
 /// holds as it forwards it, so a press stops while `flags` holds one or has
 /// Caps Lock on. A user's Command would otherwise turn `q` into Cmd-Q on the
-/// remote computer, and Caps Lock types capitals.
+/// remote computer, and Caps Lock types capitals. Before any press it is
+/// `BackgroundUnavailable`; once keys went out it is `InputFailed`, which
+/// the host never reruns in takeover, since that would type them again.
 fn physical_modifier_check<'a>(
 	window: &'a DesktopWindow,
 	flags: impl Fn() -> u64 + 'a,
@@ -533,12 +539,20 @@ fn physical_modifier_check<'a>(
 	let mut sent = 0;
 	move || {
 		if holds_modifier(flags()) {
-			return Err(DesktopError::background_unavailable(format!(
+			let why = format!(
 				"window {} ({}) gives the keys it forwards the physical keyboard's Shift, Control, \
-				 Option, Command and Caps Lock, and one is held or Caps Lock is on; stopped with \
-				 {sent} key press(es) sent; retry once no modifier key is held and Caps Lock is off",
+				 Option, Command and Caps Lock, and one is held or Caps Lock is on",
 				window.id, window.app,
-			)));
+			);
+			let retry = "retry once no modifier key is held and Caps Lock is off";
+			return Err(if sent == 0 {
+				DesktopError::background_unavailable(format!("{why}; nothing was sent; {retry}"))
+			} else {
+				DesktopError::input_failed(format!(
+					"{why}; {sent} key press(es) sent before this may already have landed, and no \
+					 further input was sent; inspect the remote screen first, then {retry}"
+				))
+			});
 		}
 		sent += 1;
 		Ok(())
@@ -699,7 +713,9 @@ fn unmapped_keyboard_refusal(wid: u32) -> DesktopError {
 /// Runs `send` at once without an `element`. With one, focuses it and runs
 /// `send` only once `pid` reports it as its focused element within
 /// [`ELEMENT_FOCUS_TIMEOUT`], read every [`ELEMENT_FOCUS_POLL`]
-/// ([`keys_after_focus`]).
+/// ([`keys_after_focus`]); nothing is focused once the user has pressed a key
+/// or clicked in the app since the call was admitted
+/// ([`control::intervention::check_press`]).
 fn element_keys(
 	pid: libc::pid_t,
 	element: Option<&AXUIElement>,
@@ -709,6 +725,7 @@ fn element_keys(
 		send()?;
 		return Ok(ElementDelivery::Delivered);
 	};
+	control::intervention::check_press()?;
 	let deadline = Instant::now() + ELEMENT_FOCUS_TIMEOUT;
 	keys_after_focus(
 		|| ax::set_focused(element),
@@ -2416,9 +2433,8 @@ fn stroke_path(
 			last = at;
 			post(Stroke::Dragged, at)?;
 		}
-		// Every point is out and the release always goes: a cancel now must
-		// not report the drag unsent.
-		std::thread::sleep(DRAG_RELEASE_GAP);
+		// Every point is out and the release always goes.
+		control::settle(DRAG_RELEASE_GAP);
 		Ok(())
 	})();
 	let release = control::cleanup(|| {
@@ -2667,7 +2683,7 @@ fn background_left_click(
 	for click_state in 1..=count {
 		before_press()?;
 		post(CGEventType::LeftMouseDown, target, local, 3, i64::from(click_state), flags)?;
-		let result = control::wait(Duration::from_millis(1));
+		let result = control::sent_gap_wait(Duration::from_millis(1), click_state == count);
 		let release = control::cleanup(|| {
 			post(CGEventType::LeftMouseUp, target, local, 3, i64::from(click_state), flags)
 		});
@@ -2705,7 +2721,7 @@ fn background_button_click(
 		release.set_flags(flags);
 		let result =
 			post_window_pointer(pid, wid, window, &press, x, y, i64::from(click_state), number, group)
-				.and_then(|()| control::wait(PRESS_GAP));
+				.and_then(|()| control::sent_gap_wait(PRESS_GAP, click_state == count));
 		let cleanup = control::cleanup(|| {
 			post_window_pointer(
 				pid,
@@ -2907,8 +2923,8 @@ fn report_taps(
 	let count = i64::from(count.max(1));
 	for click_state in 1..=count {
 		before_press()?;
-		let result =
-			post(CGEventType::LeftMouseDown, click_state).and_then(|()| control::wait(TAP_HOLD));
+		let result = post(CGEventType::LeftMouseDown, click_state)
+			.and_then(|()| control::sent_gap_wait(TAP_HOLD, click_state == count));
 		let release = control::cleanup(|| post(CGEventType::LeftMouseUp, click_state));
 		skylight::after_cleanup(result, release)?;
 		if click_state < count {
@@ -3100,7 +3116,7 @@ fn type_keys(
 	const MODIFIERS: [KeyName; 2] = [KeyName::Shift, KeyName::Alt];
 	let mut held = Modifiers::default();
 	let result = (|| {
-		for key in keys {
+		for (index, key) in keys.iter().enumerate() {
 			control::check()?;
 			let (code, wanted, text) = match *key {
 				TypedKey::Layout(stroke, text) => {
@@ -3141,10 +3157,13 @@ fn type_keys(
 				event.set_flags(modifier_flags(held));
 			}
 			guard()?;
-			let result = post(&press).and_then(|()| control::wait(gap));
+			// Once the last key is pressed the text is out: a cancel then must
+			// not report it unsent.
+			let last = index + 1 == keys.len();
+			let result = post(&press).and_then(|()| control::sent_gap_wait(gap, last));
 			let cleanup = control::cleanup(|| post(&release));
 			skylight::after_cleanup(result, cleanup)?;
-			control::wait(gap)?;
+			control::sent_gap_wait(gap, last)?;
 		}
 		Ok(())
 	})();
@@ -3219,9 +3238,12 @@ fn post_bare_keys(
 
 /// Posts one bare key transition at the HID tap: a null source and no flag
 /// or Unicode overrides, so `CoreGraphics` derives modifier state from the
-/// transitions exactly as for a hardware keyboard.
+/// transitions exactly as for a hardware keyboard. Only a press can be
+/// cancelled; a release always goes out.
 fn post_bare(code: u16, down: bool) -> CoreResult<()> {
-	control::check()?;
+	if down {
+		control::check()?;
+	}
 	// SAFETY: A null source is documented as valid for keyboard events.
 	let raw = unsafe { create_keyboard_event(ptr::null_mut(), code, down) };
 	if raw.is_null() {
@@ -3276,13 +3298,13 @@ fn hold_transitions(
 			guard()?;
 			held += 1;
 			post(key.code, true)?;
-			control::wait(gap)?;
+			control::sent_gap_wait(gap, held == keys.len())?;
 		}
 		body()?;
 		while let Some(key) = keys[..held].last() {
 			post(key.code, false)?;
 			held -= 1;
-			control::wait(gap)?;
+			control::sent_gap_wait(gap, true)?;
 		}
 		Ok(())
 	})();
@@ -3299,23 +3321,31 @@ fn hold_transitions(
 /// Posts `transitions` with `gap` after each, running `guard` before every
 /// press. A key counts as held from its attempted press until its release
 /// posts; keys still held when posting fails or is cancelled are released.
+/// After the last press nothing can be cancelled.
 fn post_transitions(
 	transitions: &[(u16, bool)],
 	gap: Duration,
 	mut guard: impl FnMut() -> CoreResult<()>,
 	mut post: impl FnMut(u16, bool) -> CoreResult<()>,
 ) -> CoreResult<()> {
+	let last_press = transitions.iter().rposition(|&(_, down)| down);
 	let mut held = [false; 128];
 	let mut result = Ok(());
-	for &(code, down) in transitions {
-		result = control::check().and_then(|()| {
+	for (index, &(code, down)) in transitions.iter().enumerate() {
+		let sent = last_press.is_none_or(|last| index >= last);
+		result = (if sent && !down {
+			Ok(())
+		} else {
+			control::check()
+		})
+		.and_then(|()| {
 			if down {
 				guard()?;
 				held[usize::from(code)] = true;
 			}
 			post(code, down)?;
 			held[usize::from(code)] = down;
-			control::wait(gap)
+			control::sent_gap_wait(gap, sent)
 		});
 		if result.is_err() {
 			break;
@@ -3367,7 +3397,7 @@ fn press_chord(
 	if keys.is_empty() {
 		return Err(empty_chord());
 	}
-	hold_presses(source, keys, gap, post, control::check)
+	hold_presses(source, keys, gap, post, || Ok(()))
 }
 
 fn with_held_keys(
@@ -3436,7 +3466,10 @@ fn layout_chord(
 			))
 		})?;
 		for (needed, modifier) in [(key.shift, KeyName::Shift), (key.option, KeyName::Alt)] {
-			if needed && !keys.contains(&modifier) {
+			// Once per chord: a second Shift would be released, in reverse,
+			// while the first character's key is still down.
+			if needed && !keys.contains(&modifier) && !chord.iter().any(|press| press.name == modifier)
+			{
 				chord.push(KeyPress { name: modifier, code: key_code(modifier)? });
 			}
 		}
@@ -3467,7 +3500,7 @@ fn hold_presses(
 		pressed += 1;
 		if let Err(error) = control::check()
 			.and_then(|()| post_code(source, key.code, true, modifier_flags(active), &mut post))
-			.and_then(|()| control::wait(gap))
+			.and_then(|()| control::sent_gap_wait(gap, pressed == keys.len()))
 		{
 			result = Err(error);
 			break;
@@ -3480,7 +3513,11 @@ fn hold_presses(
 		let mut cleanup = Ok(());
 		for &key in keys[..pressed].iter().rev() {
 			update_modifier(&mut active, key.name, false);
-			let release = post_code(source, key.code, false, modifier_flags(active), &mut post);
+			// A device that samples HID report state drops transitions closer
+			// than its report interval, so every release, the last included,
+			// is followed by `gap` before the next transition can go out.
+			let release = post_code(source, key.code, false, modifier_flags(active), &mut post)
+				.and_then(|()| control::wait(gap));
 			cleanup = skylight::after_cleanup(cleanup, release);
 		}
 		cleanup
@@ -3927,7 +3964,7 @@ fn global_pointer(source: &CGEventSource, event: PointerEvent) -> CoreResult<()>
 						number,
 						flags,
 					)?;
-					let result = control::wait(PRESS_GAP);
+					let result = control::sent_gap_wait(PRESS_GAP, click_state == count);
 					let release = control::cleanup(|| {
 						post_global_mouse(
 							source,
@@ -3946,7 +3983,7 @@ fn global_pointer(source: &CGEventSource, event: PointerEvent) -> CoreResult<()>
 				}
 				Ok(())
 			});
-			result.and_then(|()| control::wait(POINTER_SETTLE))
+			result.inspect(|()| control::settle(POINTER_SETTLE))
 		},
 		PointerEvent::Move { x, y } => post_global_mouse(
 			source,
@@ -4135,13 +4172,15 @@ fn global_drag(
 				post(dragged, location, true, flags)?;
 				last = location;
 			}
-			control::wait(Duration::from_millis(50))
+			// Every point is out and the release always goes.
+			control::settle(Duration::from_millis(50));
+			Ok(())
 		})();
 		let release = control::cleanup(|| post(up, last, false, flags));
 		skylight::after_cleanup(result, release)
 	});
 	// Lets the target release its pointer capture before focus is restored.
-	result.and_then(|()| control::wait(Duration::from_millis(100)))
+	result.inspect(|()| control::settle(Duration::from_millis(100)))
 }
 
 fn post_global_mouse(
@@ -4520,7 +4559,8 @@ mod tests {
 		assert!(error.message.contains("window 42 (Screen Sharing)"), "{}", error.message);
 		assert_eq!(posted, 0);
 		// The user presses Command after a is typed: b would reach the remote
-		// computer as Cmd-B, so it is not pressed.
+		// computer as Cmd-B, so it is not pressed. a already went out, so the
+		// stop is not one takeover may retry: that would type a again.
 		let flags = std::cell::Cell::new(0);
 		let mut check = physical_modifier_check(&window, || flags.get());
 		let mut typed = Vec::new();
@@ -4533,8 +4573,14 @@ mod tests {
 			Ok(())
 		})
 		.unwrap_err();
-		assert_eq!(error.code, ErrorCode::BackgroundUnavailable);
-		assert!(error.message.contains("1 key press(es) sent"), "{}", error.message);
+		assert_eq!(error.code, ErrorCode::InputFailed);
+		assert!(
+			error
+				.message
+				.contains("1 key press(es) sent before this may already have landed"),
+			"{}",
+			error.message
+		);
 		assert_eq!(typed, [(CGEventType::KeyDown as u32, 0), (CGEventType::KeyUp as u32, 0)]);
 		// Flags that change no key, such as the keypad's, do not stop it.
 		let mut check =
@@ -4599,6 +4645,142 @@ mod tests {
 		assert!(result.is_err());
 		assert_eq!(posted, [(55, true), (55, false)]);
 		assert_eq!(body_at, None);
+	}
+
+	#[test]
+	fn a_click_whose_last_press_is_out_is_not_reported_cancelled() {
+		use crate::desktop::error::ErrorCode;
+		let (down, up) = (CGEventType::LeftMouseDown as u32, CGEventType::LeftMouseUp as u32);
+		// A double tap cancelled as its `cancel_at`th press goes out.
+		let run = |cancel_at: i64| {
+			let source = control::CancellationSource::default();
+			let token = source.token();
+			let posted = std::cell::RefCell::new(Vec::new());
+			let result = control::with_token_for_test(&token, || {
+				report_taps(
+					2,
+					|| Ok(()),
+					|event, click_state| {
+						posted.borrow_mut().push((event as u32, click_state));
+						if event as u32 == down && click_state == cancel_at {
+							source.cancel();
+						}
+						Ok(())
+					},
+				)
+			});
+			(result.map_err(|error| error.code), posted.into_inner())
+		};
+		// Cancelled at the last press: the click went out whole and stands.
+		assert_eq!(run(2), (Ok(()), vec![(down, 1), (up, 1), (down, 2), (up, 2)]));
+		// Cancelled at an earlier press: released, and the rest is not sent.
+		assert_eq!(run(1), (Err(ErrorCode::Cancelled), vec![(down, 1), (up, 1)]));
+	}
+
+	#[test]
+	fn input_whose_last_key_is_out_is_not_reported_cancelled() {
+		let source = source().expect("event source");
+		let gap = Duration::from_millis(20);
+		let cancelled = |post: &mut dyn FnMut(&control::CancellationSource) -> CoreResult<()>| {
+			let cancellation = control::CancellationSource::default();
+			let token = cancellation.token();
+			control::with_token_for_test(&token, || post(&cancellation))
+		};
+		let (down, up) = (CGEventType::KeyDown as u32, CGEventType::KeyUp as u32);
+		// Typed text: the user cancels as the last key goes down.
+		let mut typed = Vec::new();
+		cancelled(&mut |cancellation| {
+			type_keys(
+				&source,
+				&us_keys("ab").unwrap(),
+				gap,
+				|| Ok(()),
+				|event| {
+					let event = typed_event(event);
+					if (event.0, event.1) == (down, 11) {
+						cancellation.cancel();
+					}
+					typed.push((event.0, event.1));
+					Ok(())
+				},
+			)
+		})
+		.unwrap();
+		assert_eq!(typed, [(down, 0), (up, 0), (down, 11), (up, 11)]);
+		// A shortcut fires on its last key-down: cmd+a.
+		let chord = [KeyPress { name: KeyName::Meta, code: 55 }, KeyPress {
+			name: KeyName::Char('a'),
+			code: 0,
+		}];
+		let mut posted = Vec::new();
+		cancelled(&mut |cancellation| {
+			press_chord(&source, &chord, gap, |event| {
+				let event = typed_event(event);
+				if (event.0, event.1) == (down, 0) {
+					cancellation.cancel();
+				}
+				posted.push(event.1);
+				Ok(())
+			})
+		})
+		.unwrap();
+		assert_eq!(posted, [55, 0, 0, 55]);
+		// Remote takeover: bare transitions, as a chord and as typed text.
+		let mut bare = Vec::new();
+		cancelled(&mut |cancellation| {
+			hold_transitions(
+				&chord,
+				gap,
+				|| Ok(()),
+				|| Ok(()),
+				|code, pressed| {
+					if (code, pressed) == (0, true) {
+						cancellation.cancel();
+					}
+					bare.push((code, pressed));
+					Ok(())
+				},
+			)
+		})
+		.unwrap();
+		assert_eq!(bare, [(55, true), (0, true), (0, false), (55, false)]);
+		let mut bare = Vec::new();
+		cancelled(&mut |cancellation| {
+			let transitions = bare_transitions(&us_keys("aB").unwrap());
+			post_transitions(
+				&transitions,
+				gap,
+				|| Ok(()),
+				|code, pressed| {
+					if (code, pressed) == (11, true) {
+						cancellation.cancel();
+					}
+					bare.push((code, pressed));
+					Ok(())
+				},
+			)
+		})
+		.unwrap();
+		assert_eq!(bare, [(0, true), (0, false), (56, true), (11, true), (11, false), (56, false)]);
+		// A cancel before the last press still stops the rest.
+		let mut bare = Vec::new();
+		let result = cancelled(&mut |cancellation| {
+			let transitions = bare_transitions(&us_keys("aB").unwrap());
+			post_transitions(
+				&transitions,
+				gap,
+				|| Ok(()),
+				|code, pressed| {
+					if (code, pressed) == (0, false) {
+						cancellation.cancel();
+					}
+					bare.push((code, pressed));
+					Ok(())
+				},
+			)
+		});
+		assert!(result.is_err());
+		assert_eq!(bare, [(0, true), (0, false)]);
 	}
 
 	/// The transitions `post_transitions` posts for "aB" on a remote screen,
@@ -4755,6 +4937,24 @@ mod tests {
 		let error = chord_keys(&window, &[KeyName::Char('z')], remote, layout).unwrap_err();
 		assert_eq!(error.code, ErrorCode::InvalidKey);
 		assert!(error.message.contains("window 42 (Screen Sharing)"), "{}", error.message);
+	}
+
+	#[test]
+	fn a_remote_chord_presses_a_modifier_two_characters_need_only_once() {
+		// US: ! is Shift-1 and € Shift-Option-2. A second Shift would be
+		// released, in reverse, while 1 is still down.
+		let press = |name, code| KeyPress { name, code };
+		let keys = [KeyName::Char('!'), KeyName::Char('€')];
+		let layout = || Ok(Some(us_stroke));
+		assert_eq!(
+			chord_keys(&screen_sharing(), &keys, Some(RemoteScreen::HidReports), layout).unwrap(),
+			[
+				press(KeyName::Shift, 56),
+				press(KeyName::Char('!'), 18),
+				press(KeyName::Alt, 58),
+				press(KeyName::Char('€'), 19),
+			]
+		);
 	}
 
 	#[test]
@@ -6012,6 +6212,31 @@ mod tests {
 			(CGEventType::KeyUp as u32, 36, true),
 			(CGEventType::FlagsChanged as u32, 59, false),
 		]);
+	}
+
+	#[test]
+	fn a_chord_waits_its_gap_after_every_release() {
+		// iPhone Mirroring samples HID report state: a release and the next
+		// transition inside one interval merge, so a press of a right after
+		// this chord's a goes up would be lost.
+		let source = source().expect("Quartz event source");
+		let gap = Duration::from_millis(30);
+		let mut posted = Vec::new();
+		let chord = [KeyPress { name: KeyName::Shift, code: 56 }, KeyPress {
+			name: KeyName::Char('a'),
+			code: 0,
+		}];
+		press_chord(&source, &chord, gap, |_| {
+			posted.push(Instant::now());
+			Ok(())
+		})
+		.unwrap();
+		let returned = Instant::now();
+		assert_eq!(posted.len(), 4);
+		for pair in posted.windows(2) {
+			assert!(pair[1].duration_since(pair[0]) >= gap);
+		}
+		assert!(returned.duration_since(posted[3]) >= gap);
 	}
 
 	#[test]

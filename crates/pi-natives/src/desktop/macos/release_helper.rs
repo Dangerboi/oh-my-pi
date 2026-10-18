@@ -29,7 +29,7 @@ use std::{
 	thread,
 };
 
-use release::{Input, Observation, Open, Record, Route, Step, Transitions};
+use release::{Input, Observation, Open, Record, Route, Step, Transitions, UserHolds};
 
 type Ref = *mut c_void;
 type TapCallback = unsafe extern "C" fn(Ref, u32, Ref, Ref) -> Ref;
@@ -287,7 +287,7 @@ fn main() {
 	if open.is_empty() {
 		return;
 	}
-	for step in release::plan(&open, observation.settle()) {
+	for step in release::plan(&open, observation.settle(&open)) {
 		if let Step::Post { id, flags } = step
 			&& let Some(press) = open.iter().find(|press| press.id == id)
 		{
@@ -453,24 +453,31 @@ fn observe(observation: &Arc<Observation>, mut ready: UnixStream) {
 		CGEventTapEnable(port, true);
 		Stop { source: stop, run_loop }
 	};
-	{
-		let mut holds = observation.holds();
-		for code in 0..128u16 {
-			// SAFETY: read-only query of the HID system state.
-			if unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, code) } {
-				holds.set(Input::Key(code), true);
-			}
-		}
-		for button in 0..32u8 {
-			// SAFETY: read-only query of the HID system state.
-			if unsafe { CGEventSourceButtonState(HID_SYSTEM_STATE, u32::from(button)) } {
-				holds.set(Input::Button(button), true);
-			}
-		}
-	}
+	// Before `READY` no press of this request is on the HID route, so what is
+	// down is the user's.
+	observation.holds().hold_all(hid_state());
 	observation.follow(&RunLoop, Box::new(move || stop.signal()), || {
 		let _ = ready.write_all(&[release::READY]);
 	});
+}
+
+/// The keys and buttons down in the HID system state: the user's and every
+/// process's presses alike.
+fn hid_state() -> UserHolds {
+	let mut down = UserHolds::default();
+	for code in 0..128u16 {
+		// SAFETY: read-only query of the HID system state.
+		if unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, code) } {
+			down.set(Input::Key(code), true);
+		}
+	}
+	for button in 0..32u8 {
+		// SAFETY: read-only query of the HID system state.
+		if unsafe { CGEventSourceButtonState(HID_SYSTEM_STATE, u32::from(button)) } {
+			down.set(Input::Button(button), true);
+		}
+	}
+	down
 }
 
 unsafe extern "C" fn observed(_proxy: Ref, kind: u32, event: Ref, context: Ref) -> Ref {
@@ -479,6 +486,9 @@ unsafe extern "C" fn observed(_proxy: Ref, kind: u32, event: Ref, context: Ref) 
 	if TAP_DISABLED.contains(&kind) {
 		// SAFETY: the tap outlives its callback.
 		unsafe { CGEventTapEnable(tap.port, true) };
+		// The transitions of the disabled stretch are lost; the HID state
+		// says where they left the user's holds.
+		tap.observation.holds().resync(hid_state());
 		return event;
 	}
 	if event.is_null() {
@@ -494,12 +504,12 @@ unsafe extern "C" fn observed(_proxy: Ref, kind: u32, event: Ref, context: Ref) 
 			CGEventGetIntegerValueField(event, BUTTON_NUMBER_FIELD),
 		)
 	};
-	if pid != 0 {
-		return event;
-	}
 	let mut holds = tap.observation.holds();
 	let code = u16::try_from(code).unwrap_or(u16::MAX);
 	match release::transition(kind, code, flags, button, |input| holds.has(input)) {
+		// A process posted it: it tells only whose a read-back hold was.
+		Some(release::Transition::Release(input)) if pid != 0 => holds.posted_release(input),
+		_ if pid != 0 => {},
 		Some(release::Transition::Press(input)) => holds.set(input, true),
 		Some(release::Transition::Release(input)) => holds.set(input, false),
 		_ => {},

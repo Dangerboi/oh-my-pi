@@ -21,7 +21,9 @@ use std::{
 	},
 	path::{Path, PathBuf},
 	process::{Child, Command, Stdio},
-	ptr, slice, thread,
+	ptr, slice,
+	sync::{Arc, Mutex, PoisonError},
+	thread,
 	time::{Duration, Instant},
 };
 
@@ -125,9 +127,12 @@ fn scope_with<T>(
 /// Ends the request's stream, also while a panic unwinds it: the helper
 /// releases whatever is still open, then exits. The request waits for that,
 /// so its input ownership outlasts the releases and the helper's share of
-/// it.
+/// it. A helper still running past [`EXIT_TIMEOUT`] with nothing to release,
+/// such as one that has not finished starting, is stopped rather than left
+/// holding that share into the next request.
 fn end() {
-	let Some(Ledger { helper: Some(helper), .. }) = REQUEST.with_borrow_mut(Option::take) else {
+	let Some(Ledger { open, helper: Some(helper), .. }) = REQUEST.with_borrow_mut(Option::take)
+	else {
 		return;
 	};
 	let Helper { child, socket, ownership, .. } = helper;
@@ -142,15 +147,56 @@ fn end() {
 			_ => return,
 		}
 	}
-	// Reaped off the input thread, keeping its share of input ownership until
-	// then; a failed spawn leaves a zombie rather than a panic during
-	// unwinding.
-	let _ = thread::Builder::new()
-		.name("desktop-release-reaper".into())
-		.spawn(move || {
+	if open.is_empty() {
+		stop(&mut child);
+		return;
+	}
+	reap_detached(child, ownership, spawn_reaper);
+}
+
+/// Reaps a helper still posting releases off the input thread, keeping its
+/// share of input ownership until it exits. When no thread can start for
+/// that (`spawn` fails), it is reaped here: the share must not end while the
+/// helper can still post. The helper ends itself within its release deadline.
+fn reap_detached(
+	child: Child,
+	ownership: Option<control::HandedOwnership>,
+	spawn: fn(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+) {
+	let helper = Arc::new(Mutex::new(Some((child, ownership))));
+	let reap = |helper: &Mutex<Option<(Child, Option<control::HandedOwnership>)>>| {
+		let taken = helper.lock().unwrap_or_else(PoisonError::into_inner).take();
+		if let Some((mut child, ownership)) = taken {
 			let _ = child.wait();
 			drop(ownership);
-		});
+		}
+	};
+	let detached = Arc::clone(&helper);
+	if spawn(Box::new(move || reap(&detached))).is_err() {
+		reap(&helper);
+	}
+}
+
+fn spawn_reaper(reap: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+	thread::Builder::new()
+		.name("desktop-release-reaper".into())
+		.spawn(reap)
+		.map(drop)
+}
+
+/// Stops and reaps a helper. It is asked with `SIGTERM` first and closes its
+/// event tap before it exits: killed with the tap live, it can make the
+/// user's key arrive twice.
+fn stop(child: &mut Child) {
+	let asked = libc::pid_t::try_from(child.id())
+		// SAFETY: the helper is this request's unreaped child.
+		.is_ok_and(|pid| unsafe { libc::kill(pid, libc::SIGTERM) } == 0);
+	let deadline = Instant::now() + STOP_TIMEOUT;
+	while asked && Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+		thread::sleep(Duration::from_millis(2));
+	}
+	let _ = child.kill();
+	let _ = child.wait();
 }
 
 /// Posts `event` on `route` through `deliver`, telling the request's release
@@ -320,23 +366,13 @@ impl Ledger {
 	}
 
 	/// Stops a helper that missed part of the stream before it sees the
-	/// stream end, so it never releases a key this request still holds. It is
-	/// asked with `SIGTERM` first and closes its event tap before it exits:
-	/// killed with the tap live, it can make the user's key arrive twice.
+	/// stream end, so it never releases a key this request still holds.
 	fn abandon(&mut self) {
 		if let Some(Helper {
 			child: Some(mut child), socket: _stream, ownership: _ownership, ..
 		}) = self.helper.take()
 		{
-			let asked = libc::pid_t::try_from(child.id())
-				// SAFETY: the helper is this request's unreaped child.
-				.is_ok_and(|pid| unsafe { libc::kill(pid, libc::SIGTERM) } == 0);
-			let deadline = Instant::now() + STOP_TIMEOUT;
-			while asked && Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
-				thread::sleep(Duration::from_millis(2));
-			}
-			let _ = child.kill();
-			let _ = child.wait();
+			stop(&mut child);
 		}
 		self.unguarded = true;
 	}
@@ -528,6 +564,28 @@ mod tests {
 
 	fn slow_helper() -> io::Result<Helper> {
 		let helper = spawn_at(&stand_in(), None)?;
+		let pid = helper.child.as_ref().map_or(0, Child::id);
+		STARTED.set(libc::pid_t::try_from(pid).expect("process id"));
+		Ok(helper)
+	}
+
+	/// A helper that does not get to the end of its stream in time, as one
+	/// still starting on a loaded machine.
+	fn stuck_helper() -> io::Result<Helper> {
+		thread_local! {
+			static STUCK: RefCell<Option<(HelperDirectory, PathBuf)>> = const { RefCell::new(None) };
+		}
+		let path = STUCK.with_borrow_mut(|stuck| {
+			let (_, path) = stuck.get_or_insert_with(|| {
+				let directory = HelperDirectory::create("omp-release-test").expect("directory");
+				let path = directory
+					.write("helper", b"#!/bin/sh\nexec sleep 5\n", 0o700)
+					.expect("stand-in helper");
+				(directory, path)
+			});
+			path.clone()
+		});
+		let helper = spawn_at(&path, None)?;
 		let pid = helper.child.as_ref().map_or(0, Child::id);
 		STARTED.set(libc::pid_t::try_from(pid).expect("process id"));
 		Ok(helper)
@@ -874,6 +932,32 @@ mod tests {
 			post(Route::Keyboard(7), &shift(false), || Ok(())).expect("Shift up");
 		});
 		assert!(!running(STARTED.get()), "the helper exited first");
+	}
+
+	#[test]
+	fn a_request_with_nothing_open_stops_a_helper_that_outlasts_the_wait() {
+		let began = Instant::now();
+		scope_with(stuck_helper, Presses::Process, || {
+			post(Route::Keyboard(7), &shift(true), || Ok(())).expect("Shift down");
+			post(Route::Keyboard(7), &shift(false), || Ok(())).expect("Shift up");
+		});
+		// Reaped, so its share of input ownership does not reach the next
+		// request.
+		assert!(!running(STARTED.get()), "the helper was stopped");
+		assert!(began.elapsed() < Duration::from_secs(3), "{:?}", began.elapsed());
+	}
+
+	#[test]
+	fn a_helper_whose_reaper_cannot_start_is_reaped_before_the_request_returns() {
+		let Helper { child, socket, .. } = slow_helper().expect("helper");
+		// The stream ends; the helper takes a while to finish, as one posting
+		// releases does.
+		drop(socket);
+		let failing: fn(Box<dyn FnOnce() + Send>) -> io::Result<()> =
+			|_| Err(io::Error::other("no thread"));
+		reap_detached(child.expect("child"), None, failing);
+		// Reaped, so its share of input ownership ended only once it exited.
+		assert!(!running(STARTED.get()), "the helper was reaped");
 	}
 
 	#[test]

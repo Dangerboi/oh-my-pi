@@ -139,7 +139,7 @@ import { releaseCompletionHandles } from "../eval/completion-bridge";
 import { releaseJudgmentBatches } from "../eval/judgment-batch-bridge";
 import type { EvalPreludeDefinition } from "../eval/preludes";
 import type { PythonResult } from "../eval/py/executor";
-import { formatEvalStateContext } from "../eval/state";
+import { EVAL_STATE_CONTEXT_TYPE, formatEvalStateContext, isEvalStateContext } from "../eval/state";
 import { WorkPoolRegistry } from "../task/workpool";
 import { type BashPtyOptions, type BashResult, releaseShellSessions } from "../exec/bash-executor";
 import type { TtsrManager } from "../export/ttsr";
@@ -6897,7 +6897,7 @@ export class AgentSession implements SettingsScope {
 		if (!content) return undefined;
 		for (let index = messages.length - 1; index >= 0; index--) {
 			const message = messages[index];
-			if (message.role === "custom" && message.customType === "eval-state-context") {
+			if (isEvalStateContext(message)) {
 				if (message.content === content) return undefined;
 				break;
 			}
@@ -6905,7 +6905,7 @@ export class AgentSession implements SettingsScope {
 		}
 		return {
 			role: "custom",
-			customType: "eval-state-context",
+			customType: EVAL_STATE_CONTEXT_TYPE,
 			content,
 			display: false,
 			attribution: "agent",

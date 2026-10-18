@@ -196,16 +196,15 @@ pub(crate) fn apply(open: &mut Vec<Open>, record: Record) {
 	}
 }
 
-/// The keys and buttons the user physically holds, as observed on the HID
-/// route.
+/// A set of keys and buttons.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct UserHolds {
+struct Inputs {
 	keys:    u128,
 	buttons: u32,
 }
 
-impl UserHolds {
-	pub(crate) const fn set(&mut self, input: Input, down: bool) {
+impl Inputs {
+	const fn set(&mut self, input: Input, down: bool) {
 		match input {
 			Input::Key(code) if code < 128 => {
 				let bit = 1u128 << code;
@@ -227,6 +226,71 @@ impl UserHolds {
 		}
 	}
 
+	const fn has(self, input: Input) -> bool {
+		match input {
+			Input::Key(code) => code < 128 && self.keys & (1 << code) != 0,
+			Input::Button(number) => number < 32 && self.buttons & (1 << number) != 0,
+		}
+	}
+}
+
+/// The keys and buttons the user physically holds, as observed on the HID
+/// route.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UserHolds {
+	held:   Inputs,
+	/// Held ones read back from the HID state after the tap missed events
+	/// ([`Self::resync`]), which may be this request's own presses until
+	/// their next transition says.
+	unsure: Inputs,
+}
+
+impl UserHolds {
+	/// Applies a transition of the user's own.
+	pub(crate) const fn set(&mut self, input: Input, down: bool) {
+		self.held.set(input, down);
+		self.unsure.set(input, false);
+	}
+
+	/// Adds `down` as the user's own holds.
+	pub(crate) const fn hold_all(&mut self, down: Self) {
+		self.held.keys |= down.held.keys;
+		self.held.buttons |= down.held.buttons;
+	}
+
+	/// Applies the release of `input` that a process posted: a hold read back
+	/// unsure was that process's press.
+	pub(crate) const fn posted_release(&mut self, input: Input) {
+		if self.unsure.has(input) {
+			self.held.set(input, false);
+			self.unsure.set(input, false);
+		}
+	}
+
+	/// Takes the HID state (`down`, the user's holds and this request's
+	/// presses alike) after the tap missed events: holds the user released
+	/// meanwhile end, and every key and button down counts as the user's,
+	/// unsure until its next transition, since a press of this request's may
+	/// hold it: one the user held before the gap may have been let go of and
+	/// pressed by the request in it.
+	pub(crate) const fn resync(&mut self, down: Self) {
+		self.held = down.held;
+		self.unsure = down.held;
+	}
+
+	/// The holds a release plan for `open` trusts: an unsure hold of an input
+	/// a press of this request holds on the HID route is taken for that press,
+	/// so it is released rather than left down.
+	fn for_plan(mut self, open: &[Open]) -> Self {
+		for press in open {
+			if press.route == Route::Hid && self.unsure.has(press.input) {
+				self.held.set(press.input, false);
+			}
+		}
+		self.unsure = Inputs::default();
+		self
+	}
+
 	/// Whether the user holds `input`, or for a modifier, the same modifier on
 	/// either side: both sides share one modifier flag.
 	pub(crate) fn holds(self, input: Input) -> bool {
@@ -241,10 +305,7 @@ impl UserHolds {
 
 	/// Whether the user holds exactly `input`.
 	pub(crate) const fn has(self, input: Input) -> bool {
-		match input {
-			Input::Key(code) => code < 128 && self.keys & (1 << code) != 0,
-			Input::Button(number) => number < 32 && self.buttons & (1 << number) != 0,
-		}
+		self.held.has(input)
 	}
 
 	fn flags(self) -> u64 {
@@ -319,11 +380,11 @@ impl Observation {
 		self.settled.notify_all();
 	}
 
-	/// The user's holds for the release plan, once the observer thread has
-	/// applied every transition queued before now, or after `SETTLE_TIMEOUT`
-	/// as they stand. Before `READY` they do not matter, since nothing went to
-	/// the shared HID route.
-	pub(crate) fn settle(&self) -> UserHolds {
+	/// The user's holds for the release plan of `open`, once the observer
+	/// thread has applied every transition queued before now, or after
+	/// `SETTLE_TIMEOUT` as they stand. Before `READY` they do not matter, since
+	/// nothing went to the shared HID route.
+	pub(crate) fn settle(&self, open: &[Open]) -> UserHolds {
 		let mut phase = self.phase();
 		if matches!(*phase, Phase::Following(_))
 			&& let Phase::Following(stop) = mem::replace(&mut *phase, Phase::Stopping)
@@ -335,7 +396,7 @@ impl Observation {
 				.settled
 				.wait_timeout_while(phase, SETTLE_TIMEOUT, |phase| matches!(phase, Phase::Stopping)),
 		);
-		*self.holds()
+		self.holds().for_plan(open)
 	}
 }
 
@@ -703,9 +764,47 @@ mod tests {
 			let at_ready = readied.recv().unwrap();
 			// The user lets go as the host dies, before the run loop gets to it.
 			queue.lock().unwrap().push((shift, false));
-			(at_ready, observation.settle())
+			(at_ready, observation.settle(&[]))
 		});
 		assert!(at_ready.has(shift), "READY reports the queued press");
 		assert!(!planned.has(shift), "the plan sees the queued release");
+	}
+
+	#[test]
+	fn holds_read_back_after_the_tap_missed_events_are_the_users_unless_a_press_holds_them() {
+		let open = [press(1, Route::Hid, Input::Key(SHIFT)), press(2, Route::Hid, Input::Key(A))];
+		let observation = Observation::default();
+		{
+			let mut holds = observation.holds();
+			// The user held Option when the tap stopped. Unseen, they let go of it
+			// and pressed right Shift, while this request pressed Shift and A.
+			holds.set(Input::Key(OPTION), true);
+			holds.resync(holding(&[Input::Key(RIGHT_SHIFT), Input::Key(SHIFT), Input::Key(A)]));
+		}
+		// The user's right Shift keeps Shift, whose release would cut it short;
+		// A, which only this request may hold, is released with the user's
+		// Shift and without the Option they let go of.
+		assert_eq!(plan(&open, observation.settle(&open)), [
+			Step::Post { id: 2, flags: Some(0x20000) },
+			Step::Leave { id: 1 },
+		]);
+		// A read-back hold whose release a process posts was that process's.
+		let observation = Observation::default();
+		observation.holds().resync(holding(&[Input::Key(OPTION)]));
+		observation.holds().posted_release(Input::Key(OPTION));
+		assert!(!observation.settle(&[]).has(Input::Key(OPTION)));
+		// The user held A when the tap stopped, let go of it unseen, and this
+		// request pressed A: still down, it is the request's press to release.
+		let open = [press(3, Route::Hid, Input::Key(A))];
+		let observation = Observation::default();
+		observation.holds().set(Input::Key(A), true);
+		observation.holds().resync(holding(&[Input::Key(A)]));
+		assert_eq!(plan(&open, observation.settle(&open)), [Step::Post { id: 3, flags: Some(0) }]);
+		// A hold that is still down with no press of this request on it stays
+		// the user's.
+		let observation = Observation::default();
+		observation.holds().set(Input::Key(A), true);
+		observation.holds().resync(holding(&[Input::Key(A)]));
+		assert!(observation.settle(&[]).has(Input::Key(A)));
 	}
 }
