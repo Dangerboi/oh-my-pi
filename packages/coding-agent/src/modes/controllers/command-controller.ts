@@ -72,7 +72,9 @@ import {
 	createSessionWorktree,
 	defaultSessionWorktreeBranch,
 	formatSessionWorktreeSummary,
+	mayCleanSourceAfter,
 	type SessionWorktree,
+	sessionWorktreeWarnings,
 } from "../../session/session-worktree";
 import { formatShakeSummary, type ShakeMode, type ShakeResult } from "../../session/shake-types";
 import {
@@ -1740,16 +1742,11 @@ export class CommandController {
 			}
 			if (!(await this.#relocateSession(worktree.path))) return false;
 			created = worktree;
-			// A failed hook may have left the carried-over files half-rewritten; keep the source as the intact copy.
-			const cleanup =
-				worktree.keptChanges && !worktree.hookError
-					? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
-					: { cleaned: false, errorMessage: undefined };
-			if (cleanup.errorMessage !== undefined) {
-				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
-			}
-			for (const notice of [worktree.hookError, worktree.hookSkipped]) {
-				if (notice) this.ctx.showWarning(`Worktree created, but ${notice}`);
+			const cleanup = mayCleanSourceAfter(worktree)
+				? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
+				: { cleaned: false, errorMessage: undefined };
+			for (const warning of sessionWorktreeWarnings(worktree, cleanup.errorMessage)) {
+				this.ctx.showWarning(`Worktree created, but ${warning}`);
 			}
 			this.ctx.present([
 				new Spacer(1),

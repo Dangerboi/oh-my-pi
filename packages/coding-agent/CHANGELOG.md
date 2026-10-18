@@ -19,7 +19,8 @@
 
 ### Fixed
 
-- `/wt` and `github` `pr_checkout` now run the new worktree's `post-checkout` hook, like `git worktree add`; a failing hook keeps the worktree, leaves the source checkout uncleaned, and shows a warning ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- `/wt` (including the worktree `worktree.onStart` creates) and `github` `pr_checkout` now run the new worktree's `post-checkout` hook, like `git worktree add`; a failing hook keeps the worktree, leaves the source checkout uncleaned, and shows a warning, as does a hook that exists but can't run ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- `omp worktree add` now warns when the `post-checkout` hook exists but didn't run, and shows at most the last 64 KiB of each hook output stream ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Git hooks in a `core.hooksPath` written with `~/` are now found for commits and the bash `git worktree add` rewrite, as git finds them ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Fixed image judgments (`judge()`/`judge_batch()` with images) leaving TypeSafe Jev for the local `tiny` model whenever an image fell outside Jev's 280–1568 px bounds, which most screenshots do: images are now resized into the bounds, and strips padded, before Jev sees them
 - Fixed a Codex turn stopping on "Request failed … unsupported_native_inflight_message" when you sent a message while the response was writing text; the session now keeps the partial reply and continues with your message

@@ -24,7 +24,8 @@ import { filterChildShellEnv, getWorktreesDir, isEnoent } from "@oh-my-pi/pi-uti
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
 import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
-import { describeSkippedHook, formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+import { describeSkippedHook } from "../utils/worktree-hook";
 
 import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
 

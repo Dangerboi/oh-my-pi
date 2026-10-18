@@ -174,7 +174,7 @@ describe("CommandController /move", () => {
 					sourceCwd: sourceDir,
 					baseCommit: "0",
 					keptChanges: true,
-					hookError,
+					hook: { error: hookError },
 				};
 			});
 			const cleanup = vi.spyOn(sessionWorktree, "cleanSourceCheckoutIfConfigured");

@@ -190,9 +190,10 @@ async function untilAborted(promise, signal) {
 /**
  * Run `git <args>` with output to files and resolve with its exit code. Aborting `signal`
  * kills the whole process tree, so nothing a wrapper or hook started outlives the abort,
- * and rejects with the reason. Throws `ENOENT` when no git is on `env`'s PATH.
+ * and rejects with the reason. Throws `ENOENT` when no git is on `env`'s PATH. `detached`
+ * runs it in its own session even without a signal (POSIX), away from the caller's terminal.
  */
-async function runGitToFiles(args, { cwd, env, stdout, stderr, signal }) {
+async function runGitToFiles(args, { cwd, env, stdout, stderr, signal, detached = false }) {
 	const posix = process.platform !== "win32";
 	// No await between this check and the abort listener below, so no abort can be missed.
 	signal?.throwIfAborted();
@@ -202,8 +203,9 @@ async function runGitToFiles(args, { cwd, env, stdout, stderr, signal }) {
 		stdin: "ignore",
 		stdout,
 		stderr,
-		// With a signal, own process group (setsid) so an abort also stops what it spawned, e.g. `npm install`.
-		detached: posix && signal !== undefined,
+		// Own session (setsid): an abort can stop what it spawned, e.g. `npm install`, and without a controlling
+		// terminal a prompt on /dev/tty fails instead of writing into the caller's TUI.
+		detached: posix && (detached || signal !== undefined),
 	});
 	// Windows has no process groups; pin the root now so killTree still finds its descendants on abort.
 	// shortcut: killTree misses descendants of MSYS `sh` fork stubs (taskkill /T does too); a Job Object would catch them.
@@ -258,35 +260,14 @@ async function hookRunnerProblem(captureDir, cwd, env, signal) {
 const PROBE_OUTPUT_BYTES = 4096;
 const readProbeOutput = file => Bun.file(file).slice(0, PROBE_OUTPUT_BYTES).text();
 
-/** Config overrides git honours but gix does not read. */
-const GIX_IGNORED_CONFIG_VARS = new Set([
-	"GIT_CONFIG_PARAMETERS",
-	"GIT_CONFIG_GLOBAL",
-	"GIT_CONFIG_SYSTEM",
-	"GIT_CONFIG_NOSYSTEM",
-]);
-/** Where global config lives; gix takes it from this process's environment, git from the hook's. */
-const CONFIG_HOME_VARS = new Set(["HOME", "XDG_CONFIG_HOME", "USERPROFILE"]);
-/** gix reads these, but from this process's environment, not from the one the hook gets. */
-const readsFromProcessEnv = name =>
-	CONFIG_HOME_VARS.has(name.toUpperCase()) || /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/i.test(name);
-
 /**
- * Where git looks for the `post-checkout` hook. Found in-process, as `find_hook` does, unless
- * `env` carries config the in-process lookup would not see: an override gix does not read, or a
- * different home or `GIT_CONFIG_COUNT` entries than this process's. Then git itself answers; if
- * that git can't, the in-process answer stands, so a hook it finds is reported as not run rather
- * than silently treated as missing.
+ * Where git looks for the `post-checkout` hook. The git on `env`'s PATH answers whenever it can,
+ * since only it sees every config source (wrappers, distribution system config, `-c` and
+ * environment overrides). Without a git that starts and answers, the in-process lookup (`find_hook`
+ * rules) stands, so a hook it finds is reported as not run rather than treated as missing.
  */
 async function postCheckoutHookPath(captureDir, worktreeRoot, env, signal) {
 	const inProcess = () => git(worktreeRoot)?.hookLocation("post-checkout", signal);
-	const childEnv = env ?? process.env;
-	const overridden =
-		Object.keys(childEnv).some(name => GIX_IGNORED_CONFIG_VARS.has(name.toUpperCase())) ||
-		[...Object.keys(childEnv), ...Object.keys(process.env)].some(
-			name => readsFromProcessEnv(name) && childEnv[name] !== process.env[name],
-		);
-	if (!overridden) return inProcess();
 	const outPath = path.join(captureDir, "git-path");
 	try {
 		const args = ["rev-parse", "--git-path", "hooks/post-checkout"];
@@ -296,21 +277,25 @@ async function postCheckoutHookPath(captureDir, worktreeRoot, env, signal) {
 		if (GIT_CANNOT_START.has(error?.code)) return inProcess();
 		throw error;
 	}
+	const reported = (await readProbeOutput(outPath)).trim();
+	// Nothing usable (empty, or an MSYS/Cygwin `/c/…` path on Windows): fall back rather than call the hook missing.
+	if (!reported || (process.platform === "win32" && reported.startsWith("/"))) return inProcess();
 	// A relative result is relative to the worktree, where `git hook run` runs.
-	return path.resolve(worktreeRoot, (await readProbeOutput(outPath)).trim());
+	return path.resolve(worktreeRoot, reported);
 }
 
 /**
  * Run Git's checkout hook in a newly created linked worktree, using the same
- * null old HEAD and branch-switch flag as `git worktree add`. Without a hook
- * nothing is spawned unless `GIT_CONFIG*` overrides make git locate it. Returns
- * once `git hook run` exits, even if the hook left a background process running,
- * with the last 64 KiB of each output stream; `skipped` says why an existing hook
- * did not run. Aborting `options.signal` kills the hook's process tree and rejects
- * with the reason, also while a filesystem check is stalled.
+ * null old HEAD and branch-switch flag as `git worktree add`. Git locates the
+ * hook; without a usable git the in-process lookup does, so no git binary is
+ * needed when there is no hook. Returns once `git hook run` exits, even if the
+ * hook left a background process running, with the last 64 KiB of each output
+ * stream; `skipped` says why an existing hook did not run. Aborting
+ * `options.signal` kills the hook's process tree and rejects with the reason,
+ * also while a filesystem check is stalled.
  */
 export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
-	const { signal, env } = options;
+	const { signal, env, detached } = options;
 	signal?.throwIfAborted();
 	const notRun = { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
 	const posix = process.platform !== "win32";
@@ -318,14 +303,22 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	// Files, not pipes: a background process git or the hook starts inherits them, and pipes would stay open until it exits.
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
 	try {
-		const hookPath = await postCheckoutHookPath(dir, worktreeRoot, env, signal);
-		if (!hookPath) return notRun;
+		const foundAt = await postCheckoutHookPath(dir, worktreeRoot, env, signal);
+		if (!foundAt) return notRun;
 		// Only a missing path means no hook; any other failure (EACCES, EIO) is reported, not mistaken for one.
 		const missing = error => error?.code === "ENOENT" || error?.code === "ENOTDIR";
-		const stat = await untilAborted(
-			fs.promises.stat(hookPath).catch(error => (missing(error) ? null : error)),
-			signal,
-		);
+		const statHook = file =>
+			untilAborted(
+				fs.promises.stat(file).catch(error => (missing(error) ? null : error)),
+				signal,
+			);
+		let hookPath = foundAt;
+		let stat = await statHook(hookPath);
+		// Git for Windows' `find_hook` also takes the name with `.exe` appended.
+		if (!posix && stat === null) {
+			const exeStat = await statHook(`${foundAt}.exe`);
+			if (exeStat !== null) [hookPath, stat] = [`${foundAt}.exe`, exeStat];
+		}
 		if (stat instanceof Error) return { ...notRun, skipped: { path: hookPath, reason: "inaccessible" } };
 		if (!stat?.isFile()) return notRun;
 		// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
@@ -349,6 +342,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 			stdout: Bun.file(outPath),
 			stderr: Bun.file(errPath),
 			signal,
+			detached,
 		});
 		const tail = file => file.slice(Math.max(0, file.size - HOOK_OUTPUT_TAIL_BYTES)).bytes();
 		const [stdout, stderr] = await Promise.all([tail(Bun.file(outPath)), tail(Bun.file(errPath))]);

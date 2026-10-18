@@ -10,19 +10,19 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { IsoBackendKind, VcsWorktreeAddResult } from "@oh-my-pi/pi-natives";
+import type { IsoBackendKind } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreeDir, hashPath, logger } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { Settings } from "../config/settings";
-import {
-	discardNewWorktree,
-	formatIsolationBackend,
-	parseIsolationBackend,
-	runWorktreeCheckoutHook,
-	type WorktreeCheckoutHookResult,
-} from "../task/worktree";
+import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 import { resolveAvailableWorktreePath } from "../tools/gh-pr-checkout";
+import {
+	addWorktreeWithHook,
+	type WorktreeCheckoutHookResult,
+	type WorktreeSetup,
+	worktreeHookWarnings,
+} from "../utils/worktree-hook";
 
 import { cfgIsolationBackend, cfgWorktreeCleanSource, cfgWorktreeClone } from "../task/settings";
 
@@ -35,10 +35,8 @@ export interface SessionWorktree {
 	clonedWith?: IsoBackendKind;
 	/** Why the clone fell back to a plain checkout, when it did. */
 	cloneError?: string;
-	/** Why the worktree's `post-checkout` hook failed, when it did; the worktree is kept, as with `git worktree add`. */
-	hookError?: string;
-	/** Set when the worktree's `post-checkout` hook exists but did not run (not executable, or no git that can run hooks). */
-	hookSkipped?: string;
+	/** Outcome of the worktree's `post-checkout` hook; a failed hook keeps the worktree, as with `git worktree add`. */
+	hook?: WorktreeCheckoutHookResult;
 	/** Checkout the worktree was forked from. */
 	sourceCwd: string;
 	/** Source `HEAD` the worktree branch was created at. */
@@ -119,6 +117,22 @@ export async function cleanSourceCheckoutIfConfigured(
 		};
 	}
 }
+
+/**
+ * Whether `/wt` may clean the source checkout after moving into `worktree`: only when changes were
+ * carried over and the hook did not fail, since a failed hook may have left the carried-over files
+ * half-rewritten and the source is then the intact copy.
+ */
+export function mayCleanSourceAfter(worktree: SessionWorktree): boolean {
+	return worktree.keptChanges && !worktree.hook?.error;
+}
+
+/** Warnings to show after `/wt` moved into `worktree`; each completes "Worktree created, but …". */
+export function sessionWorktreeWarnings(worktree: SessionWorktree, cleanupError: string | undefined): string[] {
+	const cleanup = cleanupError === undefined ? [] : [`cleaning source checkout failed: ${cleanupError}`];
+	return [...cleanup, ...worktreeHookWarnings(worktree.hook)];
+}
+
 /**
  * Create the worktree for `/wt`. Throws with a user-facing message when `cwd`
  * is not a git checkout, `branch` already exists, or git refuses. If creating the
@@ -159,45 +173,36 @@ export async function createSessionWorktree(
 	await fs.mkdir(path.dirname(worktreePath), { recursive: true });
 
 	await repository.createBranch(branch, baseCommit, false);
-	// Created just above (it did not exist), so it is this attempt's to delete if setup fails.
-	const deleteNewBranch = () =>
-		repository.deleteBranch(branch, true).catch(deleteError => {
+	let setUp: WorktreeSetup;
+	try {
+		setUp = await addWorktreeWithHook(
+			repository,
+			worktreePath,
+			branch,
+			{
+				detach: false,
+				clone: cfgWorktreeClone.get(settings),
+				backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
+				keepChanges,
+			},
+			options.signal,
+		);
+	} catch (error) {
+		// Created just above (it did not exist), so it is this attempt's to delete when setup fails.
+		await repository.deleteBranch(branch, true).catch(deleteError => {
 			logger.warn("could not delete the branch of a /wt worktree whose setup was cut short", {
 				branch,
 				error: String(deleteError),
 			});
 		});
-	let result: VcsWorktreeAddResult;
-	try {
-		options.signal?.throwIfAborted();
-		// No signal: the native checkout runs to completion regardless, and an abort-rejected call would not
-		// say whether this attempt created the worktree; another process may own the path by now.
-		result = await repository.worktreeAdd(worktreePath, branch, {
-			detach: false,
-			clone: cfgWorktreeClone.get(settings),
-			backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
-			keepChanges,
-		});
-	} catch (error) {
-		await deleteNewBranch();
-		throw error;
-	}
-	let hook: WorktreeCheckoutHookResult;
-	try {
-		options.signal?.throwIfAborted();
-		hook = await runWorktreeCheckoutHook(worktreePath, baseCommit, options.signal);
-	} catch (error) {
-		await discardNewWorktree(repository, worktreePath);
-		await deleteNewBranch();
 		throw error;
 	}
 	return {
 		path: await fs.realpath(worktreePath),
 		branch,
-		clonedWith: result.clonedWith ?? undefined,
-		cloneError: result.cloneError ?? undefined,
-		hookError: hook.error,
-		hookSkipped: hook.skipped,
+		clonedWith: setUp.added.clonedWith ?? undefined,
+		cloneError: setUp.added.cloneError ?? undefined,
+		hook: setUp.hook,
 		sourceCwd: cwd,
 		baseCommit,
 		keptChanges: keepChanges,

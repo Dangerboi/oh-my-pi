@@ -18,7 +18,7 @@ import {
 	type SessionWorktreeState,
 	type WorktreeExitAction,
 } from "../../src/session/session-worktree";
-import { runWorktreeCheckoutHook } from "../../src/task/worktree";
+import { runWorktreeCheckoutHook } from "../../src/utils/worktree-hook";
 
 const clean: SessionWorktreeState = { dirty: false, moved: false, offBranch: false };
 
@@ -312,13 +312,13 @@ describe("session worktree helpers (real git)", () => {
 			const marker = (await Bun.file(path.join(wt.path, ".post-checkout-ran")).text()).trim().split("\n");
 
 			expect(marker).toEqual([wt.path, "0".repeat(wt.baseCommit.length), wt.baseCommit, "1"]);
-			expect(wt.hookError).toBeUndefined();
+			expect(wt.hook?.error).toBeUndefined();
 		});
 
 		it("hides the agent's own GIT_DIR from the hook", async () => {
 			const wt = await create();
 			await hook("git rev-parse --absolute-git-dir > .git-dir-seen");
-			const helper = path.resolve(import.meta.dir, "../../src/task/worktree.ts");
+			const helper = path.resolve(import.meta.dir, "../../src/utils/worktree-hook.ts");
 			const script = `import { runWorktreeCheckoutHook } from ${JSON.stringify(helper)};
 await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.baseCommit)});`;
 			// Launched with GIT_DIR, as omp is from a git hook or `git --git-dir` wrapper; spawns inherit the launch env.
@@ -338,7 +338,7 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			const wt = await create();
 
 			expect(worktreePaths(repo)).toContain(wt.path);
-			expect(wt.hookError).toBe("post-checkout hook exited with 17: setup failed in ~/proj");
+			expect(wt.hook?.error).toBe("post-checkout hook exited with 17: setup failed in ~/proj");
 		});
 
 		it("reports a non-executable hook without running it", async () => {
@@ -347,10 +347,8 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			const wt = await create();
 
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
-			expect(wt.hookError).toBeUndefined();
-			expect(wt.hookSkipped).toBe(
-				`post-checkout hook ${path.join(repo, ".git", "hooks", "post-checkout")} is not executable, so git skipped it`,
-			);
+			expect(wt.hook?.error).toBeUndefined();
+			expect(wt.hook?.skipped).toContain("is not executable");
 		});
 
 		const gitlessRows: [name: string, hookPresent: boolean, fakeGit: string | null, reason?: "no-git" | "old-git"][] =
@@ -422,65 +420,6 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(await exists(path.join(retried.path, ".post-checkout-ran"))).toBe(true);
 		});
 
-		it("keeps the in-process lookup when the supplied env has this process's GIT_CONFIG_COUNT", async () => {
-			const wt = await create();
-			await hook("touch .post-checkout-ran");
-			const bin = path.join(root, "empty-bin");
-			await fs.mkdir(bin);
-			const previous = process.env.GIT_CONFIG_COUNT;
-			process.env.GIT_CONFIG_COUNT = "0";
-			try {
-				// No git to ask, so only the in-process lookup can find the hook and report it as not run.
-				const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
-					env: { PATH: bin, GIT_CONFIG_COUNT: "0" },
-				});
-
-				expect(result.skipped?.reason).toBe("no-git");
-			} finally {
-				if (previous === undefined) delete process.env.GIT_CONFIG_COUNT;
-				else process.env.GIT_CONFIG_COUNT = previous;
-			}
-		});
-
-		it("asks git when the supplied env has another HOME whose global config picks the hooks", async () => {
-			const wt = await create();
-			const home = path.join(root, "child-home");
-			const injected = path.join(root, "home-hooks");
-			await Bun.write(path.join(home, ".gitconfig"), `[core]\n\thooksPath = ${injected}\n`);
-			await Bun.write(path.join(injected, "post-checkout"), "#!/bin/sh\ntouch .post-checkout-ran\n");
-			await fs.chmod(path.join(injected, "post-checkout"), 0o755);
-			const {
-				GIT_CONFIG_GLOBAL: _global,
-				GIT_CONFIG_SYSTEM: _system,
-				GIT_CONFIG_NOSYSTEM: _noSystem,
-				...ambient
-			} = filterChildShellEnv(process.env);
-			// Without those overrides, which other suites set, git reads the global config from the child's HOME.
-			const env = { ...ambient, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config") };
-			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
-
-			expect(result.exitCode).toBe(0);
-			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
-		});
-
-		it("asks git when only the supplied env sets core.hooksPath through GIT_CONFIG_COUNT", async () => {
-			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
-			const wt = await create();
-			const injected = path.join(root, "count-hooks");
-			await Bun.write(path.join(injected, "post-checkout"), "#!/bin/sh\ntouch .post-checkout-ran\n");
-			await fs.chmod(path.join(injected, "post-checkout"), 0o755);
-			const env = {
-				...filterChildShellEnv(process.env),
-				GIT_CONFIG_COUNT: "1",
-				GIT_CONFIG_KEY_0: "core.hooksPath",
-				GIT_CONFIG_VALUE_0: injected,
-			};
-			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
-
-			expect(result.exitCode).toBe(0);
-			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
-		});
-
 		it("reports a hook as not run when the git on PATH cannot start", async () => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");
@@ -516,18 +455,60 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(branchSha(repo, branch)).toBeNull();
 		});
 
-		it("finds the hook that git's own config overrides select", async () => {
-			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
+		it("lets the git on PATH locate the hook, including config only it knows about", async () => {
 			const wt = await create();
-			const injected = path.join(root, "injected-hooks");
+			const injected = path.join(root, "wrapper-hooks");
 			await Bun.write(path.join(injected, "post-checkout"), "#!/bin/sh\ntouch .post-checkout-ran\n");
 			await fs.chmod(path.join(injected, "post-checkout"), 0o755);
-			// As `git -c core.hooksPath=…` passes it to a child; gix does not read it.
-			const env = { ...filterChildShellEnv(process.env), GIT_CONFIG_PARAMETERS: `'core.hooksPath'='${injected}'` };
+			const systemConfig = path.join(root, "wrapper-gitconfig");
+			await Bun.write(systemConfig, `[core]\n\thooksPath = ${injected}\n`);
+			// A wrapper bringing its own system config, as some git distributions do.
+			const bin = path.join(root, "wrapper-bin");
+			await Bun.write(
+				path.join(bin, "git"),
+				`#!/bin/sh\nexport GIT_CONFIG_SYSTEM="${systemConfig}" GIT_CONFIG_GLOBAL=/dev/null\nexec "${Bun.which("git")}" "$@"\n`,
+			);
+			await fs.chmod(path.join(bin, "git"), 0o755);
+			const {
+				GIT_CONFIG_GLOBAL: _global,
+				GIT_CONFIG_SYSTEM: _system,
+				GIT_CONFIG_NOSYSTEM: _noSystem,
+				...ambient
+			} = filterChildShellEnv(process.env);
+			// The supplied environment itself carries no config override.
+			const env = { ...ambient, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
 			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
 
 			expect(result.exitCode).toBe(0);
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
+		});
+
+		it("falls back to the in-process lookup when the git on PATH reports no hook path", async () => {
+			const wt = await create();
+			await hook("touch .post-checkout-ran");
+			const bin = path.join(root, "quiet-bin");
+			await Bun.write(
+				path.join(bin, "git"),
+				`#!/bin/sh\n[ "$1" = rev-parse ] && exit 0\nexec "${Bun.which("git")}" "$@"\n`,
+			);
+			await fs.chmod(path.join(bin, "git"), 0o755);
+			const env = { ...filterChildShellEnv(process.env), PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
+
+			expect(result.exitCode).toBe(0);
+			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
+		});
+
+		it("runs the hook away from the terminal of the agent that started it", async () => {
+			await hook("ps -o pgid= -p $$ > .post-checkout-group");
+			const wt = await create();
+			const hookGroup = (await Bun.file(path.join(wt.path, ".post-checkout-group")).text()).trim();
+			const ownGroup = Bun.spawnSync(["ps", "-o", "pgid=", "-p", String(process.pid)])
+				.stdout.toString()
+				.trim();
+
+			// Its own session and process group (setsid), so a prompt on /dev/tty fails instead of writing into the TUI.
+			expect(hookGroup).not.toBe(ownGroup);
 		});
 
 		it("returns when a git wrapper's background child keeps the version output open", async () => {
@@ -585,7 +566,7 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			const sleeper = Number((await Bun.file(path.join(wt.path, ".sleeper")).text()).trim());
 			process.kill(sleeper, "SIGKILL");
 
-			expect(wt.hookError).toBeUndefined();
+			expect(wt.hook?.error).toBeUndefined();
 		});
 
 		it("abort rejects promptly and kills what the hook spawned", async () => {

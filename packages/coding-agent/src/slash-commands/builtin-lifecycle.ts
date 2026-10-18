@@ -17,7 +17,9 @@ import {
 	createSessionWorktree,
 	defaultSessionWorktreeBranch,
 	formatSessionWorktreeSummary,
+	mayCleanSourceAfter,
 	type SessionWorktree,
+	sessionWorktreeWarnings,
 } from "../session/session-worktree";
 import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
@@ -747,17 +749,11 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			}
 			const failure = await relocateHeadlessSession(runtime, worktree.path);
 			if (failure) return failure;
-			// A failed hook may have left the carried-over files half-rewritten; keep the source as the intact copy.
-			const cleanup = worktree.hookError
-				? { cleaned: false, errorMessage: undefined }
-				: await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings);
-			if (cleanup.errorMessage !== undefined) {
-				await runtime.output(
-					`Warning: Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`,
-				);
-			}
-			for (const notice of [worktree.hookError, worktree.hookSkipped]) {
-				if (notice) await runtime.output(`Warning: Worktree created, but ${notice}`);
+			const cleanup = mayCleanSourceAfter(worktree)
+				? await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings)
+				: { cleaned: false, errorMessage: undefined };
+			for (const warning of sessionWorktreeWarnings(worktree, cleanup.errorMessage)) {
+				await runtime.output(`Warning: Worktree created, but ${warning}`);
 			}
 			await runtime.output(formatSessionWorktreeSummary(worktree, cleanup.cleaned));
 			return commandConsumed();
