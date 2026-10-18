@@ -642,8 +642,9 @@ export async function runWorktreeCheckoutHook(
 
 /**
  * Discard a worktree created moments ago whose setup did not complete, so a retry starts over
- * instead of reusing a half-set-up checkout without rerunning its hook. When it is no longer
- * discoverable (never created, or its `.git` file is gone), deletes the directory and prunes the
+ * instead of reusing a half-set-up checkout without rerunning its hook. Call it only after this
+ * attempt's own `worktreeAdd` resolved: the path may otherwise belong to another process. When it
+ * is no longer discoverable (its `.git` file is gone), deletes the directory and prunes the
  * registration that now points nowhere. Takes no signal, as the caller's may already be aborted;
  * failures are logged, not thrown, so the original error reaches the caller.
  */

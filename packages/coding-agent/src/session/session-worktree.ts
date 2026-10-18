@@ -159,30 +159,36 @@ export async function createSessionWorktree(
 	await fs.mkdir(path.dirname(worktreePath), { recursive: true });
 
 	await repository.createBranch(branch, baseCommit, false);
-	let result: VcsWorktreeAddResult;
-	let hook: WorktreeCheckoutHookResult;
-	try {
-		result = await repository.worktreeAdd(
-			worktreePath,
-			branch,
-			{
-				detach: false,
-				clone: cfgWorktreeClone.get(settings),
-				backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
-				keepChanges,
-			},
-			options.signal,
-		);
-		hook = await runWorktreeCheckoutHook(worktreePath, baseCommit, options.signal);
-	} catch (error) {
-		// The worktree path and branch were unused before this call.
-		await discardNewWorktree(repository, worktreePath);
-		await repository.deleteBranch(branch, true).catch(deleteError => {
+	// Created just above (it did not exist), so it is this attempt's to delete if setup fails.
+	const deleteNewBranch = () =>
+		repository.deleteBranch(branch, true).catch(deleteError => {
 			logger.warn("could not delete the branch of a /wt worktree whose setup was cut short", {
 				branch,
 				error: String(deleteError),
 			});
 		});
+	let result: VcsWorktreeAddResult;
+	try {
+		options.signal?.throwIfAborted();
+		// No signal: the native checkout runs to completion regardless, and an abort-rejected call would not
+		// say whether this attempt created the worktree; another process may own the path by now.
+		result = await repository.worktreeAdd(worktreePath, branch, {
+			detach: false,
+			clone: cfgWorktreeClone.get(settings),
+			backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
+			keepChanges,
+		});
+	} catch (error) {
+		await deleteNewBranch();
+		throw error;
+	}
+	let hook: WorktreeCheckoutHookResult;
+	try {
+		options.signal?.throwIfAborted();
+		hook = await runWorktreeCheckoutHook(worktreePath, baseCommit, options.signal);
+	} catch (error) {
+		await discardNewWorktree(repository, worktreePath);
+		await deleteNewBranch();
 		throw error;
 	}
 	return {

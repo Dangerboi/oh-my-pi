@@ -510,29 +510,28 @@ export async function checkoutPullRequest(
 			if (!existingWorktree) {
 				finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
 				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
+				signal?.throwIfAborted();
+				// No signal: the native checkout runs to completion regardless, and an abort-rejected call would not
+				// say whether this attempt created the worktree. Another process may have taken the path meanwhile,
+				// so only a worktree this call reports as created is ever discarded below.
+				const result = await repository.worktreeAdd(finalWorktreePath, localBranch, {
+					detach: false,
+					clone: cfgWorktreeClone.get(session.settings),
+					backend: parseIsolationBackend(cfgIsolationBackend.get(session.settings)),
+				});
+				clonedWith = result.clonedWith ?? undefined;
+				if (result.cloneError) {
+					logger.warn("worktree clone fell back to plain checkout", {
+						path: finalWorktreePath,
+						error: result.cloneError,
+					});
+				}
 				try {
-					const result = await repository.worktreeAdd(
-						finalWorktreePath,
-						localBranch,
-						{
-							detach: false,
-							clone: cfgWorktreeClone.get(session.settings),
-							backend: parseIsolationBackend(cfgIsolationBackend.get(session.settings)),
-						},
-						signal,
-					);
-					clonedWith = result.clonedWith ?? undefined;
-					if (result.cloneError) {
-						logger.warn("worktree clone fell back to plain checkout", {
-							path: finalWorktreePath,
-							error: result.cloneError,
-						});
-					}
+					signal?.throwIfAborted();
 					const head = await repository.resolveRef(`refs/heads/${localBranch}`, signal);
 					if (head) hook = await runWorktreeCheckoutHook(finalWorktreePath, head, signal);
 				} catch (error) {
-					// Stopping anywhere before the hook completed can leave a registered, half-set-up worktree;
-					// the path was unused before this call.
+					// Stopping before the hook completed can leave a half-set-up worktree a retry would reuse.
 					await discardNewWorktree(repository, finalWorktreePath);
 					throw error;
 				}

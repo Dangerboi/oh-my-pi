@@ -1303,6 +1303,28 @@ describe("github tool", () => {
 				await expect(checkout(126, controller.signal)).rejects.toThrow();
 				await expectDiscarded(126);
 			});
+
+			it("leaves alone a worktree another process created at the chosen path first", async () => {
+				mockPrView(127);
+				const repoProto = Object.getPrototypeOf(vcs.requireGit(fixture.repoRoot));
+				const worktreeAdd = repoProto.worktreeAdd;
+				let taken = "";
+				// Another process wins the race for the same free path, so this attempt's add fails.
+				vi.spyOn(repoProto, "worktreeAdd").mockImplementation(function (this: unknown, ...args: unknown[]) {
+					taken = String(args[0]);
+					runGit(fixture.repoRoot, ["worktree", "add", "-q", "--detach", taken, "HEAD"]);
+					return worktreeAdd.apply(this, args);
+				});
+				try {
+					await expect(checkout(127, new AbortController().signal)).rejects.toThrow();
+
+					expect(await Bun.file(path.join(taken, ".git")).exists()).toBe(true);
+					expect(runGit(taken, ["rev-parse", "--is-inside-work-tree"])).toBe("true");
+				} finally {
+					// Tolerant: a regression has already deleted it, and that failure should be the one reported.
+					if (taken) Bun.spawnSync(["git", "worktree", "remove", "--force", taken], { cwd: fixture.repoRoot });
+				}
+			});
 		});
 
 		// These assertions are non-mutating (a no-op add and rejected adds), so

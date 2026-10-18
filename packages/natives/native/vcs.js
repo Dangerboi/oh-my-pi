@@ -228,6 +228,9 @@ async function runGitToFiles(args, { cwd, env, stdout, stderr, signal }) {
 	return exitCode;
 }
 
+/** Spawn errors meaning the `git` on PATH cannot start: missing, not a runnable binary, or not executable. */
+const GIT_CANNOT_START = new Set(["ENOENT", "ENOEXEC", "EACCES"]);
+
 /**
  * Whether the git on `env`'s PATH can run hooks: "no-git" when none starts or `git version`
  * fails, "old-git" when it predates `git hook run`, else undefined. Output goes to a file in
@@ -239,7 +242,7 @@ async function hookRunnerProblem(captureDir, cwd, env, signal) {
 	try {
 		exitCode = await runGitToFiles(["version"], { cwd, env, stdout: Bun.file(outPath), stderr: "ignore", signal });
 	} catch (error) {
-		if (error?.code === "ENOENT") return "no-git";
+		if (GIT_CANNOT_START.has(error?.code)) return "no-git";
 		throw error;
 	}
 	if (exitCode !== 0) return "no-git";
@@ -251,21 +254,29 @@ async function hookRunnerProblem(captureDir, cwd, env, signal) {
 	return major < minMajor || (major === minMajor && minor < minMinor) ? "old-git" : undefined;
 }
 
-/** Config overrides git honours but gix does not read; `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` gix reads itself. */
+/** Config overrides git honours but gix does not read. */
 const GIX_IGNORED_CONFIG_VARS = new Set([
 	"GIT_CONFIG_PARAMETERS",
 	"GIT_CONFIG_GLOBAL",
 	"GIT_CONFIG_SYSTEM",
 	"GIT_CONFIG_NOSYSTEM",
 ]);
+/** gix reads these, but from this process's environment, not from the one the hook gets. */
+const isConfigCountVar = name => /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/i.test(name);
 
 /**
  * Where git looks for the `post-checkout` hook. Found in-process, as `find_hook` does, unless
- * `env` carries a config override gix does not read; then git itself answers. Undefined when
- * that git can't.
+ * `env` carries config the in-process lookup would not see: an override gix does not read, or
+ * `GIT_CONFIG_COUNT` entries that differ from this process's. Then git itself answers.
+ * Undefined when that git can't.
  */
 async function postCheckoutHookPath(captureDir, worktreeRoot, env, signal) {
-	const overridden = Object.keys(env ?? process.env).some(name => GIX_IGNORED_CONFIG_VARS.has(name.toUpperCase()));
+	const childEnv = env ?? process.env;
+	const overridden =
+		Object.keys(childEnv).some(name => GIX_IGNORED_CONFIG_VARS.has(name.toUpperCase())) ||
+		[...Object.keys(childEnv), ...Object.keys(process.env)].some(
+			name => isConfigCountVar(name) && childEnv[name] !== process.env[name],
+		);
 	if (!overridden) return git(worktreeRoot)?.hookLocation("post-checkout", signal);
 	const outPath = path.join(captureDir, "git-path");
 	try {
@@ -273,7 +284,7 @@ async function postCheckoutHookPath(captureDir, worktreeRoot, env, signal) {
 		const exitCode = await runGitToFiles(args, { cwd: worktreeRoot, env, stdout: Bun.file(outPath), stderr: "ignore", signal });
 		if (exitCode !== 0) return undefined;
 	} catch (error) {
-		if (error?.code === "ENOENT") return undefined;
+		if (GIT_CANNOT_START.has(error?.code)) return undefined;
 		throw error;
 	}
 	// A relative result is relative to the worktree, where `git hook run` runs.

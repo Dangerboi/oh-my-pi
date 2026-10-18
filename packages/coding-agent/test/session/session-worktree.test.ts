@@ -422,17 +422,77 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(await exists(path.join(retried.path, ".post-checkout-ran"))).toBe(true);
 		});
 
-		it("keeps the in-process lookup for config overrides gix reads itself", async () => {
+		it("keeps the in-process lookup when the supplied env has this process's GIT_CONFIG_COUNT", async () => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");
 			const bin = path.join(root, "empty-bin");
 			await fs.mkdir(bin);
-			// No git to ask, so only the in-process lookup can find the hook and report it as not run.
-			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
-				env: { PATH: bin, GIT_CONFIG_COUNT: "0" },
-			});
+			const previous = process.env.GIT_CONFIG_COUNT;
+			process.env.GIT_CONFIG_COUNT = "0";
+			try {
+				// No git to ask, so only the in-process lookup can find the hook and report it as not run.
+				const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
+					env: { PATH: bin, GIT_CONFIG_COUNT: "0" },
+				});
+
+				expect(result.skipped?.reason).toBe("no-git");
+			} finally {
+				if (previous === undefined) delete process.env.GIT_CONFIG_COUNT;
+				else process.env.GIT_CONFIG_COUNT = previous;
+			}
+		});
+
+		it("asks git when only the supplied env sets core.hooksPath through GIT_CONFIG_COUNT", async () => {
+			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
+			const wt = await create();
+			const injected = path.join(root, "count-hooks");
+			await Bun.write(path.join(injected, "post-checkout"), "#!/bin/sh\ntouch .post-checkout-ran\n");
+			await fs.chmod(path.join(injected, "post-checkout"), 0o755);
+			const env = {
+				...filterChildShellEnv(process.env),
+				GIT_CONFIG_COUNT: "1",
+				GIT_CONFIG_KEY_0: "core.hooksPath",
+				GIT_CONFIG_VALUE_0: injected,
+			};
+			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
+
+			expect(result.exitCode).toBe(0);
+			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
+		});
+
+		it("reports a hook as not run when the git on PATH cannot start", async () => {
+			const wt = await create();
+			await hook("touch .post-checkout-ran");
+			const bin = path.join(root, "broken-bin");
+			// Executable but not a program: spawning it fails with ENOEXEC.
+			await Bun.write(path.join(bin, "git"), "not a program\n");
+			await fs.chmod(path.join(bin, "git"), 0o755);
+			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env: { PATH: bin } });
 
 			expect(result.skipped?.reason).toBe("no-git");
+			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
+		});
+
+		it("leaves alone a worktree another process created at the chosen path first", async () => {
+			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
+			const repoProto = Object.getPrototypeOf(vcs.requireGit(repo));
+			const worktreeAdd = repoProto.worktreeAdd;
+			let taken = "";
+			// Another process wins the race for the same free path, so this attempt's add fails.
+			const add = spyOn(repoProto, "worktreeAdd").mockImplementation(function (this: unknown, ...args: unknown[]) {
+				taken = String(args[0]);
+				git(repo, "worktree", "add", "-q", "--detach", taken, "HEAD");
+				return worktreeAdd.apply(this, args);
+			});
+			try {
+				await expect(create()).rejects.toThrow();
+			} finally {
+				add.mockRestore();
+			}
+
+			expect(await exists(path.join(taken, ".git"))).toBe(true);
+			expect(worktreePaths(repo)).toContain(await fs.realpath(taken));
+			expect(branchSha(repo, branch)).toBeNull();
 		});
 
 		it("finds the hook that git's own config overrides select", async () => {
