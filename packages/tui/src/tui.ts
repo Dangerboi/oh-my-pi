@@ -107,6 +107,11 @@ const PAINT_END_NO_SYNC = ENABLE_AUTOWRAP;
 // native text selection.
 const MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h";
 const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1000l";
+// Cell-size replies: CSI 6 ; height ; width t in pixels, and iTerm2's
+// OSC 1337 ; ReportCellSize = height ; width [; scale] ST in points.
+const CELL_SIZE_REPLY = /^\x1b\[6;(\d+);(\d+)t$/;
+const ITERM2_CELL_SIZE_REPLY =
+	/^\x1b\]1337;ReportCellSize=(\d+(?:\.\d+)?);(\d+(?:\.\d+)?)(?:;(\d+(?:\.\d+)?))?(?:\x07|\x1b\\)$/;
 
 type MouseTrackingState = "off" | "inline" | "full";
 
@@ -2562,6 +2567,9 @@ export class TUI extends Container {
 		// Query terminal for cell size in pixels: CSI 16 t
 		// Response format: CSI 6 ; height ; width t
 		this.terminal.write("\x1b[16t");
+		// iTerm2 never answers CSI 16 t. Without a size, rows reserved for an image
+		// and crops of a partly scrolled one assume 9x18 cells and land offset.
+		if (TERMINAL.imageProtocol === ImageProtocol.Iterm2) this.terminal.write("\x1b]1337;ReportCellSize\x1b\\");
 	}
 
 	/**
@@ -3051,14 +3059,19 @@ export class TUI extends Container {
 	}
 
 	#consumeCellSizeResponse(data: string): boolean {
-		// Response format: ESC [ 6 ; height ; width t
-		const match = data.match(/^\x1b\[6;(\d+);(\d+)t$/);
-		if (!match) {
-			return false;
+		let heightPx: number;
+		let widthPx: number;
+		const pixels = CELL_SIZE_REPLY.exec(data);
+		if (pixels) {
+			heightPx = parseInt(pixels[1], 10);
+			widthPx = parseInt(pixels[2], 10);
+		} else {
+			const points = ITERM2_CELL_SIZE_REPLY.exec(data);
+			if (!points) return false;
+			const scale = points[3] ? Number(points[3]) : 1;
+			heightPx = Math.round(Number(points[1]) * scale);
+			widthPx = Math.round(Number(points[2]) * scale);
 		}
-
-		const heightPx = parseInt(match[1], 10);
-		const widthPx = parseInt(match[2], 10);
 		if (heightPx <= 0 || widthPx <= 0) {
 			return true;
 		}

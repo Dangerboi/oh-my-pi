@@ -1,10 +1,11 @@
 use std::time::Duration;
 
 use enigo::{Axis, Button, Direction, Enigo, Keyboard, Mouse, Settings};
+use windows_sys::Win32::Foundation::HWND;
 
 use super::{
 	super::{
-		backend::{DeliveryMode, Modifiers, MouseButton, PointerEvent},
+		backend::{DeliveryMode, ElementInput, Modifiers, MouseButton, PointerEvent},
 		control,
 		error::{CoreResult, DesktopError},
 		keys::{KeyDirection, KeyName, hold_keys as with_held_keys},
@@ -248,11 +249,11 @@ mod background {
 				VK_SPACE, VK_TAB, VK_UP, VkKeyScanW,
 			},
 			WindowsAndMessaging::{
-				CS_DBLCLKS, GCL_STYLE, GetClassLongW, IsWindow, PostMessageW, SMTO_ABORTIFHUNG,
-				SendMessageTimeoutW, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-				WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-				WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-				WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+				CS_DBLCLKS, GCL_STYLE, GetClassLongW, IsChild, IsWindow, PostMessageW,
+				SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
+				WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
+				WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDBLCLK,
+				WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 			},
 		},
 	};
@@ -285,7 +286,7 @@ mod background {
 	/// Time between posted drag moves.
 	const DRAG_STEP: Duration = Duration::from_millis(16);
 	/// Time between posted key transitions and typed characters.
-	const KEY_GAP: Duration = Duration::from_millis(4);
+	pub(super) const KEY_GAP: Duration = Duration::from_millis(4);
 	/// Extra time after a posted Return while rich editors build a paragraph.
 	const ENTER_SETTLE: Duration = Duration::from_millis(20);
 
@@ -343,8 +344,7 @@ mod background {
 
 	fn refusal(id: &str, class: &str, kind: EventKind, reason: &str) -> DesktopError {
 		DesktopError::background_unavailable(format!(
-			"window {id} ({class}) drops background {} events: {reason}; retry with takeover:true or \
-			 use ax actions",
+			"window {id} ({class}) drops background {} events: {reason}; no input was sent",
 			kind.name()
 		))
 	}
@@ -394,8 +394,7 @@ mod background {
 	fn child_under(root: HWND, point: POINT) -> CoreResult<(HWND, POINT)> {
 		window::deepest_child(root, point).ok_or_else(|| {
 			DesktopError::background_unavailable(
-				"cannot map this point into an enabled target client area; use ax actions or \
-				 takeover:true",
+				"cannot map this point into an enabled target client area; no input was sent",
 			)
 		})
 	}
@@ -531,13 +530,13 @@ mod background {
 				let start = screen_point(x, y);
 				let hit = hit_test(root, start).ok_or_else(|| {
 					DesktopError::background_unavailable(
-						"cannot establish the drag start region; use ax actions or takeover:true",
+						"cannot establish the drag start region; no input was sent",
 					)
 				})?;
 				if let Some(region) = non_client_drag_region(hit) {
 					return Err(DesktopError::background_unavailable(format!(
 						"window {id} drag starts on its {region}, where only real pointer input drives \
-						 the system move/size loop; retry with takeover:true or use ax actions"
+						 the system move/size loop; no input was sent"
 					)));
 				}
 				let (target, client) = child_under(root, start)?;
@@ -686,11 +685,31 @@ mod background {
 		fn focused(root: HWND) -> CoreResult<Self> {
 			let hwnd = window::focused_descendant(root).ok_or_else(|| {
 				DesktopError::background_unavailable(
-					"no unambiguous focused control in the target window; use ax actions or \
-					 takeover:true",
+					"no unambiguous focused control in the target window; no input was sent",
 				)
 			})?;
 			Ok(Self { hwnd, alt_depth: 0 })
+		}
+
+		/// The control of window `id` (`root`) that background keys of `kind`
+		/// go to: `element` when it is one of `root`'s child windows, else the
+		/// focused control ([`Self::focused`]). Both windows must take `kind`.
+		fn to(id: &str, root: HWND, element: Option<HWND>, kind: EventKind) -> CoreResult<Self> {
+			ensure_delivery(id, root, kind)?;
+			let emitter = match element {
+				Some(hwnd) if hwnd != root => {
+					// SAFETY: IsChild validates both handles.
+					if unsafe { IsChild(root, hwnd) } == 0 {
+						return Err(DesktopError::invalid_target(format!(
+							"the element's control window is not inside window {id}"
+						)));
+					}
+					Self { hwnd, alt_depth: 0 }
+				},
+				_ => Self::focused(root)?,
+			};
+			ensure_delivery(id, emitter.hwnd, kind)?;
+			Ok(emitter)
 		}
 
 		fn transition(&mut self, vk: u16, down: bool) -> CoreResult<()> {
@@ -809,7 +828,7 @@ mod background {
 			};
 			if let Some(reason) = drop_reason(hwnd, &class, kind) {
 				return Err(DesktopError::background_unavailable(format!(
-					"window {} ({class}) drops held background keys: {reason}; retry with takeover:true",
+					"window {} ({class}) drops held background keys: {reason}; no input was sent",
 					hwnd as usize,
 				)));
 			}
@@ -828,10 +847,17 @@ mod background {
 	}
 
 	pub(super) fn key_chord(id: &str, keys: &[KeyName]) -> CoreResult<()> {
-		hold_keys(id, keys, KEY_GAP)
+		hold_keys(id, keys, KEY_GAP, None)
 	}
 
-	pub(super) fn hold_keys(id: &str, keys: &[KeyName], duration: Duration) -> CoreResult<()> {
+	/// Holds `keys` in window `id`: in `element`, one of its control windows,
+	/// when given, else in its focused control.
+	pub(super) fn hold_keys(
+		id: &str,
+		keys: &[KeyName],
+		duration: Duration,
+		element: Option<HWND>,
+	) -> CoreResult<()> {
 		control::check()?;
 		for &key in keys {
 			virtual_key(key)?;
@@ -842,9 +868,7 @@ mod background {
 		} else {
 			EventKind::Keystroke
 		};
-		ensure_delivery(id, root, kind)?;
-		let mut emitter = KeyEmitter::focused(root)?;
-		ensure_delivery(id, emitter.hwnd, kind)?;
+		let mut emitter = KeyEmitter::to(id, root, element, kind)?;
 		with_held_keys(
 			&mut emitter,
 			keys.iter().copied(),
@@ -854,13 +878,13 @@ mod background {
 		)
 	}
 
-	pub(super) fn type_text(id: &str, text: &str) -> CoreResult<()> {
+	/// Types `text` into window `id`: into `element`, one of its control
+	/// windows, when given, else into its focused control.
+	pub(super) fn type_text(id: &str, text: &str, element: Option<HWND>) -> CoreResult<()> {
 		control::check()?;
 		let root = hwnd(id)?;
 		ensure_text_supported(id, root)?;
-		ensure_delivery(id, root, EventKind::TextInput)?;
-		let mut emitter = KeyEmitter::focused(root)?;
-		ensure_delivery(id, emitter.hwnd, EventKind::TextInput)?;
+		let mut emitter = KeyEmitter::to(id, root, element, EventKind::TextInput)?;
 		for grapheme in graphemes_str(text) {
 			control::check()?;
 			for unit in text_units(grapheme) {
@@ -1614,7 +1638,9 @@ pub(super) fn type_text(target: &Target, text: &str, mode: DeliveryMode) -> Core
 	control::check()?;
 	match target {
 		Target::Desktop | Target::Display(_) => foreground::type_desktop(text),
-		Target::Window(id) if mode == DeliveryMode::Background => background::type_text(id, text),
+		Target::Window(id) if mode == DeliveryMode::Background => {
+			background::type_text(id, text, None)
+		},
 		Target::Window(id) => foreground::type_text(id, text),
 	}
 }
@@ -1636,6 +1662,21 @@ pub(super) fn key_chord(
 	}
 }
 
+/// Background keyboard `input` for window `id` sent straight to `element`, a
+/// control window inside it, without moving the window's focus.
+pub(super) fn element_background(id: &str, element: HWND, input: &ElementInput) -> CoreResult<()> {
+	control::check()?;
+	match input {
+		ElementInput::Text(text) => background::type_text(id, text, Some(element)),
+		ElementInput::Chord(keys) if keys.is_empty() => {
+			Err(DesktopError::input_failed("key chord is empty"))
+		},
+		ElementInput::Chord(keys) => {
+			background::hold_keys(id, keys, background::KEY_GAP, Some(element))
+		},
+	}
+}
+
 pub(super) fn hold_keys(
 	global: &mut Enigo,
 	target: &Target,
@@ -1652,7 +1693,7 @@ pub(super) fn hold_keys(
 			with_global_keys(global, keys, |_| control::wait(duration))
 		},
 		Target::Window(id) if mode == DeliveryMode::Background => {
-			background::hold_keys(id, keys, duration)
+			background::hold_keys(id, keys, duration, None)
 		},
 		Target::Window(id) => foreground::hold_keys(id, keys, duration),
 	}
