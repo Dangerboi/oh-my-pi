@@ -382,6 +382,27 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
 		});
 
+		// Root bypasses directory permissions, so the stat would not fail.
+		it.skipIf(process.getuid?.() === 0)(
+			"reports, rather than silently skips, a hook that cannot be read",
+			async () => {
+				const wt = await create();
+				await hook("touch .post-checkout-ran");
+				const hooks = path.join(repo, ".git", "hooks");
+				await fs.chmod(hooks, 0o000);
+				try {
+					const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
+						env: filterChildShellEnv(process.env),
+					});
+
+					expect(result.skipped?.reason).toBe("inaccessible");
+				} finally {
+					await fs.chmod(hooks, 0o755);
+				}
+				expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
+			},
+		);
+
 		it("finds the hook that git's own config overrides select", async () => {
 			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
 			const wt = await create();

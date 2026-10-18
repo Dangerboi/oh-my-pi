@@ -509,38 +509,44 @@ export async function checkoutPullRequest(
 			if (!existingWorktree) {
 				finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
 				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
-				const result = await repository.worktreeAdd(
-					finalWorktreePath,
-					localBranch,
-					{
-						detach: false,
-						clone: cfgWorktreeClone.get(session.settings),
-						backend: parseIsolationBackend(cfgIsolationBackend.get(session.settings)),
-					},
-					signal,
-				);
-				clonedWith = result.clonedWith ?? undefined;
-				if (result.cloneError) {
-					logger.warn("worktree clone fell back to plain checkout", {
-						path: finalWorktreePath,
-						error: result.cloneError,
-					});
-				}
-				const head = await repository.resolveRef(`refs/heads/${localBranch}`, signal);
-				if (head) {
-					try {
-						hook = await runWorktreeCheckoutHook(finalWorktreePath, head, signal);
-					} catch (error) {
-						// A hook cut short may leave the checkout half set up, and a retry would reuse it without
-						// rerunning the hook; remove it so the retry starts over. No signal: it may already be aborted.
-						await repository.worktreeRemove(finalWorktreePath, true).catch(removeError => {
-							logger.warn("could not remove worktree after its post-checkout hook was cut short", {
-								path: finalWorktreePath,
-								error: String(removeError),
-							});
+				try {
+					const result = await repository.worktreeAdd(
+						finalWorktreePath,
+						localBranch,
+						{
+							detach: false,
+							clone: cfgWorktreeClone.get(session.settings),
+							backend: parseIsolationBackend(cfgIsolationBackend.get(session.settings)),
+						},
+						signal,
+					);
+					clonedWith = result.clonedWith ?? undefined;
+					if (result.cloneError) {
+						logger.warn("worktree clone fell back to plain checkout", {
+							path: finalWorktreePath,
+							error: result.cloneError,
 						});
-						throw error;
 					}
+					const head = await repository.resolveRef(`refs/heads/${localBranch}`, signal);
+					if (head) hook = await runWorktreeCheckoutHook(finalWorktreePath, head, signal);
+				} catch (error) {
+					// Stopping anywhere before the hook completed can leave a registered, half-set-up worktree that
+					// a retry would reuse without rerunning the hook; discard it so the retry starts over. The path
+					// was unused before this call. No signal: it may already be aborted.
+					try {
+						if (!(await repository.worktreeRemove(finalWorktreePath, true))) {
+							// Not discoverable (never created, or its `.git` file is gone): drop the directory, then
+							// the registration that now points nowhere.
+							await fs.rm(finalWorktreePath, { recursive: true, force: true });
+							await repository.worktreePrune();
+						}
+					} catch (removeError) {
+						logger.warn("could not remove a worktree whose setup was cut short", {
+							path: finalWorktreePath,
+							error: String(removeError),
+						});
+					}
+					throw error;
 				}
 			}
 			const resolvedWorktreePath = await fs.realpath(finalWorktreePath);

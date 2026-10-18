@@ -610,6 +610,7 @@ export function describeSkippedHook(skipped: vcs.SkippedPostCheckoutHook): strin
 		"not-executable": "is not executable, so git skipped it",
 		"no-git": "did not run: no working git found",
 		"old-git": "did not run: running hooks needs Git 2.36 or newer",
+		inaccessible: "did not run: it could not be read",
 	}[skipped.reason];
 	return `post-checkout hook ${displayLine(sanitizeText(skipped.path))} ${why}`;
 }

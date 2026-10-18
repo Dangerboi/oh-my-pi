@@ -1205,14 +1205,14 @@ describe("github tool", () => {
 			}
 		});
 
-		it.skipIf(process.platform === "win32")(
-			"removes a new worktree whose post-checkout hook is cut short, so a retry does not reuse it",
-			async () => {
-				vi.spyOn(github, "json")
+		describe.skipIf(process.platform === "win32")("a new worktree whose setup is cut short", () => {
+			const mockPrView = (number: number) =>
+				vi
+					.spyOn(github, "json")
 					.mockResolvedValueOnce({
-						number: 124,
+						number,
 						title: "Contributor fix",
-						url: "https://ghe.example.com/base/repo/pull/124",
+						url: `https://ghe.example.com/base/repo/pull/${number}`,
 						baseRefName: "main",
 						headRefName: fixture.headRefName,
 						headRefOid: fixture.headRefOid,
@@ -1226,42 +1226,84 @@ describe("github tool", () => {
 						sshUrl: fixture.forkBare,
 						url: fixture.forkBare,
 					});
-				const hooks = path.join(fixture.baseDir, "hooks-cut-short");
-				const ready = path.join(fixture.baseDir, "hook-started");
-				expect(Bun.spawnSync(["mkfifo", ready]).exitCode).toBe(0);
+			const checkout = (number: number, signal: AbortSignal) =>
+				checkoutPullRequest(createSession(fixture.repoRoot), signal, {
+					prRef: String(number),
+					repo: undefined,
+					force: false,
+				});
+			/** Run `body` with a `post-checkout` hook that signals `started` and then waits until it is killed. */
+			const withBlockingHook = async (name: string, prelude: string, body: (started: string) => Promise<void>) => {
+				const hooks = path.join(fixture.baseDir, `hooks-${name}`);
+				const started = path.join(fixture.baseDir, `${name}-started`);
+				expect(Bun.spawnSync(["mkfifo", started]).exitCode).toBe(0);
 				await Bun.write(
 					path.join(hooks, "post-checkout"),
-					`#!/bin/sh\necho started > "${ready}"\nsleep 30 &\nwait\n`,
+					`#!/bin/sh\n${prelude}\necho started > "${started}"\nsleep 30 &\nwait\n`,
 				);
 				await fs.chmod(path.join(hooks, "post-checkout"), 0o755);
-				const previousHooks = Bun.spawnSync(["git", "config", "--get", "core.hooksPath"], { cwd: fixture.repoRoot })
+				const previous = Bun.spawnSync(["git", "config", "--get", "core.hooksPath"], { cwd: fixture.repoRoot })
 					.stdout.toString()
 					.trim();
 				runGit(fixture.repoRoot, ["config", "core.hooksPath", hooks]);
-				const controller = new AbortController();
 				try {
-					const pending = checkoutPullRequest(createSession(fixture.repoRoot), controller.signal, {
-						prRef: "124",
-						repo: undefined,
-						force: false,
-					});
-					await fs.readFile(ready, "utf8");
-					controller.abort();
-					await expect(pending).rejects.toThrow();
+					await body(started);
 				} finally {
-					if (previousHooks) runGit(fixture.repoRoot, ["config", "core.hooksPath", previousHooks]);
+					if (previous) runGit(fixture.repoRoot, ["config", "core.hooksPath", previous]);
 					else runGit(fixture.repoRoot, ["config", "--unset", "core.hooksPath"]);
 				}
-
+			};
+			/** The worktree is neither registered nor on disk, so a retry creates it afresh and reruns the hook. */
+			const expectDiscarded = async (number: number) => {
 				const primaryRoot = vcs.requireGit(fixture.repoRoot).primaryRoot() ?? fixture.repoRoot;
+				const dir = path.join(tempHome.home, ".omp", "wt", `${number}-${hashPath(primaryRoot)}`);
 				expect(runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain(
-					"branch refs/heads/pr-124",
+					`branch refs/heads/pr-${number}`,
 				);
 				expect(
-					await Bun.file(path.join(tempHome.home, ".omp", "wt", `124-${hashPath(primaryRoot)}`, ".git")).exists(),
+					await fs.stat(dir).then(
+						() => true,
+						() => false,
+					),
 				).toBe(false);
-			},
-		);
+			};
+
+			const hookRows: [name: string, number: number, prelude: string][] = [
+				["is removed when its hook is aborted", 124, ""],
+				// Discovery then fails, so removal reports false instead of throwing.
+				["is removed when its aborted hook had deleted the worktree's .git", 125, "rm -f .git"],
+			];
+			it.each(hookRows)("%s", async (name, number, prelude) => {
+				mockPrView(number);
+				await withBlockingHook(`pr-${number}`, prelude, async started => {
+					const controller = new AbortController();
+					const pending = checkout(number, controller.signal);
+					await fs.readFile(started, "utf8");
+					controller.abort();
+					await expect(pending).rejects.toThrow();
+				});
+				await expectDiscarded(number);
+			});
+
+			it("is removed when the checkout is aborted after the worktree exists but before its hook starts", async () => {
+				mockPrView(126);
+				const controller = new AbortController();
+				const repoProto = Object.getPrototypeOf(vcs.requireGit(fixture.repoRoot));
+				const resolveRef = repoProto.resolveRef;
+				vi.spyOn(repoProto, "resolveRef").mockImplementation(function (
+					this: unknown,
+					ref: string,
+					signal?: AbortSignal,
+				) {
+					// The head lookup right after `worktreeAdd`.
+					if (ref !== "refs/heads/pr-126") return resolveRef.call(this, ref, signal);
+					controller.abort();
+					return Promise.reject(controller.signal.reason);
+				});
+				await expect(checkout(126, controller.signal)).rejects.toThrow();
+				await expectDiscarded(126);
+			});
+		});
 
 		// These assertions are non-mutating (a no-op add and rejected adds), so
 		// reuse the checkout fixture instead of cloning another repository.

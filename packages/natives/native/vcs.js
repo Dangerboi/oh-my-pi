@@ -292,7 +292,13 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	try {
 		const hookPath = await postCheckoutHookPath(dir, worktreeRoot, env, signal);
 		if (!hookPath) return notRun;
-		const stat = await untilAborted(fs.promises.stat(hookPath).catch(() => null), signal);
+		// Only a missing path means no hook; any other failure (EACCES, EIO) is reported, not mistaken for one.
+		const missing = error => error?.code === "ENOENT" || error?.code === "ENOTDIR";
+		const stat = await untilAborted(
+			fs.promises.stat(hookPath).catch(error => (missing(error) ? null : error)),
+			signal,
+		);
+		if (stat instanceof Error) return { ...notRun, skipped: { path: hookPath, reason: "inaccessible" } };
 		if (!stat?.isFile()) return notRun;
 		// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
 		if (posix) {

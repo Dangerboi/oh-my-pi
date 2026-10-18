@@ -87,8 +87,8 @@ export declare function copyGitObjects(isolationRoot: string, sourceRoot: string
 /** A `post-checkout` hook that exists but did not run, and why. */
 export interface SkippedPostCheckoutHook {
 	path: string;
-	/** `no-git`: no git starts, or `git version` fails. `old-git`: older than 2.36, without `git hook run`. */
-	reason: "not-executable" | "no-git" | "old-git";
+	/** `no-git`: no git starts, or `git version` fails. `old-git`: older than 2.36, without `git hook run`. `inaccessible`: checking the hook file failed other than with ENOENT/ENOTDIR. */
+	reason: "not-executable" | "no-git" | "old-git" | "inaccessible";
 }
 
 /**
