@@ -7,6 +7,7 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreeDir, hashPath, isEnoent, logger, slugify } from "@oh-my-pi/pi-utils";
 import { github } from "../utils/github";
 import {
+	discardNewWorktree,
 	formatIsolationBackend,
 	parseIsolationBackend,
 	runWorktreeCheckoutHook,
@@ -530,22 +531,9 @@ export async function checkoutPullRequest(
 					const head = await repository.resolveRef(`refs/heads/${localBranch}`, signal);
 					if (head) hook = await runWorktreeCheckoutHook(finalWorktreePath, head, signal);
 				} catch (error) {
-					// Stopping anywhere before the hook completed can leave a registered, half-set-up worktree that
-					// a retry would reuse without rerunning the hook; discard it so the retry starts over. The path
-					// was unused before this call. No signal: it may already be aborted.
-					try {
-						if (!(await repository.worktreeRemove(finalWorktreePath, true))) {
-							// Not discoverable (never created, or its `.git` file is gone): drop the directory, then
-							// the registration that now points nowhere.
-							await fs.rm(finalWorktreePath, { recursive: true, force: true });
-							await repository.worktreePrune();
-						}
-					} catch (removeError) {
-						logger.warn("could not remove a worktree whose setup was cut short", {
-							path: finalWorktreePath,
-							error: String(removeError),
-						});
-					}
+					// Stopping anywhere before the hook completed can leave a registered, half-set-up worktree;
+					// the path was unused before this call.
+					await discardNewWorktree(repository, finalWorktreePath);
 					throw error;
 				}
 			}

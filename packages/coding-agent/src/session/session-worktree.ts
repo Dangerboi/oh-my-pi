@@ -10,12 +10,18 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { IsoBackendKind } from "@oh-my-pi/pi-natives";
+import type { IsoBackendKind, VcsWorktreeAddResult } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreeDir, hashPath, logger } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { Settings } from "../config/settings";
-import { formatIsolationBackend, parseIsolationBackend, runWorktreeCheckoutHook } from "../task/worktree";
+import {
+	discardNewWorktree,
+	formatIsolationBackend,
+	parseIsolationBackend,
+	runWorktreeCheckoutHook,
+	type WorktreeCheckoutHookResult,
+} from "../task/worktree";
 import { resolveAvailableWorktreePath } from "../tools/gh-pr-checkout";
 
 import { cfgIsolationBackend, cfgWorktreeCleanSource, cfgWorktreeClone } from "../task/settings";
@@ -115,13 +121,15 @@ export async function cleanSourceCheckoutIfConfigured(
 }
 /**
  * Create the worktree for `/wt`. Throws with a user-facing message when `cwd`
- * is not a git checkout, `branch` already exists, or git refuses.
+ * is not a git checkout, `branch` already exists, or git refuses. If creating the
+ * worktree or running its `post-checkout` hook fails or `signal` aborts, the new
+ * worktree and branch are discarded first, so a retry with the same name starts over.
  */
 export async function createSessionWorktree(
 	cwd: string,
 	settings: Settings,
 	branch: string,
-	options: { keepChanges?: boolean } = {},
+	options: { keepChanges?: boolean; signal?: AbortSignal } = {},
 ): Promise<SessionWorktree> {
 	const keepChanges = options.keepChanges ?? true;
 	try {
@@ -151,13 +159,32 @@ export async function createSessionWorktree(
 	await fs.mkdir(path.dirname(worktreePath), { recursive: true });
 
 	await repository.createBranch(branch, baseCommit, false);
-	const result = await repository.worktreeAdd(worktreePath, branch, {
-		detach: false,
-		clone: cfgWorktreeClone.get(settings),
-		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
-		keepChanges,
-	});
-	const hook = await runWorktreeCheckoutHook(worktreePath, baseCommit);
+	let result: VcsWorktreeAddResult;
+	let hook: WorktreeCheckoutHookResult;
+	try {
+		result = await repository.worktreeAdd(
+			worktreePath,
+			branch,
+			{
+				detach: false,
+				clone: cfgWorktreeClone.get(settings),
+				backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
+				keepChanges,
+			},
+			options.signal,
+		);
+		hook = await runWorktreeCheckoutHook(worktreePath, baseCommit, options.signal);
+	} catch (error) {
+		// The worktree path and branch were unused before this call.
+		await discardNewWorktree(repository, worktreePath);
+		await repository.deleteBranch(branch, true).catch(deleteError => {
+			logger.warn("could not delete the branch of a /wt worktree whose setup was cut short", {
+				branch,
+				error: String(deleteError),
+			});
+		});
+		throw error;
+	}
 	return {
 		path: await fs.realpath(worktreePath),
 		branch,

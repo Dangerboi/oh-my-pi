@@ -403,6 +403,38 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			},
 		);
 
+		it("discards the new worktree and branch when the hook runner fails, so the name can be reused", async () => {
+			await hook("touch .post-checkout-ran");
+			const realMkdtemp = nodeFs.promises.mkdtemp;
+			// Only the runner's capture directory fails, as on a full disk.
+			const mkdtemp = spyOn(nodeFs.promises, "mkdtemp").mockImplementation(((prefix: string, ...rest: []) =>
+				prefix.includes("omp-post-checkout-")
+					? Promise.reject(Object.assign(new Error("no space left on device"), { code: "ENOSPC" }))
+					: realMkdtemp(prefix, ...rest)) as typeof realMkdtemp);
+			try {
+				await expect(create()).rejects.toThrow("no space left on device");
+			} finally {
+				mkdtemp.mockRestore();
+			}
+
+			expect(branchSha(repo, branch)).toBeNull();
+			const retried = await create();
+			expect(await exists(path.join(retried.path, ".post-checkout-ran"))).toBe(true);
+		});
+
+		it("keeps the in-process lookup for config overrides gix reads itself", async () => {
+			const wt = await create();
+			await hook("touch .post-checkout-ran");
+			const bin = path.join(root, "empty-bin");
+			await fs.mkdir(bin);
+			// No git to ask, so only the in-process lookup can find the hook and report it as not run.
+			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
+				env: { PATH: bin, GIT_CONFIG_COUNT: "0" },
+			});
+
+			expect(result.skipped?.reason).toBe("no-git");
+		});
+
 		it("finds the hook that git's own config overrides select", async () => {
 			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
 			const wt = await create();

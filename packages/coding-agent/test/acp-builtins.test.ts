@@ -270,6 +270,7 @@ function createRuntime() {
 			reloadPlugins: async () => {},
 			notifyTitleChanged: undefined as (() => Promise<void> | void) | undefined,
 			notifyConfigChanged: undefined as (() => Promise<void> | void) | undefined,
+			signal: undefined as AbortSignal | undefined,
 		},
 	};
 }
@@ -1319,6 +1320,57 @@ describe("wave 3 commands", () => {
 				expect(output.join("\n")).toContain(warning);
 				expect(await Bun.file(path.join(repoDir, "tracked.txt")).text()).toBe(sourceTracked);
 				expect(await Bun.file(path.join(repoDir, "untracked.txt")).exists()).toBe(sourceKept);
+			} finally {
+				setProjectDir(originalProjectDir);
+				if (originalWorktreeDir === undefined) delete process.env.OMP_WORKTREE_DIR;
+				else process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"/wt: an interrupt stops the post-checkout hook and discards the new worktree and branch",
+		async () => {
+			const { output, runtime, fakeSessionManager } = createRuntime();
+			const controller = new AbortController();
+			runtime.signal = controller.signal;
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-hook-abort-"));
+			const repoDir = path.join(root, "repo");
+			const hooksDir = path.join(root, "hooks");
+			const started = path.join(root, "hook-started");
+			const originalProjectDir = process.cwd();
+			const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+			process.env.OMP_WORKTREE_DIR = path.join(root, "wt");
+			const git = async (...args: string[]) => {
+				const proc = Bun.spawn(["git", ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+				const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+				expect(code).toBe(0);
+				return stdout.trim();
+			};
+			try {
+				await fs.mkdir(repoDir, { recursive: true });
+				await git("init", "-q", "-b", "main");
+				await git("config", "user.email", "t@example.com");
+				await git("config", "user.name", "t");
+				await git("config", "core.hooksPath", hooksDir);
+				await git("commit", "-q", "--allow-empty", "-m", "init");
+				expect(Bun.spawnSync(["mkfifo", started]).exitCode).toBe(0);
+				await Bun.write(
+					path.join(hooksDir, "post-checkout"),
+					`#!/bin/sh\necho started > "${started}"\nsleep 30 &\nwait\n`,
+				);
+				await fs.chmod(path.join(hooksDir, "post-checkout"), 0o755);
+				fakeSessionManager._cwd = repoDir;
+
+				const pending = executeAcpBuiltinSlashCommand("/wt feature/hook-abort", runtime);
+				await fs.readFile(started, "utf8");
+				controller.abort();
+
+				expect(await pending).toEqual({ consumed: true });
+				expect(output.join("\n")).toContain("Worktree creation failed");
+				expect(await git("branch", "--list", "feature/hook-abort")).toBe("");
+				expect(await git("worktree", "list", "--porcelain")).not.toContain("feature/hook-abort");
 			} finally {
 				setProjectDir(originalProjectDir);
 				if (originalWorktreeDir === undefined) delete process.env.OMP_WORKTREE_DIR;

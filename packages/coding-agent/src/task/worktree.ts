@@ -640,6 +640,26 @@ export async function runWorktreeCheckoutHook(
 	return result;
 }
 
+/**
+ * Discard a worktree created moments ago whose setup did not complete, so a retry starts over
+ * instead of reusing a half-set-up checkout without rerunning its hook. When it is no longer
+ * discoverable (never created, or its `.git` file is gone), deletes the directory and prunes the
+ * registration that now points nowhere. Takes no signal, as the caller's may already be aborted;
+ * failures are logged, not thrown, so the original error reaches the caller.
+ */
+export async function discardNewWorktree(repository: VcsGitRepo, worktreePath: string): Promise<void> {
+	try {
+		if (await repository.worktreeRemove(worktreePath, true)) return;
+		await fs.rm(worktreePath, { recursive: true, force: true });
+		await repository.worktreePrune();
+	} catch (error) {
+		logger.warn("could not remove a worktree whose setup was cut short", {
+			path: worktreePath,
+			error: String(error),
+		});
+	}
+}
+
 export interface IsolationHandle {
 	/** Merged view materialised by the backend; pass this to the task. */
 	mergedDir: string;

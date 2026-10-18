@@ -251,14 +251,22 @@ async function hookRunnerProblem(captureDir, cwd, env, signal) {
 	return major < minMajor || (major === minMajor && minor < minMinor) ? "old-git" : undefined;
 }
 
+/** Config overrides git honours but gix does not read; `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` gix reads itself. */
+const GIX_IGNORED_CONFIG_VARS = new Set([
+	"GIT_CONFIG_PARAMETERS",
+	"GIT_CONFIG_GLOBAL",
+	"GIT_CONFIG_SYSTEM",
+	"GIT_CONFIG_NOSYSTEM",
+]);
+
 /**
  * Where git looks for the `post-checkout` hook. Found in-process, as `find_hook` does, unless
- * `env` injects config through `GIT_CONFIG*`, which gix does not read; then git itself answers,
- * as the bash `git worktree add` builtin hands such cases to git. Undefined when that git can't.
+ * `env` carries a config override gix does not read; then git itself answers. Undefined when
+ * that git can't.
  */
 async function postCheckoutHookPath(captureDir, worktreeRoot, env, signal) {
-	const injected = Object.keys(env ?? process.env).some(name => name.slice(0, 10).toUpperCase() === "GIT_CONFIG");
-	if (!injected) return git(worktreeRoot)?.hookLocation("post-checkout", signal);
+	const overridden = Object.keys(env ?? process.env).some(name => GIX_IGNORED_CONFIG_VARS.has(name.toUpperCase()));
+	if (!overridden) return git(worktreeRoot)?.hookLocation("post-checkout", signal);
 	const outPath = path.join(captureDir, "git-path");
 	try {
 		const args = ["rev-parse", "--git-path", "hooks/post-checkout"];

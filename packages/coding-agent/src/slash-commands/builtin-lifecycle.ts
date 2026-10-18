@@ -741,7 +741,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			const sourceCwd = runtime.sessionManager.getCwd();
 			let worktree: SessionWorktree;
 			try {
-				worktree = await createSessionWorktree(sourceCwd, runtime.settings, branch);
+				worktree = await createSessionWorktree(sourceCwd, runtime.settings, branch, { signal: runtime.signal });
 			} catch (err) {
 				return usage(`Worktree creation failed: ${errorMessage(err)}`, runtime);
 			}
