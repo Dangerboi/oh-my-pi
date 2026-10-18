@@ -246,13 +246,17 @@ async function hookRunnerProblem(captureDir, cwd, env, signal) {
 		throw error;
 	}
 	if (exitCode !== 0) return "no-git";
-	const match = /^git version (\d+)\.(\d+)/.exec(await Bun.file(outPath).text());
+	const match = /^git version (\d+)\.(\d+)/.exec(await readProbeOutput(outPath));
 	// An unrecognised version string gets the benefit of the doubt.
 	if (!match) return undefined;
 	const [major, minor] = [Number(match[1]), Number(match[2])];
 	const [minMajor, minMinor] = HOOK_RUN_MIN_GIT;
 	return major < minMajor || (major === minMajor && minor < minMinor) ? "old-git" : undefined;
 }
+
+/** Bytes read from a probe's output: enough for a version line or a path, bounded for noisy wrappers. */
+const PROBE_OUTPUT_BYTES = 4096;
+const readProbeOutput = file => Bun.file(file).slice(0, PROBE_OUTPUT_BYTES).text();
 
 /** Config overrides git honours but gix does not read. */
 const GIX_IGNORED_CONFIG_VARS = new Set([
@@ -261,34 +265,39 @@ const GIX_IGNORED_CONFIG_VARS = new Set([
 	"GIT_CONFIG_SYSTEM",
 	"GIT_CONFIG_NOSYSTEM",
 ]);
+/** Where global config lives; gix takes it from this process's environment, git from the hook's. */
+const CONFIG_HOME_VARS = new Set(["HOME", "XDG_CONFIG_HOME", "USERPROFILE"]);
 /** gix reads these, but from this process's environment, not from the one the hook gets. */
-const isConfigCountVar = name => /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/i.test(name);
+const readsFromProcessEnv = name =>
+	CONFIG_HOME_VARS.has(name.toUpperCase()) || /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/i.test(name);
 
 /**
  * Where git looks for the `post-checkout` hook. Found in-process, as `find_hook` does, unless
- * `env` carries config the in-process lookup would not see: an override gix does not read, or
- * `GIT_CONFIG_COUNT` entries that differ from this process's. Then git itself answers.
- * Undefined when that git can't.
+ * `env` carries config the in-process lookup would not see: an override gix does not read, or a
+ * different home or `GIT_CONFIG_COUNT` entries than this process's. Then git itself answers; if
+ * that git can't, the in-process answer stands, so a hook it finds is reported as not run rather
+ * than silently treated as missing.
  */
 async function postCheckoutHookPath(captureDir, worktreeRoot, env, signal) {
+	const inProcess = () => git(worktreeRoot)?.hookLocation("post-checkout", signal);
 	const childEnv = env ?? process.env;
 	const overridden =
 		Object.keys(childEnv).some(name => GIX_IGNORED_CONFIG_VARS.has(name.toUpperCase())) ||
 		[...Object.keys(childEnv), ...Object.keys(process.env)].some(
-			name => isConfigCountVar(name) && childEnv[name] !== process.env[name],
+			name => readsFromProcessEnv(name) && childEnv[name] !== process.env[name],
 		);
-	if (!overridden) return git(worktreeRoot)?.hookLocation("post-checkout", signal);
+	if (!overridden) return inProcess();
 	const outPath = path.join(captureDir, "git-path");
 	try {
 		const args = ["rev-parse", "--git-path", "hooks/post-checkout"];
 		const exitCode = await runGitToFiles(args, { cwd: worktreeRoot, env, stdout: Bun.file(outPath), stderr: "ignore", signal });
-		if (exitCode !== 0) return undefined;
+		if (exitCode !== 0) return inProcess();
 	} catch (error) {
-		if (GIT_CANNOT_START.has(error?.code)) return undefined;
+		if (GIT_CANNOT_START.has(error?.code)) return inProcess();
 		throw error;
 	}
 	// A relative result is relative to the worktree, where `git hook run` runs.
-	return path.resolve(worktreeRoot, (await Bun.file(outPath).text()).trim());
+	return path.resolve(worktreeRoot, (await readProbeOutput(outPath)).trim());
 }
 
 /**

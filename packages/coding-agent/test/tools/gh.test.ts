@@ -1284,6 +1284,21 @@ describe("github tool", () => {
 				});
 				await expectDiscarded(number);
 			});
+			it("puts back the PR branch a cut-short hook committed to, so a retry is not refused as diverged", async () => {
+				mockPrView(128);
+				const commit =
+					"git -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false commit -q --allow-empty -m hook";
+				await withBlockingHook("pr-128", commit, async started => {
+					const controller = new AbortController();
+					const pending = checkout(128, controller.signal);
+					await fs.readFile(started, "utf8");
+					controller.abort();
+					await expect(pending).rejects.toThrow();
+				});
+
+				await expectDiscarded(128);
+				expect(runGit(fixture.repoRoot, ["rev-parse", "refs/heads/pr-128"])).toBe(fixture.headRefOid);
+			});
 
 			it("is removed when the checkout is aborted after the worktree exists but before its hook starts", async () => {
 				mockPrView(126);

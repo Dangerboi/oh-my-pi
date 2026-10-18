@@ -442,6 +442,27 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			}
 		});
 
+		it("asks git when the supplied env has another HOME whose global config picks the hooks", async () => {
+			const wt = await create();
+			const home = path.join(root, "child-home");
+			const injected = path.join(root, "home-hooks");
+			await Bun.write(path.join(home, ".gitconfig"), `[core]\n\thooksPath = ${injected}\n`);
+			await Bun.write(path.join(injected, "post-checkout"), "#!/bin/sh\ntouch .post-checkout-ran\n");
+			await fs.chmod(path.join(injected, "post-checkout"), 0o755);
+			const {
+				GIT_CONFIG_GLOBAL: _global,
+				GIT_CONFIG_SYSTEM: _system,
+				GIT_CONFIG_NOSYSTEM: _noSystem,
+				...ambient
+			} = filterChildShellEnv(process.env);
+			// Without those overrides, which other suites set, git reads the global config from the child's HOME.
+			const env = { ...ambient, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config") };
+			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
+
+			expect(result.exitCode).toBe(0);
+			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
+		});
+
 		it("asks git when only the supplied env sets core.hooksPath through GIT_CONFIG_COUNT", async () => {
 			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
 			const wt = await create();

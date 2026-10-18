@@ -526,13 +526,30 @@ export async function checkoutPullRequest(
 						error: result.cloneError,
 					});
 				}
+				let head: string | null | undefined = null;
 				try {
 					signal?.throwIfAborted();
-					const head = await repository.resolveRef(`refs/heads/${localBranch}`, signal);
+					head = await repository.resolveRef(`refs/heads/${localBranch}`, signal);
 					if (head) hook = await runWorktreeCheckoutHook(finalWorktreePath, head, signal);
 				} catch (error) {
 					// Stopping before the hook completed can leave a half-set-up worktree a retry would reuse.
 					await discardNewWorktree(repository, finalWorktreePath);
+					// A hook that committed before it was cut short moved the branch, and a retry would refuse it
+					// as diverged from the PR head; put it back where the checkout left it.
+					if (head) {
+						const checkedOut = head;
+						await repository
+							.resolveRef(`refs/heads/${localBranch}`)
+							.then(now =>
+								now && now !== checkedOut ? repository.createBranch(localBranch, checkedOut, true) : undefined,
+							)
+							.catch(restoreError => {
+								logger.warn("could not restore a PR branch moved by a cut-short post-checkout hook", {
+									branch: localBranch,
+									error: String(restoreError),
+								});
+							});
+					}
 					throw error;
 				}
 			}
