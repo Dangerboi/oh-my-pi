@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [18.12.2] - 2026-10-18
+
 ### Fixed
 
 - Fixed a relay tab close failing when Chrome refuses it for a moment (a tab being dragged); the extension retries it ([#16119](https://github.com/can1357/oh-my-pi/pull/16119) by [@will-bogusz](https://github.com/will-bogusz))

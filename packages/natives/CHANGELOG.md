@@ -3,17 +3,27 @@
 ## [Unreleased]
 
 ### Added
+
+- Added `VcsGitRepo.hookLocation(name, signal?)`, where git looks for a hook (`core.hooksPath`, with `~/` and `%(prefix)/` expanded, or the shared hooks directory) whether or not one exists there ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+
+### Changed
+
+- `vcs.runPostCheckoutHook` takes `{ signal, env, detached }`, reports a hook that exists but didn't run as `skipped`, returns once `git hook run` exits even if the hook left a background process running, and returns at most the last 64 KiB of each output stream ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+
+## [18.12.2] - 2026-10-18
+
+### Added
+
 - Added a `refuseMenu` option to `click`, `drag` and `holdMouse`: a macOS background left click on a menu button or popup button, or a drag or hold starting on one, throws `BackgroundUnavailable` before anything is sent ([#15191](https://github.com/can1357/oh-my-pi/pull/15191) by [@will-bogusz](https://github.com/will-bogusz))
 - Added a `returnFocus` option for window input with `takeover`: on macOS the takeover hands focus back to your app even if you clicked meanwhile, and only a third app you switched to keeps focus ([#15191](https://github.com/can1357/oh-my-pi/pull/15191) by [@will-bogusz](https://github.com/will-bogusz))
-
 - Added `DesktopSession.axSelectText` (macOS) to select text in an accessibility element's value by UTF-16 range, refusing missing or ambiguous matches and returning the selection read back ([#15175](https://github.com/can1357/oh-my-pi/pull/15175) by [@will-bogusz](https://github.com/will-bogusz))
-- Added `VcsGitRepo.hookLocation(name, signal?)`, where git looks for a hook (`core.hooksPath`, with `~/` and `%(prefix)/` expanded, or the shared hooks directory) whether or not one exists there ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Added a `menu` item path to `click` options and `axPerform`: a macOS click or action that opens a menu chooses that item, submenus included, and leaves no menu open ([#15185](https://github.com/can1357/oh-my-pi/pull/15185) by [@will-bogusz](https://github.com/will-bogusz))
 - Added `DesktopSession.axType` and `axKeyChord`, which type into or press keys in one accessibility element; on macOS a field that does not report keyboard focus gets nothing and the error names what has focus; on Windows background input goes straight to the element's own control window and refuses a windowless element ([#15563](https://github.com/can1357/oh-my-pi/pull/15563) by [@will-bogusz](https://github.com/will-bogusz))
 - Added `DesktopSession.escapeStops` and `desktopEscapeStops(key)`, counting takeover input you stopped with physical Escape on macOS, Windows and X11, apart from host cancels ([#15564](https://github.com/can1357/oh-my-pi/pull/15564) by [@will-bogusz](https://github.com/will-bogusz))
 - Added `UserIntervened` on macOS: keys and clicks stop at your first key or click in the app they go to, and input to an app you used since it was last read waits up to 5 s for you to pause, then fails without sending (needs Input Monitoring) ([#15562](https://github.com/can1357/oh-my-pi/pull/15562) by [@will-bogusz](https://github.com/will-bogusz))
 
 ### Changed
+
 - Reduced Mermaid XY-chart rendering overhead while preserving chart colors and layout ([#16214](https://github.com/can1357/oh-my-pi/pull/16214) by [@kyle-elliott](https://github.com/kyle-elliott)).
 - Reading recent commit subjects in a long Git history now reads only the commits requested instead of walking the whole history ([#16210](https://github.com/can1357/oh-my-pi/pull/16210) by [@kyle-elliott](https://github.com/kyle-elliott)).
 - Improved AST search and edit performance in directories containing many unsupported files ([#16213](https://github.com/can1357/oh-my-pi/pull/16213) by [@kyle-elliott](https://github.com/kyle-elliott)).
@@ -21,16 +31,15 @@
 - Improved word-diff performance for inline change highlighting ([#16212](https://github.com/can1357/oh-my-pi/pull/16212) by [@kyle-elliott](https://github.com/kyle-elliott)).
 - Window input calls, element `axClick`, `axType` and `axKeyChord` included, resolve to a `DesktopFocusReturn` (`handedBack`, `previousPid`, `frontPid`) when a macOS takeover ran, and to `null` otherwise ([#15191](https://github.com/can1357/oh-my-pi/pull/15191) by [@will-bogusz](https://github.com/will-bogusz))
 - `BackgroundUnavailable` and partial-delivery errors no longer tell the caller to retry with `takeover:true`; they say whether any input was sent ([#15191](https://github.com/can1357/oh-my-pi/pull/15191) by [@will-bogusz](https://github.com/will-bogusz))
-
 - Reduced allocation overhead for uncached, result-limited file searches in large directory trees ([#16115](https://github.com/can1357/oh-my-pi/pull/16115) by [@kyle-elliott](https://github.com/kyle-elliott)).
 - Desktop window input with `takeover` omitted is now background on every platform even while task control is held; only `takeover: true` selects foreground delivery ([#15173](https://github.com/can1357/oh-my-pi/pull/15173) by [@will-bogusz](https://github.com/will-bogusz))
-- `vcs.runPostCheckoutHook` takes `{ signal, env, detached }`, reports a hook that exists but didn't run as `skipped`, returns once `git hook run` exits even if the hook left a background process running, and returns at most the last 64 KiB of each output stream ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Computer use's physical Escape stop now watches the keyboard only during takeover input (`takeover: true`, held control, desktop-level input, raises); without held control, an Escape the user presses in their own app no longer cancels background window input, which the host interrupt still stops ([#15176](https://github.com/can1357/oh-my-pi/pull/15176) by [@will-bogusz](https://github.com/will-bogusz))
 - macOS background keys, typing, left clicks and menu commands now refuse with `BackgroundUnavailable` when aimed at a non-key window of the app you are using, or once you have come to the target app, instead of moving your typing there; keys sent while another window of the target app becomes key stop with `InputFailed` ([#15184](https://github.com/can1357/oh-my-pi/pull/15184) by [@will-bogusz](https://github.com/will-bogusz))
 - macOS `win.menu.items` now makes the window key within its app before reading, so it takes the input lock and throws `InputBusy` while another operation holds it ([#15184](https://github.com/can1357/oh-my-pi/pull/15184) by [@will-bogusz](https://github.com/will-bogusz))
 - macOS background drags and holds on sliders, scroll bars, splitters and steppers, modified clicks, right-clicks, Electron scrolls and Tk 8.5 clicks now run without bringing the app forward; drags that could pick up files or text still throw `BackgroundUnavailable` ([#15185](https://github.com/can1357/oh-my-pi/pull/15185) by [@will-bogusz](https://github.com/will-bogusz))
 
 ### Fixed
+
 - Fixed macOS `UserIntervened` missing your input during element writes (`axSelectText`, `setValue`, native-field typing, AX actions and popups), a reused Open/Save panel process id counting another app's input, and an event tap started during exit staying live ([#15562](https://github.com/can1357/oh-my-pi/pull/15562))
 - Fixed macOS remote-screen `press`/`holdKeys` landing in a Screen Sharing window you brought forward during the layout read, iPhone Mirroring dropping a press right after a release, and a modifier two characters need being pressed twice ([#15193](https://github.com/can1357/oh-my-pi/pull/15193))
 - Fixed the macOS focus guard missing switches while a click hit-test stalled and missing an app the action brought forward 200–500 ms after its last send; background actions now keep guarding for that window before returning ([#15195](https://github.com/can1357/oh-my-pi/pull/15195))
@@ -39,7 +48,6 @@
 - Fixed macOS and X11 background input throwing `BackgroundUnavailable` ("nothing was sent") after part of the call was already sent; it now throws `InputFailed`, and on macOS a call stopped because you came to the target app throws `UserIntervened` ([#15191](https://github.com/can1357/oh-my-pi/pull/15191) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed macOS takeover `InputFailed` naming only the target window when another held focus; it now names the app's focused window, such as an alert or sheet, or the app that stayed in front ([#15191](https://github.com/can1357/oh-my-pi/pull/15191) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed a macOS `takeover: true` click or key that opened a document or closed a sheet or panel leaving its app in front for good; focus now returns to your app unless you clicked or pressed a shortcut during the takeover ([#15191](https://github.com/can1357/oh-my-pi/pull/15191) by [@will-bogusz](https://github.com/will-bogusz))
-
 - Fixed the in-process `cksum --check` panicking on a tagged checksum line that starts with `(` (for example `(file)= <hash>`) instead of reporting it as an invalid checksum line ([#16142](https://github.com/can1357/oh-my-pi/pull/16142) by [@jchanghong023](https://github.com/jchanghong023))
 - Fixed `grep --path-separator` leaving `\` separators untouched in printed paths on Windows, so displayed paths no longer mix `\` with the configured separator ([#16143](https://github.com/can1357/oh-my-pi/pull/16143) by [@jchanghong023](https://github.com/jchanghong023))
 - Fixed macOS computer use reporting a working physical Escape stop (`globalEscape: true`) when Input Monitoring was turned off and the stop could not see keys; `inputPermission` now reports event-posting access, and permission errors name the terminal or IDE to grant ([#15157](https://github.com/can1357/oh-my-pi/pull/15157) by [@will-bogusz](https://github.com/will-bogusz))
