@@ -17,9 +17,15 @@ export interface WorktreeCheckoutHookResult {
 	skipped?: string;
 }
 
-const displayLine = (text: string) => truncateToWidth(sanitizeDisplayWarning(text), TRUNCATE_LENGTHS.LINE);
+/**
+ * Width left for a hook warning after the longest lead-in a caller puts before it (`/wt` shows
+ * "Warning: Worktree created, but …"), so the whole rendered line stays within one display line.
+ */
+const WARNING_WIDTH = TRUNCATE_LENGTHS.LINE - Bun.stringWidth("Warning: Worktree created, but ");
 
-/** Warning line for a `post-checkout` hook that exists but did not run; sanitized and home-shortened. */
+const displayLine = (text: string, width = WARNING_WIDTH) => truncateToWidth(sanitizeDisplayWarning(text), width);
+
+/** Warning line for a `post-checkout` hook that exists but did not run; sanitized and home-shortened. Only the path is cut, never the reason. */
 export function describeSkippedHook(skipped: vcs.SkippedPostCheckoutHook): string {
 	const why = {
 		"not-executable": "is not executable, so git skipped it",
@@ -27,7 +33,8 @@ export function describeSkippedHook(skipped: vcs.SkippedPostCheckoutHook): strin
 		"old-git": "did not run: running hooks needs Git 2.36 or newer",
 		inaccessible: "did not run: it could not be read",
 	}[skipped.reason];
-	return `post-checkout hook ${displayLine(skipped.path)} ${why}`;
+	const lead = "post-checkout hook ";
+	return `${lead}${displayLine(skipped.path, WARNING_WIDTH - Bun.stringWidth(`${lead} ${why}`))} ${why}`;
 }
 
 /** The hook's warnings, failure first; each completes "Worktree created, but …". */
@@ -53,10 +60,13 @@ export async function runWorktreeCheckoutHook(
 	if (hook.exitCode !== 0) {
 		const decoder = new TextDecoder();
 		const output = sanitizeText(`${decoder.decode(hook.stdout)}\n${decoder.decode(hook.stderr)}`).trim();
-		const shown = displayLine(output.split("\n").at(-1) ?? "");
-		result.error = shown
-			? `post-checkout hook exited with ${hook.exitCode}: ${shown}`
-			: `post-checkout hook exited with ${hook.exitCode}`;
+		const last = output.split("\n").at(-1);
+		// Composed first, then truncated as a whole, so the exit status always counts against the line limit.
+		result.error = displayLine(
+			last
+				? `post-checkout hook exited with ${hook.exitCode}: ${last}`
+				: `post-checkout hook exited with ${hook.exitCode}`,
+		);
 	}
 	return result;
 }
@@ -89,7 +99,10 @@ export async function addWorktreeWithHook(
 	try {
 		signal?.throwIfAborted();
 		head = await repository.resolveRef(`refs/heads/${branch}`, signal);
-		return { added, hook: head ? await runWorktreeCheckoutHook(worktreePath, head, signal) : {} };
+		const hook = head ? await runWorktreeCheckoutHook(worktreePath, head, signal) : {};
+		// An abort that lands as the hook finishes still cancels: the caller must not move into the worktree.
+		signal?.throwIfAborted();
+		return { added, hook };
 	} catch (error) {
 		await discardNewWorktree(repository, worktreePath);
 		if (head) await restoreBranch(repository, branch, head);

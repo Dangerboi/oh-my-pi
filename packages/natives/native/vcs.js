@@ -233,22 +233,34 @@ async function runGitToFiles(args, { cwd, env, stdout, stderr, signal, detached 
 /** Spawn errors meaning the `git` on PATH cannot start: missing, not a runnable binary, or not executable. */
 const GIT_CANNOT_START = new Set(["ENOENT", "ENOEXEC", "EACCES"]);
 
+/** Bytes read from a probe's output: enough for a version line or a path, bounded for noisy wrappers. */
+const PROBE_OUTPUT_BYTES = 4096;
+
 /**
- * Whether the git on `env`'s PATH can run hooks: "no-git" when none starts or `git version`
- * fails, "old-git" when it predates `git hook run`, else undefined. Output goes to a file in
- * `captureDir`, so a wrapper's lingering child cannot hold the result back.
+ * Run `git <args>` for its output: written to a file in `captureDir`, so a wrapper's lingering
+ * child cannot hold it back, and read up to {@link PROBE_OUTPUT_BYTES}. Null when no git starts
+ * or the command fails.
  */
-async function hookRunnerProblem(captureDir, cwd, { env, signal, detached }) {
-	const outPath = path.join(captureDir, "version");
-	let exitCode;
+async function gitProbe(args, captureDir, cwd, { env, signal, detached }) {
+	const outPath = path.join(captureDir, args[0]);
 	try {
-		exitCode = await runGitToFiles(["version"], { cwd, env, stdout: Bun.file(outPath), stderr: "ignore", signal, detached });
+		const exitCode = await runGitToFiles(args, { cwd, env, stdout: Bun.file(outPath), stderr: "ignore", signal, detached });
+		if (exitCode !== 0) return null;
 	} catch (error) {
-		if (GIT_CANNOT_START.has(error?.code)) return "no-git";
+		if (GIT_CANNOT_START.has(error?.code)) return null;
 		throw error;
 	}
-	if (exitCode !== 0) return "no-git";
-	const match = /^git version (\d+)\.(\d+)/.exec(await readProbeOutput(outPath));
+	return untilAborted(Bun.file(outPath).slice(0, PROBE_OUTPUT_BYTES).text(), signal);
+}
+
+/**
+ * Whether the git on `env`'s PATH can run hooks: "no-git" when none starts or `git version`
+ * fails, "old-git" when it predates `git hook run`, else undefined.
+ */
+async function hookRunnerProblem(captureDir, cwd, gitOptions) {
+	const version = await gitProbe(["version"], captureDir, cwd, gitOptions);
+	if (version === null) return "no-git";
+	const match = /^git version (\d+)\.(\d+)/.exec(version);
 	// An unrecognised version string gets the benefit of the doubt.
 	if (!match) return undefined;
 	const [major, minor] = [Number(match[1]), Number(match[2])];
@@ -256,30 +268,20 @@ async function hookRunnerProblem(captureDir, cwd, { env, signal, detached }) {
 	return major < minMajor || (major === minMajor && minor < minMinor) ? "old-git" : undefined;
 }
 
-/** Bytes read from a probe's output: enough for a version line or a path, bounded for noisy wrappers. */
-const PROBE_OUTPUT_BYTES = 4096;
-const readProbeOutput = file => Bun.file(file).slice(0, PROBE_OUTPUT_BYTES).text();
-
 /**
  * Where git looks for the `post-checkout` hook. The git on `env`'s PATH answers whenever it can,
  * since only it sees every config source (wrappers, distribution system config, `-c` and
  * environment overrides). Without a git that starts and answers, the in-process lookup (`find_hook`
  * rules) stands, so a hook it finds is reported as not run rather than treated as missing.
  */
-async function postCheckoutHookPath(captureDir, worktreeRoot, { env, signal, detached }) {
-	const inProcess = () => git(worktreeRoot)?.hookLocation("post-checkout", signal);
-	const outPath = path.join(captureDir, "git-path");
-	try {
-		const args = ["rev-parse", "--git-path", "hooks/post-checkout"];
-		const exitCode = await runGitToFiles(args, { cwd: worktreeRoot, env, stdout: Bun.file(outPath), stderr: "ignore", signal, detached });
-		if (exitCode !== 0) return inProcess();
-	} catch (error) {
-		if (GIT_CANNOT_START.has(error?.code)) return inProcess();
-		throw error;
+async function postCheckoutHookPath(captureDir, worktreeRoot, gitOptions) {
+	const answer = await gitProbe(["rev-parse", "--git-path", "hooks/post-checkout"], captureDir, worktreeRoot, gitOptions);
+	// Only the line break git ends it with: a relative `core.hooksPath` may start or end with spaces.
+	const reported = answer?.replace(/\r?\n$/, "");
+	// Nothing usable (no answer, empty, or an MSYS/Cygwin `/c/…` path on Windows; `//server/share` UNC paths are fine).
+	if (!reported || (process.platform === "win32" && reported.startsWith("/") && !reported.startsWith("//"))) {
+		return git(worktreeRoot)?.hookLocation("post-checkout", gitOptions.signal);
 	}
-	const reported = (await readProbeOutput(outPath)).trim();
-	// Nothing usable (empty, or an MSYS/Cygwin `/c/…` path on Windows; `//server/share` UNC paths are fine): fall back rather than call the hook missing.
-	if (!reported || (process.platform === "win32" && reported.startsWith("/") && !reported.startsWith("//"))) return inProcess();
 	// A relative result is relative to the worktree, where `git hook run` runs.
 	return path.resolve(worktreeRoot, reported);
 }
@@ -292,7 +294,7 @@ async function postCheckoutHookPath(captureDir, worktreeRoot, { env, signal, det
  * hook left a background process running, with the last 64 KiB of each output
  * stream; `skipped` says why an existing hook did not run. Aborting
  * `options.signal` kills the hook's process tree and rejects with the reason,
- * also while a filesystem check is stalled.
+ * also while a filesystem check or a read is stalled.
  */
 export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	const { signal, env, detached } = options;
@@ -302,18 +304,18 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	if (!posix) void sweepStaleHookCaptures();
 	// Files, not pipes: a background process git or the hook starts inherits them, and pipes would stay open until it exits.
 	const removeCapture = dir => fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
-	const making = fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
+	const creating = fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
 	let dir;
 	try {
-		dir = await untilAborted(making, signal);
+		dir = await untilAborted(creating, signal);
 	} catch (error) {
 		// Aborted while a stalled TMPDIR was still creating it: remove it once it exists.
-		making.then(removeCapture, () => {});
+		creating.then(removeCapture, () => {});
 		throw error;
 	}
-	const probe = { env, signal, detached };
+	const gitOptions = { env, signal, detached };
 	try {
-		const foundAt = await postCheckoutHookPath(dir, worktreeRoot, probe);
+		const foundAt = await postCheckoutHookPath(dir, worktreeRoot, gitOptions);
 		if (!foundAt) return notRun;
 		// Only a missing path means no hook; any other failure (EACCES, EIO) is reported, not mistaken for one.
 		const missing = error => error?.code === "ENOENT" || error?.code === "ENOTDIR";
@@ -342,7 +344,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 				return { ...notRun, skipped: { path: hookPath, reason: "not-executable" } };
 			}
 		}
-		const reason = await hookRunnerProblem(dir, worktreeRoot, probe);
+		const reason = await hookRunnerProblem(dir, worktreeRoot, gitOptions);
 		if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
 		const outPath = path.join(dir, "stdout");
 		const errPath = path.join(dir, "stderr");
@@ -356,7 +358,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 			detached,
 		});
 		const tail = file => file.slice(Math.max(0, file.size - HOOK_OUTPUT_TAIL_BYTES)).bytes();
-		const [stdout, stderr] = await Promise.all([tail(Bun.file(outPath)), tail(Bun.file(errPath))]);
+		const [stdout, stderr] = await untilAborted(Promise.all([tail(Bun.file(outPath)), tail(Bun.file(errPath))]), signal);
 		return { exitCode, stdout, stderr };
 	} finally {
 		// Not awaited: a stalled TMPDIR must not hold up the result or an abort. A lingering child may still hold the files open on Windows; leave them for the OS then.

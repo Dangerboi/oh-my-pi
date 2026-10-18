@@ -97,14 +97,18 @@ export interface SkippedPostCheckoutHook {
  * (`git rev-parse --git-path`), seeing every config source; without a git that starts and
  * answers, the in-process lookup (`core.hooksPath`, path expanded, or the shared hooks
  * directory) does, so no git binary is needed when there is no hook. On Windows a
- * `post-checkout.exe` counts too, as in git. Returns once `git hook run` exits, even if the
- * hook left a background process running. `skipped` is set when the hook exists but did not
- * run: not executable (POSIX only), no working git on PATH, a git older than 2.36, or a hook
- * file that can't be checked. `env` replaces the inherited environment; pass one without
- * ambient `GIT_DIR`-family variables. `detached` (POSIX) runs the hook, and the git calls that locate it, in their own session,
- * without the caller's controlling terminal, so a prompt on /dev/tty fails instead of writing
- * into a TUI. Aborting `signal` kills the hook's process tree and rejects with the abort
- * reason, also while a filesystem check is stalled; a `signal` implies `detached`.
+ * `post-checkout.exe` counts too, as in git. Only a missing path means no hook; anything else
+ * there goes to git. The hook runs through `git hook run`, so, like hooks git runs itself and
+ * unlike `git worktree add`'s, it sees `GIT_DIR` set to the new worktree's git dir. Returns
+ * once `git hook run` exits, even if the hook left a background process running. `skipped` is
+ * set when the hook exists but did not run: not executable (POSIX only), no working git on
+ * PATH, a git older than 2.36, or a hook file that can't be checked. `env` replaces the
+ * inherited environment; pass one without ambient `GIT_DIR`-family variables. `detached`
+ * (POSIX) runs the hook, and the git calls that locate it, in their own session, without the
+ * caller's controlling terminal, so a prompt on /dev/tty fails instead of writing into a TUI.
+ * Aborting `signal` kills the hook's process tree (on Windows, commands MSYS `sh` started
+ * through its fork stubs can survive) and rejects with the abort reason, also while a
+ * filesystem check or a read is stalled; a `signal` implies `detached`.
  */
 export declare function runPostCheckoutHook(
 	worktreeRoot: string,

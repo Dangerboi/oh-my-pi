@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
+import { shortenPath, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { filterChildShellEnv, setWorktreesDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import {
@@ -341,6 +341,42 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(wt.hook?.error).toBe("post-checkout hook exited with 17: setup failed in ~/proj");
 		});
 
+		// The longest line the TUI renders for it: showWarning's "Warning: " plus /wt's "Worktree created, but ".
+		const rendered = (warning: string | undefined) => Bun.stringWidth(`Warning: Worktree created, but ${warning}`);
+
+		it("keeps the whole rendered failure warning within one display line when the hook's last line is long", async () => {
+			await hook(`printf '%0300d\\n' 0 >&2; exit 3`);
+			const wt = await create();
+
+			expect(wt.hook?.error).toStartWith("post-checkout hook exited with 3: 000");
+			expect(rendered(wt.hook?.error)).toBeLessThanOrEqual(TRUNCATE_LENGTHS.LINE);
+		});
+
+		it("cuts a long hook path, never the reason it did not run", async () => {
+			const hooks = path.join(root, "h".repeat(150));
+			git(repo, "config", "core.hooksPath", hooks);
+			await Bun.write(path.join(hooks, "post-checkout"), "#!/bin/sh\ntouch .post-checkout-ran\n");
+			await fs.chmod(path.join(hooks, "post-checkout"), 0o644);
+			const wt = await create();
+
+			expect(wt.hook?.skipped).toEndWith(" is not executable, so git skipped it");
+			expect(rendered(wt.hook?.skipped)).toBeLessThanOrEqual(TRUNCATE_LENGTHS.LINE);
+		});
+
+		it("finds a hook under a relative core.hooksPath that starts with a space", async () => {
+			const wt = await create();
+			git(repo, "config", "core.hooksPath", " spaced-hooks");
+			const hookFile = path.join(wt.path, " spaced-hooks", "post-checkout");
+			await Bun.write(hookFile, "#!/bin/sh\ntouch .post-checkout-ran\n");
+			await fs.chmod(hookFile, 0o755);
+			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
+				env: filterChildShellEnv(process.env),
+			});
+
+			expect(result.exitCode).toBe(0);
+			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
+		});
+
 		it("reports a non-executable hook without running it", async () => {
 			await hook("touch .post-checkout-ran");
 			await fs.chmod(path.join(repo, ".git", "hooks", "post-checkout"), 0o644);
@@ -428,6 +464,28 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(branchSha(repo, branch)).toBeNull();
 			const retried = await create();
 			expect(await exists(path.join(retried.path, ".post-checkout-ran"))).toBe(true);
+		});
+
+		it("an abort landing just as the hook finishes still cancels /wt and leaves nothing behind", async () => {
+			await hook("touch .post-checkout-ran");
+			const controller = new AbortController();
+			const runHook = vcs.runPostCheckoutHook;
+			// The hook completes, then the user's Esc arrives before /wt hands the worktree over.
+			const run = spyOn(vcs, "runPostCheckoutHook").mockImplementation(async (...args) => {
+				const result = await runHook(...args);
+				controller.abort();
+				return result;
+			});
+			try {
+				await expect(
+					createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal }),
+				).rejects.toMatchObject({ name: "AbortError" });
+			} finally {
+				run.mockRestore();
+			}
+
+			expect(worktreePaths(repo)).toEqual([repo]);
+			expect(branchSha(repo, branch)).toBeNull();
 		});
 
 		it("reports a hook as not run when the git on PATH cannot start", async () => {
@@ -613,6 +671,35 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 				await reached.promise;
 			} finally {
 				mkdtemp.mockRestore();
+			}
+			controller.abort();
+			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+		});
+
+		// The runner reads each capture file once after writing it through git: the second `Bun.file` for that name.
+		it.each([
+			["the hook-path probe's output", "rev-parse"],
+			["the hook's output", "stdout"],
+		])("abort is not held up by a stalled read of %s", async (_name, capture) => {
+			const wt = await create();
+			await hook("touch .post-checkout-ran");
+			const reached = Promise.withResolvers<void>();
+			const realFile = Bun.file;
+			let opened = 0;
+			// A read that never settles, as on a stalled network-mounted TMPDIR.
+			const file = spyOn(Bun, "file").mockImplementation(((target: string, ...rest: []) => {
+				if (path.basename(String(target)) !== capture || ++opened < 2) return realFile(target, ...rest);
+				reached.resolve();
+				const stalled = Promise.withResolvers<never>();
+				releaseStalled = () => stalled.reject(Object.assign(new Error("released"), { code: "ENOENT" }));
+				return { size: 0, slice: () => ({ text: () => stalled.promise, bytes: () => stalled.promise }) };
+			}) as unknown as typeof realFile);
+			const controller = new AbortController();
+			const pending = vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { signal: controller.signal });
+			try {
+				await reached.promise;
+			} finally {
+				file.mockRestore();
 			}
 			controller.abort();
 			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
