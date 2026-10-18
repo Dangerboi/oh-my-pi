@@ -142,11 +142,11 @@ async function discardNewWorktree(repository: VcsGitRepo, worktreePath: string):
 	}
 }
 
-/** Put `branch` back at `head` if a cut-short hook committed to it. Failures are logged. */
+/** Put `branch` back at `head` if a cut-short hook moved or deleted it. Failures are logged. */
 async function restoreBranch(repository: VcsGitRepo, branch: string, head: string): Promise<void> {
 	try {
 		const now = await repository.resolveRef(`refs/heads/${branch}`);
-		if (now && now !== head) await repository.createBranch(branch, head, true);
+		if (now !== head) await repository.createBranch(branch, head, true);
 	} catch (error) {
 		logger.warn("could not restore a branch moved by a cut-short post-checkout hook", {
 			branch,

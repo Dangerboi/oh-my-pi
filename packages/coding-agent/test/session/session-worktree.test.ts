@@ -710,33 +710,65 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 		});
 
-		// The runner reads each capture file once after writing it through git: the second `Bun.file` for that name.
 		it.each([
-			["the hook-path probe's output", "rev-parse"],
-			["the hook's output", "stdout"],
-		])("abort is not held up by a stalled read of %s", async (_name, capture) => {
+			["reading the hook-path probe's output", "rev-parse", "r"],
+			["reading the hook's output", "stdout", "r"],
+			["creating the hook's output file", "stdout", "w"],
+		])("abort is not held up by a stalled filesystem when %s", async (_name, capture, flags) => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");
 			const reached = Promise.withResolvers<void>();
-			const realFile = Bun.file;
-			let opened = 0;
-			// A read that never settles, as on a stalled network-mounted TMPDIR.
-			const file = spyOn(Bun, "file").mockImplementation(((target: string, ...rest: []) => {
-				if (path.basename(String(target)) !== capture || ++opened < 2) return realFile(target, ...rest);
+			const realOpen = nodeFs.promises.open;
+			// An open that never settles, as on a stalled network-mounted TMPDIR.
+			const open = spyOn(nodeFs.promises, "open").mockImplementation(((
+				file: nodeFs.PathLike,
+				mode: string,
+				...rest: []
+			) => {
+				const target = String(file);
+				const isCapture =
+					path.basename(target) === capture &&
+					path.basename(path.dirname(target)).startsWith("omp-post-checkout-");
+				if (!isCapture || mode !== flags) return realOpen(file, mode, ...rest);
 				reached.resolve();
-				const stalled = Promise.withResolvers<never>();
+				const stalled = Promise.withResolvers<nodeFs.promises.FileHandle>();
 				releaseStalled = () => stalled.reject(Object.assign(new Error("released"), { code: "ENOENT" }));
-				return { size: 0, slice: () => ({ text: () => stalled.promise, bytes: () => stalled.promise }) };
-			}) as unknown as typeof realFile);
+				return stalled.promise;
+			}) as typeof realOpen);
 			const controller = new AbortController();
 			const pending = vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { signal: controller.signal });
 			try {
 				await reached.promise;
 			} finally {
-				file.mockRestore();
+				open.mockRestore();
 			}
 			controller.abort();
 			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+		});
+
+		it("removes this host's hook captures whose omp process is gone, never those of a live one or another host", async () => {
+			const wt = await create();
+			const tmp = path.join(root, "tmp");
+			await fs.mkdir(tmp);
+			const host = Bun.hash(os.hostname()).toString(36);
+			// A pid whose process has already exited, as after omp crashed before its own cleanup.
+			const gone = Bun.spawnSync(["sh", "-c", "echo $$"]).stdout.toString().trim();
+			const left = path.join(tmp, `omp-post-checkout-${host}-${gone}-leftover`);
+			// Its omp is alive: a hook that may be running for hours.
+			const running = path.join(tmp, `omp-post-checkout-${host}-${process.pid}-running`);
+			// Another host or container sharing the TMPDIR, whose pids mean nothing here.
+			const foreign = path.join(tmp, `omp-post-checkout-otherhost-${gone}-elsewhere`);
+			for (const dir of [left, running, foreign]) await Bun.write(path.join(dir, "stdout"), "output\n");
+			const tmpdir = spyOn(os, "tmpdir").mockReturnValue(tmp);
+			try {
+				await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env: filterChildShellEnv(process.env) });
+			} finally {
+				tmpdir.mockRestore();
+			}
+
+			expect(await exists(left)).toBe(false);
+			expect(await exists(path.join(running, "stdout"))).toBe(true);
+			expect(await exists(path.join(foreign, "stdout"))).toBe(true);
 		});
 
 		it("returns when the hook exits even if it left a background process running", async () => {

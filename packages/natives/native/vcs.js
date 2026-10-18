@@ -152,21 +152,36 @@ export async function copyGitObjects(isolationRoot, sourceRoot) {
 /** Bytes kept from the end of each of the hook's output streams. */
 const HOOK_OUTPUT_TAIL_BYTES = 64 * 1024;
 const HOOK_CAPTURE_PREFIX = "omp-post-checkout-";
-/** Capture directories older than this are leftovers, never a run in progress. */
-const HOOK_CAPTURE_STALE_MS = 60 * 60 * 1000;
+/**
+ * This host's tag in capture directory names. Pids only identify processes within one host (pid
+ * namespace), so captures of another host or container sharing the TMPDIR are never judged by them.
+ */
+const HOOK_CAPTURE_HOST = Bun.hash(os.hostname()).toString(36);
+/** A capture directory of this host, with the pid of the omp process that created it. */
+const HOOK_CAPTURE_OWNED = new RegExp(`^${HOOK_CAPTURE_PREFIX}${HOOK_CAPTURE_HOST}-(\\d+)-`);
+
+/** Whether process `pid` still exists (EPERM: it does, under another user). */
+function processAlive(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return error?.code === "EPERM";
+	}
+}
 
 /**
- * On Windows a background process a hook left running keeps its capture files open, so their
- * cleanup fails; delete such leftovers on later runs, once that process has exited.
+ * Delete this host's capture directories whose omp process is gone: it crashed or was killed
+ * before its own cleanup, or (Windows) a background process the hook left running kept the files
+ * open then. A run in progress is never touched, however long it takes: its omp is alive.
+ * shortcut: a pid reused by an unrelated process keeps its leftover until that process exits, fine for a few small directories.
  */
 async function sweepStaleHookCaptures() {
 	const tmp = os.tmpdir();
-	const cutoff = Date.now() - HOOK_CAPTURE_STALE_MS;
 	for (const name of await fs.promises.readdir(tmp).catch(() => [])) {
-		if (!name.startsWith(HOOK_CAPTURE_PREFIX)) continue;
-		const dir = path.join(tmp, name);
-		const stat = await fs.promises.stat(dir).catch(() => null);
-		if (stat && stat.mtimeMs < cutoff) await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+		const pid = Number(HOOK_CAPTURE_OWNED.exec(name)?.[1]);
+		if (!(pid > 0) || processAlive(pid)) continue;
+		await fs.promises.rm(path.join(tmp, name), { recursive: true, force: true }).catch(() => {});
 	}
 }
 
@@ -176,6 +191,8 @@ const HOOK_RUN_MIN_GIT = [2, 36];
 /** Settle with `promise`, or reject with the abort reason as soon as `signal` aborts. */
 async function untilAborted(promise, signal) {
 	if (!signal) return promise;
+	// Observed even when the abort wins, so its later failure never goes unhandled.
+	promise.catch(() => {});
 	const aborted = Promise.withResolvers();
 	const onAbort = () => aborted.reject(signal.reason);
 	signal.addEventListener("abort", onAbort, { once: true });
@@ -188,56 +205,112 @@ async function untilAborted(promise, signal) {
 }
 
 /**
- * Run `git <args>` with output to files and resolve with its exit code. Aborting `signal`
- * kills its process tree, descendants that left its process group included (see the shortcut below),
- * and rejects with the reason. Throws `ENOENT` when no git is on `env`'s PATH. `detached`
- * runs it in its own session even without a signal (POSIX), away from the caller's terminal.
+ * Open `file` for a child's output, raced against the abort. Asynchronous, unlike handing
+ * `Bun.spawn` a `BunFile`, which opens it on the JS thread, where a stalled TMPDIR would block it.
  */
-async function runGitToFiles(args, { cwd, env, stdout, stderr, signal, detached = false }) {
-	const posix = process.platform !== "win32";
-	// No await between this check and the abort listener below, so no abort can be missed.
-	signal?.throwIfAborted();
-	const child = Bun.spawn(["git", ...args], {
-		cwd,
-		env,
-		stdin: "ignore",
-		stdout,
-		stderr,
-		// Own session (setsid): an abort can stop what it spawned, e.g. `npm install`, and without a controlling
-		// terminal a prompt on /dev/tty fails instead of writing into the caller's TUI.
-		detached: posix && (detached || signal !== undefined),
-	});
-	// Pin the root now: killTree walks its descendants by parent, so it also reaches one that left the
-	// process group (setsid), and on Windows, which has no process groups, finds them at all.
-	// shortcut: a descendant that double-forks out to init escapes, as do commands MSYS `sh` starts through fork
-	// stubs on Windows (taskkill /T misses them too), upgrade to ptree's Linux subreaper / a Job Object if hooks
-	// that daemonize must be stopped.
-	const root = signal ? api().Process.fromPid(child.pid) : null;
-	const onAbort = () => {
-		// killTree snapshots the descendants, then signals the root's process group, the descendants and the root;
-		// the group kill after it covers a root that had exited before it could be pinned.
-		try {
-			if (posix) root?.killTree(9);
-			else root?.killTree();
-		} catch {
-			// Already exited.
-		}
-		try {
-			if (posix) process.kill(-child.pid, "SIGKILL");
-		} catch {
-			// Already exited.
-		}
-		child.kill();
-	};
-	signal?.addEventListener("abort", onAbort, { once: true });
-	let exitCode;
+async function openCapture(file, signal) {
+	const opening = fs.promises.open(file, "w");
 	try {
-		exitCode = await child.exited;
-	} finally {
-		signal?.removeEventListener("abort", onAbort);
+		return await untilAborted(opening, signal);
+	} catch (error) {
+		// Opened after the abort: close it once it is.
+		opening.then(handle => handle.close(), () => {});
+		throw error;
 	}
-	signal?.throwIfAborted();
-	return exitCode;
+}
+
+/**
+ * Up to `maxBytes` of a capture file, from its start or (`fromEnd`) its end, read through a file
+ * handle off the JS thread and raced against the abort. A missing file reads as empty.
+ */
+function readCapture(file, maxBytes, { fromEnd = false, signal } = {}) {
+	const read = async () => {
+		let handle;
+		try {
+			handle = await fs.promises.open(file, "r");
+		} catch (error) {
+			if (error?.code === "ENOENT") return new Uint8Array();
+			throw error;
+		}
+		try {
+			const { size } = await handle.stat();
+			const length = Math.min(size, maxBytes);
+			const bytes = new Uint8Array(length);
+			const { bytesRead } = await handle.read(bytes, 0, length, fromEnd ? size - length : 0);
+			return bytes.subarray(0, bytesRead);
+		} finally {
+			await handle.close();
+		}
+	};
+	return untilAborted(read(), signal);
+}
+
+/**
+ * Run `git <args>` with output to the files `stdout`/`stderr` (paths, or "ignore") and resolve with
+ * its exit code. Aborting `signal` kills its process tree, descendants that left its process group
+ * included (see the shortcut below), and rejects with the reason. Throws `ENOENT` when no git is on
+ * `env`'s PATH. `detached` runs it in its own session even without a signal (POSIX), away from the
+ * caller's terminal.
+ */
+async function runGitToFiles(args, { cwd, env, stdout = "ignore", stderr = "ignore", signal, detached = false }) {
+	const posix = process.platform !== "win32";
+	const handles = [];
+	const sink = async file => {
+		if (file === "ignore") return file;
+		const handle = await openCapture(file, signal);
+		handles.push(handle);
+		return handle.fd;
+	};
+	try {
+		const out = await sink(stdout);
+		const err = await sink(stderr);
+		// No await between this check and the abort listener below, so no abort can be missed.
+		signal?.throwIfAborted();
+		const child = Bun.spawn(["git", ...args], {
+			cwd,
+			env,
+			stdin: "ignore",
+			stdout: out,
+			stderr: err,
+			// Own session (setsid): an abort can stop what it spawned, e.g. `npm install`, and without a controlling
+			// terminal a prompt on /dev/tty fails instead of writing into the caller's TUI.
+			detached: posix && (detached || signal !== undefined),
+		});
+		// Pin the root now: killTree walks its descendants by parent, so it also reaches one that left the
+		// process group (setsid), and on Windows, which has no process groups, finds them at all.
+		// shortcut: a descendant that double-forks out to init escapes, as do commands MSYS `sh` starts through fork
+		// stubs on Windows (taskkill /T misses them too), upgrade to ptree's Linux subreaper / a Job Object if hooks
+		// that daemonize must be stopped.
+		const root = signal ? api().Process.fromPid(child.pid) : null;
+		const onAbort = () => {
+			// killTree snapshots the descendants, then signals the root's process group, the descendants and the root;
+			// the group kill after it covers a root that had exited before it could be pinned.
+			try {
+				if (posix) root?.killTree(9);
+				else root?.killTree();
+			} catch {
+				// Already exited.
+			}
+			try {
+				if (posix) process.kill(-child.pid, "SIGKILL");
+			} catch {
+				// Already exited.
+			}
+			child.kill();
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		let exitCode;
+		try {
+			exitCode = await child.exited;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+		signal?.throwIfAborted();
+		return exitCode;
+	} finally {
+		// Our copies only; the child (and anything it left running) holds its own. Not awaited, like the capture cleanup.
+		for (const handle of handles) void handle.close().catch(() => {});
+	}
 }
 
 /** Spawn errors meaning the `git` on PATH cannot start: missing, not a runnable binary, or not executable. */
@@ -254,13 +327,13 @@ const PROBE_OUTPUT_BYTES = 4096;
 async function gitProbe(args, captureDir, cwd, { env, signal, detached }) {
 	const outPath = path.join(captureDir, args[0]);
 	try {
-		const exitCode = await runGitToFiles(args, { cwd, env, stdout: Bun.file(outPath), stderr: "ignore", signal, detached });
+		const exitCode = await runGitToFiles(args, { cwd, env, stdout: outPath, signal, detached });
 		if (exitCode !== 0) return null;
 	} catch (error) {
 		if (GIT_CANNOT_START.has(error?.code)) return null;
 		throw error;
 	}
-	return untilAborted(Bun.file(outPath).slice(0, PROBE_OUTPUT_BYTES).text(), signal);
+	return new TextDecoder().decode(await readCapture(outPath, PROBE_OUTPUT_BYTES, { signal }));
 }
 
 /**
@@ -311,10 +384,14 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	signal?.throwIfAborted();
 	const notRun = { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
 	const posix = process.platform !== "win32";
-	if (!posix) void sweepStaleHookCaptures();
+	// Awaited, raced against the abort: a stalled TMPDIR holds the run up until then, as `mkdtemp` would.
+	await untilAborted(sweepStaleHookCaptures(), signal);
 	// Files, not pipes: a background process git or the hook starts inherits them, and pipes would stay open until it exits.
 	const removeCapture = dir => fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
-	const creating = fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
+	// Host and pid let a later run tell this directory from one whose omp process is gone.
+	const creating = fs.promises.mkdtemp(
+		path.join(os.tmpdir(), `${HOOK_CAPTURE_PREFIX}${HOOK_CAPTURE_HOST}-${process.pid}-`),
+	);
 	let dir;
 	try {
 		dir = await untilAborted(creating, signal);
@@ -362,13 +439,13 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		const exitCode = await runGitToFiles(["hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
 			cwd: worktreeRoot,
 			env,
-			stdout: Bun.file(outPath),
-			stderr: Bun.file(errPath),
+			stdout: outPath,
+			stderr: errPath,
 			signal,
 			detached,
 		});
-		const tail = file => file.slice(Math.max(0, file.size - HOOK_OUTPUT_TAIL_BYTES)).bytes();
-		const [stdout, stderr] = await untilAborted(Promise.all([tail(Bun.file(outPath)), tail(Bun.file(errPath))]), signal);
+		const tail = file => readCapture(file, HOOK_OUTPUT_TAIL_BYTES, { fromEnd: true, signal });
+		const [stdout, stderr] = await Promise.all([tail(outPath), tail(errPath)]);
 		return { exitCode, stdout, stderr };
 	} finally {
 		// Not awaited: a stalled TMPDIR must not hold up the result or an abort. A lingering child may still hold the files open on Windows; leave them for the OS then.
