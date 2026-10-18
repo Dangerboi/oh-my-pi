@@ -382,6 +382,20 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
 		});
 
+		it("finds the hook that git's own config overrides select", async () => {
+			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
+			const wt = await create();
+			const injected = path.join(root, "injected-hooks");
+			await Bun.write(path.join(injected, "post-checkout"), "#!/bin/sh\ntouch .post-checkout-ran\n");
+			await fs.chmod(path.join(injected, "post-checkout"), 0o755);
+			// As `git -c core.hooksPath=…` passes it to a child; gix does not read it.
+			const env = { ...filterChildShellEnv(process.env), GIT_CONFIG_PARAMETERS: `'core.hooksPath'='${injected}'` };
+			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
+
+			expect(result.exitCode).toBe(0);
+			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
+		});
+
 		it("returns when a git wrapper's background child keeps the version output open", async () => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");

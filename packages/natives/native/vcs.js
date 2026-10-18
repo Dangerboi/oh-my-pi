@@ -252,9 +252,30 @@ async function hookRunnerProblem(captureDir, cwd, env, signal) {
 }
 
 /**
+ * Where git looks for the `post-checkout` hook. Found in-process, as `find_hook` does, unless
+ * `env` injects config through `GIT_CONFIG*`, which gix does not read; then git itself answers,
+ * as the bash `git worktree add` builtin hands such cases to git. Undefined when that git can't.
+ */
+async function postCheckoutHookPath(captureDir, worktreeRoot, env, signal) {
+	const injected = Object.keys(env ?? process.env).some(name => name.slice(0, 10).toUpperCase() === "GIT_CONFIG");
+	if (!injected) return git(worktreeRoot)?.hookLocation("post-checkout", signal);
+	const outPath = path.join(captureDir, "git-path");
+	try {
+		const args = ["rev-parse", "--git-path", "hooks/post-checkout"];
+		const exitCode = await runGitToFiles(args, { cwd: worktreeRoot, env, stdout: Bun.file(outPath), stderr: "ignore", signal });
+		if (exitCode !== 0) return undefined;
+	} catch (error) {
+		if (error?.code === "ENOENT") return undefined;
+		throw error;
+	}
+	// A relative result is relative to the worktree, where `git hook run` runs.
+	return path.resolve(worktreeRoot, (await Bun.file(outPath).text()).trim());
+}
+
+/**
  * Run Git's checkout hook in a newly created linked worktree, using the same
- * null old HEAD and branch-switch flag as `git worktree add`. The hook is found
- * in-process, as `find_hook` does, so without one nothing is spawned. Returns
+ * null old HEAD and branch-switch flag as `git worktree add`. Without a hook
+ * nothing is spawned unless `GIT_CONFIG*` overrides make git locate it. Returns
  * once `git hook run` exits, even if the hook left a background process running,
  * with the last 64 KiB of each output stream; `skipped` says why an existing hook
  * did not run. Aborting `options.signal` kills the hook's process tree and rejects
@@ -264,30 +285,30 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	const { signal, env } = options;
 	signal?.throwIfAborted();
 	const notRun = { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
-	const hookPath = await git(worktreeRoot)?.hookLocation("post-checkout", signal);
-	if (!hookPath) return notRun;
-	const stat = await untilAborted(fs.promises.stat(hookPath).catch(() => null), signal);
-	if (!stat?.isFile()) return notRun;
 	const posix = process.platform !== "win32";
-	// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
-	if (posix) {
-		const access = fs.promises.access(hookPath, fs.constants.X_OK).then(
-			() => true,
-			() => false,
-		);
-		if (!(await untilAborted(access, signal))) {
-			return { ...notRun, skipped: { path: hookPath, reason: "not-executable" } };
-		}
-	}
-	const nullOid = "0".repeat(head.length);
 	if (!posix) void sweepStaleHookCaptures();
-	// Files, not pipes: a background process the hook starts inherits them, and pipes would stay open until it exits.
+	// Files, not pipes: a background process git or the hook starts inherits them, and pipes would stay open until it exits.
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
-	const outPath = path.join(dir, "stdout");
-	const errPath = path.join(dir, "stderr");
 	try {
+		const hookPath = await postCheckoutHookPath(dir, worktreeRoot, env, signal);
+		if (!hookPath) return notRun;
+		const stat = await untilAborted(fs.promises.stat(hookPath).catch(() => null), signal);
+		if (!stat?.isFile()) return notRun;
+		// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
+		if (posix) {
+			const access = fs.promises.access(hookPath, fs.constants.X_OK).then(
+				() => true,
+				() => false,
+			);
+			if (!(await untilAborted(access, signal))) {
+				return { ...notRun, skipped: { path: hookPath, reason: "not-executable" } };
+			}
+		}
 		const reason = await hookRunnerProblem(dir, worktreeRoot, env, signal);
 		if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
+		const outPath = path.join(dir, "stdout");
+		const errPath = path.join(dir, "stderr");
+		const nullOid = "0".repeat(head.length);
 		const exitCode = await runGitToFiles(["hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
 			cwd: worktreeRoot,
 			env,
@@ -299,7 +320,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		const [stdout, stderr] = await Promise.all([tail(Bun.file(outPath)), tail(Bun.file(errPath))]);
 		return { exitCode, stdout, stderr };
 	} finally {
-		// A lingering hook child may still hold the files open on Windows; leave them for the OS then.
+		// A lingering child may still hold the files open on Windows; leave them for the OS then.
 		await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
 	}
 }

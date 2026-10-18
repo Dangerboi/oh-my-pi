@@ -95,7 +95,8 @@ export interface SkippedPostCheckoutHook {
  * Run Git's checkout hook in a new linked worktree and return its exit status and the
  * last 64 KiB of each output stream. The hook is found in-process (`core.hooksPath`, path
  * expanded, or the shared hooks directory), so without one nothing is spawned and no git
- * binary is needed. Returns once `git hook run` exits, even if the hook left a background
+ * binary is needed; when `env` has `GIT_CONFIG*` variables, which gix does not read, git
+ * locates it instead. Returns once `git hook run` exits, even if the hook left a background
  * process running. `skipped` is set when the hook exists but did not run: not executable
  * (POSIX only), no working git on PATH, or a git older than 2.36. `env` replaces the
  * inherited environment; pass one without ambient `GIT_DIR`-family variables. Aborting

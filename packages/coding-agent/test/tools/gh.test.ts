@@ -15,7 +15,7 @@ import {
 	resolveDefaultRepoMemoized,
 } from "@oh-my-pi/pi-coding-agent/tools/gh";
 import { parseIssueUrl, parsePullRequestUrl } from "@oh-my-pi/pi-coding-agent/tools/gh-common";
-import { sanitizeRemoteName } from "@oh-my-pi/pi-coding-agent/tools/gh-pr-checkout";
+import { checkoutPullRequest, sanitizeRemoteName } from "@oh-my-pi/pi-coding-agent/tools/gh-pr-checkout";
 import { github } from "@oh-my-pi/pi-coding-agent/utils/github";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { withRepoLock } from "@oh-my-pi/pi-coding-agent/utils/repo-lock";
@@ -1204,6 +1204,64 @@ describe("github tool", () => {
 				);
 			}
 		});
+
+		it.skipIf(process.platform === "win32")(
+			"removes a new worktree whose post-checkout hook is cut short, so a retry does not reuse it",
+			async () => {
+				vi.spyOn(github, "json")
+					.mockResolvedValueOnce({
+						number: 124,
+						title: "Contributor fix",
+						url: "https://ghe.example.com/base/repo/pull/124",
+						baseRefName: "main",
+						headRefName: fixture.headRefName,
+						headRefOid: fixture.headRefOid,
+						headRepository: { nameWithOwner: "contrib/repo" },
+						headRepositoryOwner: { login: "contrib" },
+						isCrossRepository: true,
+						maintainerCanModify: true,
+					})
+					.mockResolvedValueOnce({
+						nameWithOwner: "contrib/repo",
+						sshUrl: fixture.forkBare,
+						url: fixture.forkBare,
+					});
+				const hooks = path.join(fixture.baseDir, "hooks-cut-short");
+				const ready = path.join(fixture.baseDir, "hook-started");
+				expect(Bun.spawnSync(["mkfifo", ready]).exitCode).toBe(0);
+				await Bun.write(
+					path.join(hooks, "post-checkout"),
+					`#!/bin/sh\necho started > "${ready}"\nsleep 30 &\nwait\n`,
+				);
+				await fs.chmod(path.join(hooks, "post-checkout"), 0o755);
+				const previousHooks = Bun.spawnSync(["git", "config", "--get", "core.hooksPath"], { cwd: fixture.repoRoot })
+					.stdout.toString()
+					.trim();
+				runGit(fixture.repoRoot, ["config", "core.hooksPath", hooks]);
+				const controller = new AbortController();
+				try {
+					const pending = checkoutPullRequest(createSession(fixture.repoRoot), controller.signal, {
+						prRef: "124",
+						repo: undefined,
+						force: false,
+					});
+					await fs.readFile(ready, "utf8");
+					controller.abort();
+					await expect(pending).rejects.toThrow();
+				} finally {
+					if (previousHooks) runGit(fixture.repoRoot, ["config", "core.hooksPath", previousHooks]);
+					else runGit(fixture.repoRoot, ["config", "--unset", "core.hooksPath"]);
+				}
+
+				const primaryRoot = vcs.requireGit(fixture.repoRoot).primaryRoot() ?? fixture.repoRoot;
+				expect(runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain(
+					"branch refs/heads/pr-124",
+				);
+				expect(
+					await Bun.file(path.join(tempHome.home, ".omp", "wt", `124-${hashPath(primaryRoot)}`, ".git")).exists(),
+				).toBe(false);
+			},
+		);
 
 		// These assertions are non-mutating (a no-op add and rejected adds), so
 		// reuse the checkout fixture instead of cloning another repository.

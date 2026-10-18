@@ -527,7 +527,21 @@ export async function checkoutPullRequest(
 					});
 				}
 				const head = await repository.resolveRef(`refs/heads/${localBranch}`, signal);
-				if (head) hook = await runWorktreeCheckoutHook(finalWorktreePath, head, signal);
+				if (head) {
+					try {
+						hook = await runWorktreeCheckoutHook(finalWorktreePath, head, signal);
+					} catch (error) {
+						// A hook cut short may leave the checkout half set up, and a retry would reuse it without
+						// rerunning the hook; remove it so the retry starts over. No signal: it may already be aborted.
+						await repository.worktreeRemove(finalWorktreePath, true).catch(removeError => {
+							logger.warn("could not remove worktree after its post-checkout hook was cut short", {
+								path: finalWorktreePath,
+								error: String(removeError),
+							});
+						});
+						throw error;
+					}
+				}
 			}
 			const resolvedWorktreePath = await fs.realpath(finalWorktreePath);
 
