@@ -315,11 +315,20 @@ describe("session worktree helpers (real git)", () => {
 			expect(wt.hookError).toBe("post-checkout hook exited with 17: setup-failed");
 		});
 
+		it("returns when the hook exits even if it left a background process running", async () => {
+			await hook("sleep 30 &\necho $! > .sleeper");
+			const wt = await create();
+			const sleeper = Number((await Bun.file(path.join(wt.path, ".sleeper")).text()).trim());
+			process.kill(sleeper, "SIGKILL");
+
+			expect(wt.hookError).toBeUndefined();
+		});
+
 		it("abort rejects promptly and kills what the hook spawned", async () => {
 			const wt = await create();
 			const ready = path.join(root, "hook-ready");
 			expect(Bun.spawnSync(["mkfifo", ready]).exitCode).toBe(0);
-			// The background sleep keeps the hook's pipes open, so only a process-group kill plus the race returns early.
+			// `wait` keeps the hook running until aborted; only a process-group kill also stops the sleep.
 			await hook(`sleep 30 &\necho $! > "${ready}"\nwait`);
 			const controller = new AbortController();
 			const pending = runWorktreeCheckoutHook(wt.path, wt.baseCommit, controller.signal);

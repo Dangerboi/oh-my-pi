@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { loadNative } from "./loader-state.js";
 
@@ -150,43 +151,52 @@ export async function copyGitObjects(isolationRoot, sourceRoot) {
 
 /**
  * Run Git's checkout hook in a newly created linked worktree, using the same
- * null old HEAD and branch-switch flag as `git worktree add`. Aborting
- * `signal` kills the hook's whole process group and rejects with the reason.
+ * null old HEAD and branch-switch flag as `git worktree add`. Returns once
+ * `git hook run` exits, even if the hook left a background process running.
+ * Aborting `signal` kills the hook's process tree and rejects with the reason.
  */
 export async function runPostCheckoutHook(worktreeRoot, head, signal) {
 	signal?.throwIfAborted();
 	const nullOid = "0".repeat(head.length);
-	// With a signal, own process group (setsid) so an abort also stops what the hook spawned, e.g. `npm install`.
-	const killGroup = signal !== undefined && process.platform !== "win32";
-	const child = Bun.spawn(["git", "hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
-		cwd: worktreeRoot,
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
-		detached: killGroup,
-	});
-	const done = Promise.all([new Response(child.stdout).bytes(), new Response(child.stderr).bytes(), child.exited]);
-	if (!signal) {
-		const [stdout, stderr, exitCode] = await done;
-		return { exitCode, stdout, stderr };
-	}
-	const aborted = Promise.withResolvers();
-	const onAbort = () => {
-		try {
-			if (killGroup) process.kill(-child.pid, "SIGKILL");
-			else child.kill();
-		} catch {
-			// Already exited.
-		}
-		aborted.reject(signal.reason);
-	};
-	signal.addEventListener("abort", onAbort, { once: true });
+	const posix = process.platform !== "win32";
+	// Files, not pipes: a background process the hook starts inherits them, and pipes would stay open until it exits.
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-post-checkout-"));
+	const outPath = path.join(dir, "stdout");
+	const errPath = path.join(dir, "stderr");
 	try {
-		// Race so a descendant still holding the pipes cannot keep the caller waiting.
-		const [stdout, stderr, exitCode] = await Promise.race([done, aborted.promise]);
+		const child = Bun.spawn(["git", "hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
+			cwd: worktreeRoot,
+			stdin: "ignore",
+			stdout: Bun.file(outPath),
+			stderr: Bun.file(errPath),
+			// With a signal, own process group (setsid) so an abort also stops what the hook spawned, e.g. `npm install`.
+			detached: posix && signal !== undefined,
+		});
+		// Windows has no process groups; pin the root now so killTree still finds its descendants on abort.
+		// shortcut: killTree misses descendants of MSYS `sh` fork stubs (taskkill /T does too); a Job Object would catch them.
+		const root = signal && !posix ? api().Process.fromPid(child.pid) : null;
+		const onAbort = () => {
+			try {
+				if (posix) process.kill(-child.pid, "SIGKILL");
+				else root?.killTree();
+			} catch {
+				// Already exited.
+			}
+			child.kill();
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		let exitCode;
+		try {
+			exitCode = await child.exited;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+		signal?.throwIfAborted();
+		const [stdout, stderr] = await Promise.all([Bun.file(outPath).bytes(), Bun.file(errPath).bytes()]);
 		return { exitCode, stdout, stderr };
 	} finally {
-		signal.removeEventListener("abort", onAbort);
+		// A lingering hook child may still hold the files open on Windows; leave them for the OS then.
+		await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
 	}
 }
 

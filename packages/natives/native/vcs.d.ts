@@ -86,7 +86,8 @@ export declare function copyGitObjects(isolationRoot: string, sourceRoot: string
 
 /**
  * Run Git's checkout hook in a new linked worktree and return its output and exit status.
- * Aborting `signal` kills the hook's process group and rejects with the abort reason.
+ * Returns once `git hook run` exits, even if the hook left a background process running.
+ * Aborting `signal` kills the hook's process tree and rejects with the abort reason.
  */
 export declare function runPostCheckoutHook(
 	worktreeRoot: string,
