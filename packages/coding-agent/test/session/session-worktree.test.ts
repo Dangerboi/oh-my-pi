@@ -463,13 +463,13 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			}
 		});
 
-		it("abort also stops a hung git version check", async () => {
+		it("abort also stops a hung git version check and what it spawned", async () => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");
 			const bin = path.join(root, "bin");
 			const ready = path.join(root, "probe-ready");
 			expect(Bun.spawnSync(["mkfifo", ready]).exitCode).toBe(0);
-			// A git wrapper that hangs on `version`; its child keeps stdout open after the wrapper is killed.
+			// A git wrapper that hangs on `version` with a child of its own; only a process-group kill also stops the sleep.
 			await Bun.write(
 				path.join(bin, "git"),
 				`#!/bin/sh\nif [ "$1" = version ]; then\n  sleep 30 &\n  echo $! > "${ready}"\n  wait\nfi\nexec "${Bun.which("git")}" "$@"\n`,
@@ -482,6 +482,10 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			try {
 				controller.abort();
 				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+				const state = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(sleeper)])
+					.stdout.toString()
+					.trim();
+				expect(state === "" || state.startsWith("Z")).toBe(true);
 			} finally {
 				try {
 					process.kill(sleeper, "SIGKILL");

@@ -188,28 +188,61 @@ async function untilAborted(promise, signal) {
 }
 
 /**
+ * Run `git <args>` with output to files and resolve with its exit code. Aborting `signal`
+ * kills the whole process tree, so nothing a wrapper or hook started outlives the abort,
+ * and rejects with the reason. Throws `ENOENT` when no git is on `env`'s PATH.
+ */
+async function runGitToFiles(args, { cwd, env, stdout, stderr, signal }) {
+	const posix = process.platform !== "win32";
+	// No await between this check and the abort listener below, so no abort can be missed.
+	signal?.throwIfAborted();
+	const child = Bun.spawn(["git", ...args], {
+		cwd,
+		env,
+		stdin: "ignore",
+		stdout,
+		stderr,
+		// With a signal, own process group (setsid) so an abort also stops what it spawned, e.g. `npm install`.
+		detached: posix && signal !== undefined,
+	});
+	// Windows has no process groups; pin the root now so killTree still finds its descendants on abort.
+	// shortcut: killTree misses descendants of MSYS `sh` fork stubs (taskkill /T does too); a Job Object would catch them.
+	const root = signal && !posix ? api().Process.fromPid(child.pid) : null;
+	const onAbort = () => {
+		try {
+			if (posix) process.kill(-child.pid, "SIGKILL");
+			else root?.killTree();
+		} catch {
+			// Already exited.
+		}
+		child.kill();
+	};
+	signal?.addEventListener("abort", onAbort, { once: true });
+	let exitCode;
+	try {
+		exitCode = await child.exited;
+	} finally {
+		signal?.removeEventListener("abort", onAbort);
+	}
+	signal?.throwIfAborted();
+	return exitCode;
+}
+
+/**
  * Whether the git on `env`'s PATH can run hooks: "no-git" when none starts or `git version`
  * fails, "old-git" when it predates `git hook run`, else undefined. Output goes to a file in
  * `captureDir`, so a wrapper's lingering child cannot hold the result back.
  */
 async function hookRunnerProblem(captureDir, cwd, env, signal) {
 	const outPath = path.join(captureDir, "version");
-	let child;
+	let exitCode;
 	try {
-		child = Bun.spawn(["git", "version"], {
-			cwd,
-			env,
-			stdin: "ignore",
-			stdout: Bun.file(outPath),
-			stderr: "ignore",
-			signal,
-			killSignal: "SIGKILL",
-		});
+		exitCode = await runGitToFiles(["version"], { cwd, env, stdout: Bun.file(outPath), stderr: "ignore", signal });
 	} catch (error) {
 		if (error?.code === "ENOENT") return "no-git";
 		throw error;
 	}
-	if ((await untilAborted(child.exited, signal)) !== 0) return "no-git";
+	if (exitCode !== 0) return "no-git";
 	const match = /^git version (\d+)\.(\d+)/.exec(await Bun.file(outPath).text());
 	// An unrecognised version string gets the benefit of the doubt.
 	if (!match) return undefined;
@@ -255,37 +288,13 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	try {
 		const reason = await hookRunnerProblem(dir, worktreeRoot, env, signal);
 		if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
-		// No await between this check and the abort listener below, so no abort can be missed.
-		signal?.throwIfAborted();
-		const child = Bun.spawn(["git", "hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
+		const exitCode = await runGitToFiles(["hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
 			cwd: worktreeRoot,
 			env,
-			stdin: "ignore",
 			stdout: Bun.file(outPath),
 			stderr: Bun.file(errPath),
-			// With a signal, own process group (setsid) so an abort also stops what the hook spawned, e.g. `npm install`.
-			detached: posix && signal !== undefined,
+			signal,
 		});
-		// Windows has no process groups; pin the root now so killTree still finds its descendants on abort.
-		// shortcut: killTree misses descendants of MSYS `sh` fork stubs (taskkill /T does too); a Job Object would catch them.
-		const root = signal && !posix ? api().Process.fromPid(child.pid) : null;
-		const onAbort = () => {
-			try {
-				if (posix) process.kill(-child.pid, "SIGKILL");
-				else root?.killTree();
-			} catch {
-				// Already exited.
-			}
-			child.kill();
-		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-		let exitCode;
-		try {
-			exitCode = await child.exited;
-		} finally {
-			signal?.removeEventListener("abort", onAbort);
-		}
-		signal?.throwIfAborted();
 		const tail = file => file.slice(Math.max(0, file.size - HOOK_OUTPUT_TAIL_BYTES)).bytes();
 		const [stdout, stderr] = await Promise.all([tail(Bun.file(outPath)), tail(Bun.file(errPath))]);
 		return { exitCode, stdout, stderr };
