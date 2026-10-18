@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
-import { setWorktreesDir } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, setWorktreesDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import {
 	canAutoCreateWorktree,
@@ -379,6 +380,31 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 					.stdout.toString()
 					.trim();
 				expect(state === "" || state.startsWith("Z")).toBe(true);
+			} finally {
+				try {
+					process.kill(sleeper, "SIGKILL");
+				} catch {}
+			}
+		});
+
+		it("abort also stops a hung hook-path probe", async () => {
+			const wt = await create();
+			const bin = path.join(root, "bin");
+			const ready = path.join(root, "probe-ready");
+			expect(Bun.spawnSync(["mkfifo", ready]).exitCode).toBe(0);
+			// A git wrapper that hangs on `rev-parse`; its child keeps stdout open after the wrapper is killed.
+			await Bun.write(
+				path.join(bin, "git"),
+				`#!/bin/sh\nif [ "$1" = rev-parse ]; then\n  sleep 30 &\n  echo $! > "${ready}"\n  wait\nfi\nexec "${Bun.which("git")}" "$@"\n`,
+			);
+			await fs.chmod(path.join(bin, "git"), 0o755);
+			const controller = new AbortController();
+			const env = { ...filterChildShellEnv(process.env), PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+			const pending = vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { signal: controller.signal, env });
+			const sleeper = Number((await fs.readFile(ready, "utf8")).trim());
+			try {
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 			} finally {
 				try {
 					process.kill(sleeper, "SIGKILL");

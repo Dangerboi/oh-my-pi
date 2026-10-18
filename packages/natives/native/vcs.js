@@ -173,8 +173,9 @@ async function sweepStaleHookCaptures() {
 /**
  * The worktree's `post-checkout` hook path when it exists but git would skip it as not
  * executable (git's `access(X_OK)` check), else undefined. Git for Windows ignores the bit.
+ * Aborting `signal` kills the probe and rejects with the reason.
  */
-async function nonExecutableHookPath(worktreeRoot, env) {
+async function nonExecutableHookPath(worktreeRoot, env, signal) {
 	if (process.platform === "win32") return undefined;
 	const git = Bun.spawn(["git", "rev-parse", "--git-path", "hooks/post-checkout"], {
 		cwd: worktreeRoot,
@@ -182,8 +183,26 @@ async function nonExecutableHookPath(worktreeRoot, env) {
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "ignore",
+		signal,
+		killSignal: "SIGKILL",
 	});
-	const [resolved, exitCode] = await Promise.all([new Response(git.stdout).text(), git.exited]);
+	const probe = Promise.all([new Response(git.stdout).text(), git.exited]);
+	let resolved;
+	let exitCode;
+	if (signal) {
+		// Race so a wrapper's child still holding stdout cannot keep the caller waiting after an abort.
+		const aborted = Promise.withResolvers();
+		const onAbort = () => aborted.reject(signal.reason);
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			signal.throwIfAborted();
+			[resolved, exitCode] = await Promise.race([probe, aborted.promise]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+	} else {
+		[resolved, exitCode] = await probe;
+	}
 	if (exitCode !== 0) return undefined;
 	// `--git-path` honours `core.hooksPath`; a relative result is relative to the worktree, as for `git hook run`.
 	const hookPath = path.resolve(worktreeRoot, resolved.trim());
@@ -209,7 +228,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	const nullOid = "0".repeat(head.length);
 	const posix = process.platform !== "win32";
 	if (!posix) void sweepStaleHookCaptures();
-	const skippedHookPath = await nonExecutableHookPath(worktreeRoot, env);
+	const skippedHookPath = await nonExecutableHookPath(worktreeRoot, env, signal);
 	// Files, not pipes: a background process the hook starts inherits them, and pipes would stay open until it exits.
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
 	const outPath = path.join(dir, "stdout");
