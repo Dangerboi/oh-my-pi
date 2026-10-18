@@ -238,11 +238,11 @@ const GIT_CANNOT_START = new Set(["ENOENT", "ENOEXEC", "EACCES"]);
  * fails, "old-git" when it predates `git hook run`, else undefined. Output goes to a file in
  * `captureDir`, so a wrapper's lingering child cannot hold the result back.
  */
-async function hookRunnerProblem(captureDir, cwd, env, signal) {
+async function hookRunnerProblem(captureDir, cwd, { env, signal, detached }) {
 	const outPath = path.join(captureDir, "version");
 	let exitCode;
 	try {
-		exitCode = await runGitToFiles(["version"], { cwd, env, stdout: Bun.file(outPath), stderr: "ignore", signal });
+		exitCode = await runGitToFiles(["version"], { cwd, env, stdout: Bun.file(outPath), stderr: "ignore", signal, detached });
 	} catch (error) {
 		if (GIT_CANNOT_START.has(error?.code)) return "no-git";
 		throw error;
@@ -266,20 +266,20 @@ const readProbeOutput = file => Bun.file(file).slice(0, PROBE_OUTPUT_BYTES).text
  * environment overrides). Without a git that starts and answers, the in-process lookup (`find_hook`
  * rules) stands, so a hook it finds is reported as not run rather than treated as missing.
  */
-async function postCheckoutHookPath(captureDir, worktreeRoot, env, signal) {
+async function postCheckoutHookPath(captureDir, worktreeRoot, { env, signal, detached }) {
 	const inProcess = () => git(worktreeRoot)?.hookLocation("post-checkout", signal);
 	const outPath = path.join(captureDir, "git-path");
 	try {
 		const args = ["rev-parse", "--git-path", "hooks/post-checkout"];
-		const exitCode = await runGitToFiles(args, { cwd: worktreeRoot, env, stdout: Bun.file(outPath), stderr: "ignore", signal });
+		const exitCode = await runGitToFiles(args, { cwd: worktreeRoot, env, stdout: Bun.file(outPath), stderr: "ignore", signal, detached });
 		if (exitCode !== 0) return inProcess();
 	} catch (error) {
 		if (GIT_CANNOT_START.has(error?.code)) return inProcess();
 		throw error;
 	}
 	const reported = (await readProbeOutput(outPath)).trim();
-	// Nothing usable (empty, or an MSYS/Cygwin `/c/…` path on Windows): fall back rather than call the hook missing.
-	if (!reported || (process.platform === "win32" && reported.startsWith("/"))) return inProcess();
+	// Nothing usable (empty, or an MSYS/Cygwin `/c/…` path on Windows; `//server/share` UNC paths are fine): fall back rather than call the hook missing.
+	if (!reported || (process.platform === "win32" && reported.startsWith("/") && !reported.startsWith("//"))) return inProcess();
 	// A relative result is relative to the worktree, where `git hook run` runs.
 	return path.resolve(worktreeRoot, reported);
 }
@@ -301,9 +301,19 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	const posix = process.platform !== "win32";
 	if (!posix) void sweepStaleHookCaptures();
 	// Files, not pipes: a background process git or the hook starts inherits them, and pipes would stay open until it exits.
-	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
+	const removeCapture = dir => fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+	const making = fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
+	let dir;
 	try {
-		const foundAt = await postCheckoutHookPath(dir, worktreeRoot, env, signal);
+		dir = await untilAborted(making, signal);
+	} catch (error) {
+		// Aborted while a stalled TMPDIR was still creating it: remove it once it exists.
+		making.then(removeCapture, () => {});
+		throw error;
+	}
+	const probe = { env, signal, detached };
+	try {
+		const foundAt = await postCheckoutHookPath(dir, worktreeRoot, probe);
 		if (!foundAt) return notRun;
 		// Only a missing path means no hook; any other failure (EACCES, EIO) is reported, not mistaken for one.
 		const missing = error => error?.code === "ENOENT" || error?.code === "ENOTDIR";
@@ -320,7 +330,8 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 			if (exeStat !== null) [hookPath, stat] = [`${foundAt}.exe`, exeStat];
 		}
 		if (stat instanceof Error) return { ...notRun, skipped: { path: hookPath, reason: "inaccessible" } };
-		if (!stat?.isFile()) return notRun;
+		// Anything else there, even a directory, isn't missing: git tries to run it and reports the failure.
+		if (stat === null) return notRun;
 		// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
 		if (posix) {
 			const access = fs.promises.access(hookPath, fs.constants.X_OK).then(
@@ -331,7 +342,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 				return { ...notRun, skipped: { path: hookPath, reason: "not-executable" } };
 			}
 		}
-		const reason = await hookRunnerProblem(dir, worktreeRoot, env, signal);
+		const reason = await hookRunnerProblem(dir, worktreeRoot, probe);
 		if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
 		const outPath = path.join(dir, "stdout");
 		const errPath = path.join(dir, "stderr");
@@ -348,8 +359,8 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		const [stdout, stderr] = await Promise.all([tail(Bun.file(outPath)), tail(Bun.file(errPath))]);
 		return { exitCode, stdout, stderr };
 	} finally {
-		// A lingering child may still hold the files open on Windows; leave them for the OS then.
-		await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+		// Not awaited: a stalled TMPDIR must not hold up the result or an abort. A lingering child may still hold the files open on Windows; leave them for the OS then.
+		void removeCapture(dir);
 	}
 }
 

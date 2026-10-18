@@ -299,11 +299,11 @@ describe("session worktree helpers (real git)", () => {
 			await Bun.write(path.join(hooks, "post-checkout"), `#!/bin/sh\n${script}\n`);
 			await fs.chmod(path.join(hooks, "post-checkout"), 0o755);
 		};
-		// Settles a deliberately stalled stat even when its test times out, so nothing stays pending.
-		let releaseStalledStat: (() => void) | undefined;
+		// Settles a deliberately stalled filesystem call even when its test times out, so nothing stays pending.
+		let releaseStalled: (() => void) | undefined;
 		afterEach(() => {
-			releaseStalledStat?.();
-			releaseStalledStat = undefined;
+			releaseStalled?.();
+			releaseStalled = undefined;
 		});
 
 		it("runs in the new worktree with git's new-worktree arguments", async () => {
@@ -349,6 +349,16 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
 			expect(wt.hook?.error).toBeUndefined();
 			expect(wt.hook?.skipped).toContain("is not executable");
+		});
+
+		it("reports a directory at the hook path as a failing hook, as git does, not as no hook", async () => {
+			const hooks = path.join(repo, ".git", "hooks");
+			git(repo, "config", "core.hooksPath", hooks);
+			await fs.mkdir(path.join(hooks, "post-checkout"), { recursive: true, mode: 0o755 });
+			const wt = await create();
+
+			expect(worktreePaths(repo)).toContain(wt.path);
+			expect(wt.hook?.error).toStartWith("post-checkout hook exited with ");
 		});
 
 		const gitlessRows: [name: string, hookPresent: boolean, fakeGit: string | null, reason?: "no-git" | "old-git"][] =
@@ -511,6 +521,30 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(hookGroup).not.toBe(ownGroup);
 		});
 
+		it("keeps the git probes before the hook away from the agent's terminal too", async () => {
+			const wt = await create();
+			await hook("touch .post-checkout-ran");
+			const bin = path.join(root, "probe-bin");
+			const groups = path.join(root, "probe-groups");
+			await Bun.write(
+				path.join(bin, "git"),
+				`#!/bin/sh\ncase "$1" in rev-parse|version) echo "$1 $(ps -o pgid= -p $$)" >> "${groups}";; esac\nexec "${Bun.which("git")}" "$@"\n`,
+			);
+			await fs.chmod(path.join(bin, "git"), 0o755);
+			const env = { ...filterChildShellEnv(process.env), PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+			await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env, detached: true });
+			const ownGroup = Bun.spawnSync(["ps", "-o", "pgid=", "-p", String(process.pid)])
+				.stdout.toString()
+				.trim();
+			const probes = (await Bun.file(groups).text())
+				.trim()
+				.split("\n")
+				.map(line => line.split(/\s+/));
+
+			expect(probes.map(([probe]) => probe)).toEqual(["rev-parse", "version"]);
+			for (const [, group] of probes) expect(group).not.toBe(ownGroup);
+		});
+
 		it("returns when a git wrapper's background child keeps the version output open", async () => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");
@@ -545,7 +579,7 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 				if (path.resolve(String(file)) !== hookFile) return realStat(file, ...rest);
 				reached.resolve();
 				const stalled = Promise.withResolvers<nodeFs.Stats>();
-				releaseStalledStat = () => stalled.reject(Object.assign(new Error("released"), { code: "ENOENT" }));
+				releaseStalled = () => stalled.reject(Object.assign(new Error("released"), { code: "ENOENT" }));
 				return stalled.promise;
 			}) as typeof realStat);
 			const controller = new AbortController();
@@ -555,6 +589,30 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			} finally {
 				// Restored before the outcome is awaited, so a regression can't leak the stalled stat into other tests.
 				stat.mockRestore();
+			}
+			controller.abort();
+			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+		});
+
+		it("abort is not held up by a stalled capture directory", async () => {
+			const wt = await create();
+			await hook("touch .post-checkout-ran");
+			const reached = Promise.withResolvers<void>();
+			const realMkdtemp = nodeFs.promises.mkdtemp;
+			// A temp directory that never appears, as on a stalled network-mounted TMPDIR.
+			const mkdtemp = spyOn(nodeFs.promises, "mkdtemp").mockImplementation(((prefix: string, ...rest: []) => {
+				if (!prefix.includes("omp-post-checkout-")) return realMkdtemp(prefix, ...rest);
+				reached.resolve();
+				const stalled = Promise.withResolvers<string>();
+				releaseStalled = () => stalled.reject(Object.assign(new Error("released"), { code: "ENOENT" }));
+				return stalled.promise;
+			}) as typeof realMkdtemp);
+			const controller = new AbortController();
+			const pending = vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { signal: controller.signal });
+			try {
+				await reached.promise;
+			} finally {
+				mkdtemp.mockRestore();
 			}
 			controller.abort();
 			await expect(pending).rejects.toMatchObject({ name: "AbortError" });

@@ -101,7 +101,7 @@ export interface SkippedPostCheckoutHook {
  * hook left a background process running. `skipped` is set when the hook exists but did not
  * run: not executable (POSIX only), no working git on PATH, a git older than 2.36, or a hook
  * file that can't be checked. `env` replaces the inherited environment; pass one without
- * ambient `GIT_DIR`-family variables. `detached` (POSIX) runs the hook in its own session,
+ * ambient `GIT_DIR`-family variables. `detached` (POSIX) runs the hook, and the git calls that locate it, in their own session,
  * without the caller's controlling terminal, so a prompt on /dev/tty fails instead of writing
  * into a TUI. Aborting `signal` kills the hook's process tree and rejects with the abort
  * reason, also while a filesystem check is stalled; a `signal` implies `detached`.
