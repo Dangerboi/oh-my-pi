@@ -747,7 +747,10 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			}
 			const failure = await relocateHeadlessSession(runtime, worktree.path);
 			if (failure) return failure;
-			const cleanup = await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings);
+			// A failed hook may have left the carried-over files half-rewritten; keep the source as the intact copy.
+			const cleanup = worktree.hookError
+				? { cleaned: false, errorMessage: undefined }
+				: await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings);
 			if (cleanup.errorMessage !== undefined) {
 				await runtime.output(
 					`Warning: Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`,

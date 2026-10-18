@@ -1264,6 +1264,56 @@ describe("wave 3 commands", () => {
 		}
 	});
 
+	it.skipIf(process.platform === "win32")(
+		"/wt: with worktree.cleanSource=true, keeps the source checkout when the post-checkout hook fails",
+		async () => {
+			const { output, runtime, fakeSessionManager } = createRuntime();
+			cfgWorktreeCleanSource.override(runtime.settings, true);
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-hookfail-"));
+			const repoDir = path.join(root, "repo");
+			const hooksDir = path.join(root, "hooks");
+			const originalProjectDir = process.cwd();
+			const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+			process.env.OMP_WORKTREE_DIR = path.join(root, "wt");
+			const git = async (...args: string[]) => {
+				const proc = Bun.spawn(["git", ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+				const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+				expect(code).toBe(0);
+				return stdout.trim();
+			};
+			try {
+				await fs.mkdir(repoDir, { recursive: true });
+				await git("init", "-q", "-b", "main");
+				await git("config", "user.email", "t@example.com");
+				await git("config", "user.name", "t");
+				await git("config", "core.hooksPath", hooksDir);
+				await Bun.write(path.join(repoDir, "tracked.txt"), "committed\n");
+				await git("add", "-A");
+				await git("commit", "-qm", "init");
+				// The hook clobbers the carried-over edit in the new worktree, then fails.
+				await Bun.write(path.join(hooksDir, "post-checkout"), "#!/bin/sh\necho clobbered > tracked.txt\nexit 1\n");
+				await fs.chmod(path.join(hooksDir, "post-checkout"), 0o755);
+				await Bun.write(path.join(repoDir, "tracked.txt"), "edited\n");
+				await Bun.write(path.join(repoDir, "untracked.txt"), "new\n");
+				fakeSessionManager._cwd = repoDir;
+
+				const result = await executeAcpBuiltinSlashCommand("/wt feature/hook-fails", runtime);
+
+				expect(result).toEqual({ consumed: true });
+				expect(output.join("\n")).toContain("post-checkout hook exited with 1");
+				expect(await Bun.file(path.join(fakeSessionManager._movedTo!, "tracked.txt")).text()).toBe("clobbered\n");
+				// The source still holds the user's uncommitted work.
+				expect(await Bun.file(path.join(repoDir, "tracked.txt")).text()).toBe("edited\n");
+				expect(await Bun.file(path.join(repoDir, "untracked.txt")).text()).toBe("new\n");
+			} finally {
+				setProjectDir(originalProjectDir);
+				if (originalWorktreeDir === undefined) delete process.env.OMP_WORKTREE_DIR;
+				else process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("/wt: aborts and leaves source checkout untouched when settings flush fails", async () => {
 		const { output, runtime, fakeSessionManager } = createRuntime();
 		spyOn(runtime.settings, "flush").mockRejectedValue(new Error("disk full"));

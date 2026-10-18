@@ -160,6 +160,34 @@ describe("CommandController /move", () => {
 		}
 	});
 
+	it("keeps the source checkout when the worktree's post-checkout hook failed", async () => {
+		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-hookfail-"));
+		try {
+			const { ctx, state } = createMoveContext(sourceDir);
+			const target = path.join(sourceDir, "checkout");
+			const hookError = "post-checkout hook exited with 1: setup failed";
+			vi.spyOn(sessionWorktree, "createSessionWorktree").mockImplementation(async () => {
+				await fs.mkdir(target);
+				return {
+					path: target,
+					branch: "feature",
+					sourceCwd: sourceDir,
+					baseCommit: "0",
+					keptChanges: true,
+					hookError,
+				};
+			});
+			const cleanup = vi.spyOn(sessionWorktree, "cleanSourceCheckoutIfConfigured");
+			await new CommandController(ctx).handleWorktreeCommand("feature");
+
+			expect(state.cwd).toBe(target);
+			expect(cleanup).not.toHaveBeenCalled();
+			expect(ctx.showWarning).toHaveBeenCalledWith(expect.stringContaining(hookError));
+		} finally {
+			await fs.rm(sourceDir, { recursive: true, force: true });
+		}
+	});
+
 	it("releases the gate without relocating when worktree creation fails", async () => {
 		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-failure-"));
 		try {

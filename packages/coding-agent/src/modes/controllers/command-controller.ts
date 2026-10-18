@@ -1740,9 +1740,11 @@ export class CommandController {
 			}
 			if (!(await this.#relocateSession(worktree.path))) return false;
 			created = worktree;
-			const cleanup = worktree.keptChanges
-				? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
-				: { cleaned: false, errorMessage: undefined };
+			// A failed hook may have left the carried-over files half-rewritten; keep the source as the intact copy.
+			const cleanup =
+				worktree.keptChanges && !worktree.hookError
+					? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
+					: { cleaned: false, errorMessage: undefined };
 			if (cleanup.errorMessage !== undefined) {
 				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
 			}
