@@ -15,7 +15,12 @@ import {
 	Snowflake,
 	sanitizeText,
 } from "@oh-my-pi/pi-utils";
-import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
+import {
+	replaceTabs,
+	shortenEmbeddedPaths,
+	TRUNCATE_LENGTHS,
+	truncateToWidth,
+} from "@oh-my-pi/pi-tui/render/render-utils";
 import type { SettingValueOf } from "../config/registry";
 
 import { withRepoLock } from "../utils/repo-lock";
@@ -591,7 +596,7 @@ export function formatIsolationBackend(backend: IsoBackendKind): Exclude<Isolati
 /**
  * Run a new linked worktree's `post-checkout` hook, as `git worktree add` does, without the
  * agent's own `GIT_DIR`-family variables. Returns undefined on success, else the exit status and
- * the hook's last output line, sanitized and truncated for display. Aborting `signal` stops the
+ * the hook's last output line, sanitized, home-shortened and truncated for display. Aborting `signal` stops the
  * hook and rejects.
  */
 export async function runWorktreeCheckoutHook(
@@ -604,9 +609,10 @@ export async function runWorktreeCheckoutHook(
 	if (hook.exitCode === 0) return undefined;
 	const decoder = new TextDecoder();
 	const output = sanitizeText(`${decoder.decode(hook.stdout)}\n${decoder.decode(hook.stderr)}`).trim();
-	const lastLine = truncateToWidth(replaceTabs(output.split("\n").at(-1)?.trim() ?? ""), TRUNCATE_LENGTHS.LINE);
-	return lastLine
-		? `post-checkout hook exited with ${hook.exitCode}: ${lastLine}`
+	const lastLine = output.split("\n").at(-1)?.trim() ?? "";
+	const shown = truncateToWidth(replaceTabs(shortenEmbeddedPaths(lastLine)), TRUNCATE_LENGTHS.LINE);
+	return shown
+		? `post-checkout hook exited with ${hook.exitCode}: ${shown}`
 		: `post-checkout hook exited with ${hook.exitCode}`;
 }
 

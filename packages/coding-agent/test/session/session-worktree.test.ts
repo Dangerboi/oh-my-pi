@@ -325,12 +325,12 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			);
 		});
 
-		it("keeps the worktree and reports a failing hook without terminal escapes", async () => {
-			await hook("printf '\\033[31msetup-failed\\033[0m\\n' >&2; exit 17");
+		it("keeps the worktree and reports a failing hook without terminal escapes or the home path", async () => {
+			await hook(`printf '\\033[31msetup failed in %s/proj\\033[0m\\n' "${os.homedir()}" >&2; exit 17`);
 			const wt = await create();
 
 			expect(worktreePaths(repo)).toContain(wt.path);
-			expect(wt.hookError).toBe("post-checkout hook exited with 17: setup-failed");
+			expect(wt.hookError).toBe("post-checkout hook exited with 17: setup failed in ~/proj");
 		});
 
 		it("returns when the hook exits even if it left a background process running", async () => {

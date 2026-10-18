@@ -151,6 +151,24 @@ export async function copyGitObjects(isolationRoot, sourceRoot) {
 
 /** Bytes kept from the end of each of the hook's output streams. */
 const HOOK_OUTPUT_TAIL_BYTES = 64 * 1024;
+const HOOK_CAPTURE_PREFIX = "omp-post-checkout-";
+/** Capture directories older than this are leftovers, never a run in progress. */
+const HOOK_CAPTURE_STALE_MS = 60 * 60 * 1000;
+
+/**
+ * On Windows a background process a hook left running keeps its capture files open, so their
+ * cleanup fails; delete such leftovers on later runs, once that process has exited.
+ */
+async function sweepStaleHookCaptures() {
+	const tmp = os.tmpdir();
+	const cutoff = Date.now() - HOOK_CAPTURE_STALE_MS;
+	for (const name of await fs.promises.readdir(tmp).catch(() => [])) {
+		if (!name.startsWith(HOOK_CAPTURE_PREFIX)) continue;
+		const dir = path.join(tmp, name);
+		const stat = await fs.promises.stat(dir).catch(() => null);
+		if (stat && stat.mtimeMs < cutoff) await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+	}
+}
 
 /**
  * Run Git's checkout hook in a newly created linked worktree, using the same
@@ -164,8 +182,9 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	signal?.throwIfAborted();
 	const nullOid = "0".repeat(head.length);
 	const posix = process.platform !== "win32";
+	if (!posix) void sweepStaleHookCaptures();
 	// Files, not pipes: a background process the hook starts inherits them, and pipes would stay open until it exits.
-	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-post-checkout-"));
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
 	const outPath = path.join(dir, "stdout");
 	const errPath = path.join(dir, "stderr");
 	try {
