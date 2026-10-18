@@ -24,7 +24,7 @@ import { filterChildShellEnv, getWorktreesDir, isEnoent } from "@oh-my-pi/pi-uti
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
 import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
-import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
+import { describeSkippedHook, formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 
 import { cfgIsolationBackend, cfgWorktreeClone } from "../task/settings";
 
@@ -164,6 +164,7 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	const hook = await vcs.runPostCheckoutHook(worktreePath, commit.sha, { env: filterChildShellEnv(process.env) });
 	process.stderr.write(hook.stdout);
 	process.stderr.write(hook.stderr);
+	if (hook.skipped) console.error(chalk.dim(`warning: ${describeSkippedHook(hook.skipped)}`));
 	if (hook.exitCode !== 0) process.exitCode = hook.exitCode;
 }
 

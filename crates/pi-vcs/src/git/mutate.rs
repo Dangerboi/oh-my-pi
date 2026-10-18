@@ -895,18 +895,24 @@ impl GitRepo {
 	}
 
 	/// Where git's `find_hook` looks for hook `name`, whether or not a file
-	/// exists there: under `core.hooksPath` (a relative value resolves against
-	/// the checkout root) or else the shared `hooks` directory, which linked
-	/// worktrees read from the common dir.
+	/// exists there: under `core.hooksPath` (path-valued, so `~/` and
+	/// `%(prefix)/` expand; a relative value resolves against the checkout
+	/// root) or else the shared `hooks` directory, which linked worktrees read
+	/// from the common dir.
 	pub fn hook_location(&self, name: &str) -> Result<PathBuf> {
-		let dir = self
-			.gix()?
-			.config_snapshot()
-			.string("core.hooksPath")
-			.map_or_else(
-				|| self.info().common_dir.join("hooks"),
-				|value| self.root().join(value.to_str_lossy().as_ref()),
-			);
+		let repo = self.gix()?;
+		let snapshot = repo.config_snapshot();
+		let dir = match snapshot.trusted_path("core.hooksPath") {
+			Some(Ok(value)) => self.root().join(value),
+			// Not expandable (e.g. `~unknown-user/`): use it literally rather
+			// than failing every caller.
+			Some(Err(_)) => self.root().join(
+				snapshot
+					.string("core.hooksPath")
+					.map_or_else(String::new, |value| value.to_str_lossy().into_owned()),
+			),
+			None => self.info().common_dir.join("hooks"),
+		};
 		Ok(dir.join(name))
 	}
 
@@ -2048,6 +2054,22 @@ mod tests {
 		git(temp.path(), &["commit", "-qm", "base"]);
 		let repo = GitRepo::require(temp.path()).unwrap();
 		(temp, repo)
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn hook_location_expands_a_home_relative_hooks_path_like_git() {
+		let (temp, _) = fixture();
+		git(temp.path(), &["config", "core.hooksPath", "~/omp-hook-location-test"]);
+		let repo = GitRepo::require(temp.path()).unwrap();
+		let expected = git(temp.path(), &[
+			"rev-parse",
+			"--path-format=absolute",
+			"--git-path",
+			"hooks/post-checkout",
+		]);
+
+		assert_eq!(repo.hook_location("post-checkout").unwrap(), PathBuf::from(expected));
 	}
 
 	#[test]

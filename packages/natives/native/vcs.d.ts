@@ -84,26 +84,29 @@ export declare function detachGitDir(
 /** Preserve isolation-local Git objects in the source without changing its refs or index. */
 export declare function copyGitObjects(isolationRoot: string, sourceRoot: string): Promise<void>;
 
+/** A `post-checkout` hook that exists but did not run, and why. */
+export interface SkippedPostCheckoutHook {
+	path: string;
+	/** `no-git`: no git starts, or `git version` fails. `old-git`: older than 2.36, without `git hook run`. */
+	reason: "not-executable" | "no-git" | "old-git";
+}
+
 /**
  * Run Git's checkout hook in a new linked worktree and return its exit status and the
- * last 64 KiB of each output stream. The hook is found in-process (`core.hooksPath` or the
- * shared hooks directory), so without one nothing is spawned and no git binary is needed.
- * Returns once `git hook run` exits, even if the hook left a background process running.
- * `skipped` is set when the hook exists but did not run: not executable (POSIX only), no
- * git on PATH, or a git older than 2.36, which lacks `git hook run`. `env` replaces the
+ * last 64 KiB of each output stream. The hook is found in-process (`core.hooksPath`, path
+ * expanded, or the shared hooks directory), so without one nothing is spawned and no git
+ * binary is needed. Returns once `git hook run` exits, even if the hook left a background
+ * process running. `skipped` is set when the hook exists but did not run: not executable
+ * (POSIX only), no working git on PATH, or a git older than 2.36. `env` replaces the
  * inherited environment; pass one without ambient `GIT_DIR`-family variables. Aborting
- * `signal` kills the hook's process tree and rejects with the abort reason.
+ * `signal` kills the hook's process tree and rejects with the abort reason, also while a
+ * filesystem check is stalled.
  */
 export declare function runPostCheckoutHook(
 	worktreeRoot: string,
 	head: string,
 	options?: { signal?: AbortSignal; env?: Record<string, string> },
-): Promise<{
-	exitCode: number;
-	stdout: Uint8Array;
-	stderr: Uint8Array;
-	skipped?: { path: string; reason: "not-executable" | "no-git" | "old-git" };
-}>;
+): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array; skipped?: SkippedPostCheckoutHook }>;
 
 /** Join patch fragments, preserving each part's trailing newline. */
 export declare function joinPatches(parts: string[]): string;

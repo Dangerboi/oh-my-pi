@@ -597,8 +597,21 @@ export function formatIsolationBackend(backend: IsoBackendKind): Exclude<Isolati
 export interface WorktreeCheckoutHookResult {
 	/** The hook ran and failed: exit status and its last output line. */
 	error?: string;
-	/** The hook exists but did not run: not executable, or no git that can run hooks. */
+	/** The hook exists but did not run: not executable, or no working git that can run hooks. */
 	skipped?: string;
+}
+
+const displayLine = (line: string) =>
+	truncateToWidth(replaceTabs(shortenEmbeddedPaths(line.trim())), TRUNCATE_LENGTHS.LINE);
+
+/** Warning line for a `post-checkout` hook that exists but did not run; sanitized and home-shortened. */
+export function describeSkippedHook(skipped: vcs.SkippedPostCheckoutHook): string {
+	const why = {
+		"not-executable": "is not executable, so git skipped it",
+		"no-git": "did not run: no working git found",
+		"old-git": "did not run: running hooks needs Git 2.36 or newer",
+	}[skipped.reason];
+	return `post-checkout hook ${displayLine(sanitizeText(skipped.path))} ${why}`;
 }
 
 /**
@@ -613,22 +626,12 @@ export async function runWorktreeCheckoutHook(
 ): Promise<WorktreeCheckoutHookResult> {
 	const env = filterChildShellEnv(process.env);
 	const hook = await vcs.runPostCheckoutHook(worktreeRoot, head, { signal, env });
-	const display = (line: string) =>
-		truncateToWidth(replaceTabs(shortenEmbeddedPaths(line.trim())), TRUNCATE_LENGTHS.LINE);
 	const result: WorktreeCheckoutHookResult = {};
-	if (hook.skipped) {
-		const shownPath = display(sanitizeText(hook.skipped.path));
-		const why = {
-			"not-executable": "is not executable, so git skipped it",
-			"no-git": "did not run: git is not installed",
-			"old-git": "did not run: running hooks needs Git 2.36 or newer",
-		}[hook.skipped.reason];
-		result.skipped = `post-checkout hook ${shownPath} ${why}`;
-	}
+	if (hook.skipped) result.skipped = describeSkippedHook(hook.skipped);
 	if (hook.exitCode !== 0) {
 		const decoder = new TextDecoder();
 		const output = sanitizeText(`${decoder.decode(hook.stdout)}\n${decoder.decode(hook.stderr)}`).trim();
-		const shown = display(output.split("\n").at(-1) ?? "");
+		const shown = displayLine(output.split("\n").at(-1) ?? "");
 		result.error = shown
 			? `post-checkout hook exited with ${hook.exitCode}: ${shown}`
 			: `post-checkout hook exited with ${hook.exitCode}`;

@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -298,6 +299,12 @@ describe("session worktree helpers (real git)", () => {
 			await Bun.write(path.join(hooks, "post-checkout"), `#!/bin/sh\n${script}\n`);
 			await fs.chmod(path.join(hooks, "post-checkout"), 0o755);
 		};
+		// Settles a deliberately stalled stat even when its test times out, so nothing stays pending.
+		let releaseStalledStat: (() => void) | undefined;
+		afterEach(() => {
+			releaseStalledStat?.();
+			releaseStalledStat = undefined;
+		});
 
 		it("runs in the new worktree with git's new-worktree arguments", async () => {
 			await hook('printf "%s\\n" "$PWD" "$1" "$2" "$3" > .post-checkout-ran');
@@ -356,6 +363,7 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 					`[ "$1" = version ] && echo "git version 2.34.1" && exit 0\necho "git: '$1' is not a git command" >&2\nexit 1`,
 					"old-git",
 				],
+				["reports, without failing, a hook when `git version` fails", true, "exit 1", "no-git"],
 			];
 		it.each(gitlessRows)("%s", async (_name, hookPresent, fakeGit, reason) => {
 			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
@@ -372,6 +380,55 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(result.exitCode).toBe(0);
 			expect(result.skipped?.reason).toBe(reason);
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
+		});
+
+		it("returns when a git wrapper's background child keeps the version output open", async () => {
+			const wt = await create();
+			await hook("touch .post-checkout-ran");
+			const bin = path.join(root, "bin");
+			const lingering = path.join(root, "lingering-pid");
+			await Bun.write(
+				path.join(bin, "git"),
+				`#!/bin/sh\nif [ "$1" = version ]; then\n  sleep 30 &\n  echo $! > "${lingering}"\nfi\nexec "${Bun.which("git")}" "$@"\n`,
+			);
+			await fs.chmod(path.join(bin, "git"), 0o755);
+			const env = { ...filterChildShellEnv(process.env), PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+			try {
+				const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
+
+				expect(result.exitCode).toBe(0);
+				expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
+			} finally {
+				try {
+					process.kill(Number((await fs.readFile(lingering, "utf8")).trim()), "SIGKILL");
+				} catch {}
+			}
+		});
+
+		it("abort is not held up by a stalled hook-file check", async () => {
+			const wt = await create();
+			await hook("touch .post-checkout-ran");
+			const hookFile = path.join(repo, ".git", "hooks", "post-checkout");
+			const reached = Promise.withResolvers<void>();
+			const realStat = nodeFs.promises.stat;
+			// A stat that never settles, as on a stalled network filesystem.
+			const stat = spyOn(nodeFs.promises, "stat").mockImplementation(((file: nodeFs.PathLike, ...rest: []) => {
+				if (path.resolve(String(file)) !== hookFile) return realStat(file, ...rest);
+				reached.resolve();
+				const stalled = Promise.withResolvers<nodeFs.Stats>();
+				releaseStalledStat = () => stalled.reject(Object.assign(new Error("released"), { code: "ENOENT" }));
+				return stalled.promise;
+			}) as typeof realStat);
+			const controller = new AbortController();
+			const pending = vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { signal: controller.signal });
+			try {
+				await reached.promise;
+			} finally {
+				// Restored before the outcome is awaited, so a regression can't leak the stalled stat into other tests.
+				stat.mockRestore();
+			}
+			controller.abort();
+			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 		});
 
 		it("returns when the hook exits even if it left a background process running", async () => {

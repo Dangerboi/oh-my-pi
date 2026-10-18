@@ -55,4 +55,15 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 		expect(result.exitCode).toBe(17);
 		expect(result.stderr.toString()).toContain("checkout-refused");
 	});
+
+	it("warns, without failing, when the hook exists but is not executable", async () => {
+		await hook("touch .post-checkout-ran");
+		await fs.chmod(path.join(hooks, "post-checkout"), 0o644);
+		const { worktree, result } = await add("skipped");
+
+		expect(result.exitCode).toBe(0);
+		expect(await Bun.file(path.join(worktree, ".post-checkout-ran")).exists()).toBe(false);
+		expect(result.stderr.toString()).toContain("post-checkout hook");
+		expect(result.stderr.toString()).toContain("is not executable");
+	});
 });

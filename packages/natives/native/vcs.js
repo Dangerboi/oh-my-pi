@@ -173,52 +173,44 @@ async function sweepStaleHookCaptures() {
 /** Oldest Git with `git hook run`. */
 const HOOK_RUN_MIN_GIT = [2, 36];
 
-/**
- * Stdout of a short git command, or null when no git is on `env`'s PATH. Aborting `signal`
- * kills it and rejects, even while a wrapper's child still holds stdout.
- */
-async function gitStdout(args, cwd, env, signal) {
-	let child;
-	try {
-		child = Bun.spawn(["git", ...args], {
-			cwd,
-			env,
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "ignore",
-			signal,
-			killSignal: "SIGKILL",
-		});
-	} catch (error) {
-		if (error?.code === "ENOENT") return null;
-		throw error;
-	}
-	const run = Promise.all([new Response(child.stdout).text(), child.exited]);
-	if (!signal) return (await run)[0];
+/** Settle with `promise`, or reject with the abort reason as soon as `signal` aborts. */
+async function untilAborted(promise, signal) {
+	if (!signal) return promise;
 	const aborted = Promise.withResolvers();
 	const onAbort = () => aborted.reject(signal.reason);
 	signal.addEventListener("abort", onAbort, { once: true });
 	try {
 		signal.throwIfAborted();
-		return (await Promise.race([run, aborted.promise]))[0];
+		return await Promise.race([promise, aborted.promise]);
 	} finally {
 		signal.removeEventListener("abort", onAbort);
 	}
 }
 
-/** Why a `post-checkout` hook that exists cannot run, or undefined when it can. */
-async function hookSkipReason(hookPath, worktreeRoot, env, signal) {
-	// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
-	if (process.platform !== "win32") {
-		const executable = await fs.promises.access(hookPath, fs.constants.X_OK).then(
-			() => true,
-			() => false,
-		);
-		if (!executable) return "not-executable";
+/**
+ * Whether the git on `env`'s PATH can run hooks: "no-git" when none starts or `git version`
+ * fails, "old-git" when it predates `git hook run`, else undefined. Output goes to a file in
+ * `captureDir`, so a wrapper's lingering child cannot hold the result back.
+ */
+async function hookRunnerProblem(captureDir, cwd, env, signal) {
+	const outPath = path.join(captureDir, "version");
+	let child;
+	try {
+		child = Bun.spawn(["git", "version"], {
+			cwd,
+			env,
+			stdin: "ignore",
+			stdout: Bun.file(outPath),
+			stderr: "ignore",
+			signal,
+			killSignal: "SIGKILL",
+		});
+	} catch (error) {
+		if (error?.code === "ENOENT") return "no-git";
+		throw error;
 	}
-	const version = await gitStdout(["version"], worktreeRoot, env, signal);
-	if (version === null) return "no-git";
-	const match = /^git version (\d+)\.(\d+)/.exec(version);
+	if ((await untilAborted(child.exited, signal)) !== 0) return "no-git";
+	const match = /^git version (\d+)\.(\d+)/.exec(await Bun.file(outPath).text());
 	// An unrecognised version string gets the benefit of the doubt.
 	if (!match) return undefined;
 	const [major, minor] = [Number(match[1]), Number(match[2])];
@@ -233,25 +225,36 @@ async function hookSkipReason(hookPath, worktreeRoot, env, signal) {
  * once `git hook run` exits, even if the hook left a background process running,
  * with the last 64 KiB of each output stream; `skipped` says why an existing hook
  * did not run. Aborting `options.signal` kills the hook's process tree and rejects
- * with the reason.
+ * with the reason, also while a filesystem check is stalled.
  */
 export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	const { signal, env } = options;
 	signal?.throwIfAborted();
 	const notRun = { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
 	const hookPath = await git(worktreeRoot)?.hookLocation("post-checkout", signal);
-	const stat = hookPath && (await fs.promises.stat(hookPath).catch(() => null));
+	if (!hookPath) return notRun;
+	const stat = await untilAborted(fs.promises.stat(hookPath).catch(() => null), signal);
 	if (!stat?.isFile()) return notRun;
-	const reason = await hookSkipReason(hookPath, worktreeRoot, env, signal);
-	if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
-	const nullOid = "0".repeat(head.length);
 	const posix = process.platform !== "win32";
+	// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
+	if (posix) {
+		const access = fs.promises.access(hookPath, fs.constants.X_OK).then(
+			() => true,
+			() => false,
+		);
+		if (!(await untilAborted(access, signal))) {
+			return { ...notRun, skipped: { path: hookPath, reason: "not-executable" } };
+		}
+	}
+	const nullOid = "0".repeat(head.length);
 	if (!posix) void sweepStaleHookCaptures();
 	// Files, not pipes: a background process the hook starts inherits them, and pipes would stay open until it exits.
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
 	const outPath = path.join(dir, "stdout");
 	const errPath = path.join(dir, "stderr");
 	try {
+		const reason = await hookRunnerProblem(dir, worktreeRoot, env, signal);
+		if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
 		// No await between this check and the abort listener below, so no abort can be missed.
 		signal?.throwIfAborted();
 		const child = Bun.spawn(["git", "hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
