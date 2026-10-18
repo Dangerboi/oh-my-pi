@@ -106,8 +106,9 @@ export interface SkippedPostCheckoutHook {
  * inherited environment; pass one without ambient `GIT_DIR`-family variables. `detached`
  * (POSIX) runs the hook, and the git calls that locate it, in their own session, without the
  * caller's controlling terminal, so a prompt on /dev/tty fails instead of writing into a TUI.
- * Aborting `signal` kills the hook's process tree (on Windows, commands MSYS `sh` started
- * through its fork stubs can survive) and rejects with the abort reason, also while a
+ * Aborting `signal` kills the hook's process tree, descendants that moved into their own
+ * session included (one that double-forks out to init escapes, and on Windows so do commands
+ * MSYS `sh` started through its fork stubs), and rejects with the abort reason, also while a
  * filesystem check or a read is stalled; a `signal` implies `detached`.
  */
 export declare function runPostCheckoutHook(

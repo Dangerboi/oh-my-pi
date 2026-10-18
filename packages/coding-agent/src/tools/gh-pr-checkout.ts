@@ -7,7 +7,12 @@ import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getWorktreeDir, hashPath, isEnoent, logger, slugify } from "@oh-my-pi/pi-utils";
 import { github } from "../utils/github";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
-import { addWorktreeWithHook, type WorktreeCheckoutHookResult, worktreeHookWarnings } from "../utils/worktree-hook";
+import {
+	addWorktreeWithHook,
+	resolveWorktreePath,
+	type WorktreeCheckoutHookResult,
+	worktreeHookWarnings,
+} from "../utils/worktree-hook";
 import { withRepoLock } from "../utils/repo-lock";
 import type { ToolSession } from ".";
 import type { GhPrCheckoutSummary, GhToolDetails } from "@oh-my-pi/pi-tui/tools/github";
@@ -495,6 +500,7 @@ export async function checkoutPullRequest(
 			);
 
 			let finalWorktreePath = existingWorktree?.path ?? worktreePath;
+			let resolvedWorktreePath: string | undefined;
 			let clonedWith: IsoBackendKind | undefined;
 			let hook: WorktreeCheckoutHookResult | undefined;
 			if (!existingWorktree) {
@@ -511,6 +517,7 @@ export async function checkoutPullRequest(
 					},
 					signal,
 				);
+				resolvedWorktreePath = setUp.path;
 				clonedWith = setUp.added.clonedWith ?? undefined;
 				if (setUp.added.cloneError) {
 					logger.warn("worktree clone fell back to plain checkout", {
@@ -520,7 +527,8 @@ export async function checkoutPullRequest(
 				}
 				hook = setUp.hook;
 			}
-			const resolvedWorktreePath = await fs.realpath(finalWorktreePath);
+			// A reused worktree has nothing to discard, but a stalled path lookup must not keep the repo lock after an abort.
+			resolvedWorktreePath ??= await resolveWorktreePath(finalWorktreePath, signal);
 
 			return {
 				data,

@@ -6,7 +6,7 @@
 import * as fs from "node:fs/promises";
 import type { VcsGitRepo, VcsWorktreeAddOptions, VcsWorktreeAddResult } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { filterChildShellEnv, logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, logger, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import { sanitizeDisplayWarning, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 
 /** Display lines for a new worktree's `post-checkout` hook; both unset when it ran cleanly or there is none. */
@@ -71,17 +71,29 @@ export async function runWorktreeCheckoutHook(
 	return result;
 }
 
-/** A worktree {@link addWorktreeWithHook} created, and its hook's outcome. */
+/** A worktree {@link addWorktreeWithHook} created, its resolved path, and its hook's outcome. */
 export interface WorktreeSetup {
 	added: VcsWorktreeAddResult;
+	/** `worktreePath` with symlinks resolved. */
+	path: string;
 	hook: WorktreeCheckoutHookResult;
 }
 
 /**
+ * `worktreePath` with symlinks resolved, raced against `signal`, so a stalled filesystem (e.g. a
+ * `worktree.base` on a network mount) cannot outlast an abort.
+ */
+export function resolveWorktreePath(worktreePath: string, signal?: AbortSignal): Promise<string> {
+	// A function, not a started lookup: on an already-aborted signal it never runs, so its failure can't go unhandled.
+	return untilAborted(signal, () => fs.realpath(worktreePath));
+}
+
+/**
  * Add a linked worktree of `branch` at the unused `worktreePath`, then run its `post-checkout`
- * hook. If the hook stage fails or `signal` aborts, the worktree is discarded and `branch` put
- * back where the checkout left it, so a retry starts over instead of reusing a half-set-up
- * checkout or finding the branch diverged. A failed `worktreeAdd` discards nothing: another
+ * hook. If the hook stage fails or `signal` aborts, up to resolving the worktree's path, the
+ * worktree is discarded and `branch` put back where the checkout left it, so a retry starts over
+ * instead of reusing a half-set-up checkout or finding the branch diverged. The discard itself
+ * takes no signal and runs to completion. A failed `worktreeAdd` discards nothing: another
  * process may own the path by then.
  */
 export async function addWorktreeWithHook(
@@ -100,9 +112,10 @@ export async function addWorktreeWithHook(
 		signal?.throwIfAborted();
 		head = await repository.resolveRef(`refs/heads/${branch}`, signal);
 		const hook = head ? await runWorktreeCheckoutHook(worktreePath, head, signal) : {};
-		// An abort that lands as the hook finishes still cancels: the caller must not move into the worktree.
-		signal?.throwIfAborted();
-		return { added, hook };
+		// The abort may also have landed as the hook finished: either way, or with a stalled `worktree.base`,
+		// the caller must not move into the worktree, so it is discarded below.
+		const resolved = await resolveWorktreePath(worktreePath, signal);
+		return { added, path: resolved, hook };
 	} catch (error) {
 		await discardNewWorktree(repository, worktreePath);
 		if (head) await restoreBranch(repository, branch, head);

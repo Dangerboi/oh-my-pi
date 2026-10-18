@@ -198,7 +198,7 @@ export async function createSessionWorktree(
 		throw error;
 	}
 	return {
-		path: await fs.realpath(worktreePath),
+		path: setUp.path,
 		branch,
 		clonedWith: setUp.added.clonedWith ?? undefined,
 		cloneError: setUp.added.cloneError ?? undefined,

@@ -466,23 +466,57 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(await exists(path.join(retried.path, ".post-checkout-ran"))).toBe(true);
 		});
 
-		it("an abort landing just as the hook finishes still cancels /wt and leaves nothing behind", async () => {
+		it.each([
+			["", "touch .post-checkout-ran"],
+			// Its path lookup then fails too; started after the abort, that failure would go unhandled.
+			[", also when the hook removed the worktree", 'rm -rf "$PWD"'],
+		])(
+			"an abort landing just as the hook finishes still cancels /wt and leaves nothing behind%s",
+			async (_name, script) => {
+				await hook(script);
+				const controller = new AbortController();
+				const runHook = vcs.runPostCheckoutHook;
+				// The hook completes, then the user's Esc arrives before /wt hands the worktree over.
+				const run = spyOn(vcs, "runPostCheckoutHook").mockImplementation(async (...args) => {
+					const result = await runHook(...args);
+					controller.abort();
+					return result;
+				});
+				try {
+					await expect(
+						createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal }),
+					).rejects.toMatchObject({ name: "AbortError" });
+				} finally {
+					run.mockRestore();
+				}
+
+				expect(worktreePaths(repo)).toEqual([repo]);
+				expect(branchSha(repo, branch)).toBeNull();
+			},
+		);
+
+		it("an abort while the new worktree's path is still being resolved cancels /wt and leaves nothing behind", async () => {
 			await hook("touch .post-checkout-ran");
+			const worktrees = path.join(root, "wt");
+			const reached = Promise.withResolvers<void>();
+			const realRealpath = fs.realpath;
+			// A lookup that never settles, as with `worktree.base` on a stalled network filesystem.
+			const realpath = spyOn(fs, "realpath").mockImplementation(((file: nodeFs.PathLike, ...rest: []) => {
+				if (!String(file).startsWith(`${worktrees}${path.sep}`)) return realRealpath(file, ...rest);
+				reached.resolve();
+				const stalled = Promise.withResolvers<string>();
+				releaseStalled = () => stalled.reject(Object.assign(new Error("released"), { code: "ENOENT" }));
+				return stalled.promise;
+			}) as typeof realRealpath);
 			const controller = new AbortController();
-			const runHook = vcs.runPostCheckoutHook;
-			// The hook completes, then the user's Esc arrives before /wt hands the worktree over.
-			const run = spyOn(vcs, "runPostCheckoutHook").mockImplementation(async (...args) => {
-				const result = await runHook(...args);
-				controller.abort();
-				return result;
-			});
+			const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
 			try {
-				await expect(
-					createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal }),
-				).rejects.toMatchObject({ name: "AbortError" });
+				await reached.promise;
 			} finally {
-				run.mockRestore();
+				realpath.mockRestore();
 			}
+			controller.abort();
+			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 
 			expect(worktreePaths(repo)).toEqual([repo]);
 			expect(branchSha(repo, branch)).toBeNull();
@@ -720,6 +754,30 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(Bun.spawnSync(["mkfifo", ready]).exitCode).toBe(0);
 			// `wait` keeps the hook running until aborted; only a process-group kill also stops the sleep.
 			await hook(`sleep 30 &\necho $! > "${ready}"\nwait`);
+			const controller = new AbortController();
+			const pending = runWorktreeCheckoutHook(wt.path, wt.baseCommit, controller.signal);
+			const sleeper = Number((await fs.readFile(ready, "utf8")).trim());
+			try {
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+				const state = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(sleeper)])
+					.stdout.toString()
+					.trim();
+				expect(state === "" || state.startsWith("Z")).toBe(true);
+			} finally {
+				try {
+					process.kill(sleeper, "SIGKILL");
+				} catch {}
+			}
+		});
+
+		it.skipIf(!Bun.which("setsid"))("abort also kills a child the hook moved into its own session", async () => {
+			const wt = await create();
+			const ready = path.join(root, "hook-ready");
+			expect(Bun.spawnSync(["mkfifo", ready]).exitCode).toBe(0);
+			// `setsid` takes the sleep out of the hook's process group, so a group kill alone misses it. The pid is
+			// written from inside the new session, so the abort cannot land before the child has left the group.
+			await hook(`setsid sh -c 'echo $$ > "${ready}"; exec sleep 30' &\nwait`);
 			const controller = new AbortController();
 			const pending = runWorktreeCheckoutHook(wt.path, wt.baseCommit, controller.signal);
 			const sleeper = Number((await fs.readFile(ready, "utf8")).trim());

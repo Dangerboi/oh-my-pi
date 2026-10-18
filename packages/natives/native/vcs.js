@@ -189,7 +189,7 @@ async function untilAborted(promise, signal) {
 
 /**
  * Run `git <args>` with output to files and resolve with its exit code. Aborting `signal`
- * kills the whole process tree, so nothing a wrapper or hook started outlives the abort,
+ * kills its process tree, descendants that left its process group included (see the shortcut below),
  * and rejects with the reason. Throws `ENOENT` when no git is on `env`'s PATH. `detached`
  * runs it in its own session even without a signal (POSIX), away from the caller's terminal.
  */
@@ -207,13 +207,23 @@ async function runGitToFiles(args, { cwd, env, stdout, stderr, signal, detached 
 		// terminal a prompt on /dev/tty fails instead of writing into the caller's TUI.
 		detached: posix && (detached || signal !== undefined),
 	});
-	// Windows has no process groups; pin the root now so killTree still finds its descendants on abort.
-	// shortcut: killTree misses descendants of MSYS `sh` fork stubs (taskkill /T does too); a Job Object would catch them.
-	const root = signal && !posix ? api().Process.fromPid(child.pid) : null;
+	// Pin the root now: killTree walks its descendants by parent, so it also reaches one that left the
+	// process group (setsid), and on Windows, which has no process groups, finds them at all.
+	// shortcut: a descendant that double-forks out to init escapes, as do commands MSYS `sh` starts through fork
+	// stubs on Windows (taskkill /T misses them too), upgrade to ptree's Linux subreaper / a Job Object if hooks
+	// that daemonize must be stopped.
+	const root = signal ? api().Process.fromPid(child.pid) : null;
 	const onAbort = () => {
+		// killTree snapshots the descendants, then signals the root's process group, the descendants and the root;
+		// the group kill after it covers a root that had exited before it could be pinned.
+		try {
+			if (posix) root?.killTree(9);
+			else root?.killTree();
+		} catch {
+			// Already exited.
+		}
 		try {
 			if (posix) process.kill(-child.pid, "SIGKILL");
-			else root?.killTree();
 		} catch {
 			// Already exited.
 		}
