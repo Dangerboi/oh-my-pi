@@ -29,8 +29,10 @@ export interface SessionWorktree {
 	clonedWith?: IsoBackendKind;
 	/** Why the clone fell back to a plain checkout, when it did. */
 	cloneError?: string;
-	/** Why the worktree's `post-checkout` hook failed or was skipped, when it was; the worktree is kept, as with `git worktree add`. */
+	/** Why the worktree's `post-checkout` hook failed, when it did; the worktree is kept, as with `git worktree add`. */
 	hookError?: string;
+	/** Set when git skipped the worktree's `post-checkout` hook as not executable; no hook code ran. */
+	hookSkipped?: string;
 	/** Checkout the worktree was forked from. */
 	sourceCwd: string;
 	/** Source `HEAD` the worktree branch was created at. */
@@ -155,13 +157,14 @@ export async function createSessionWorktree(
 		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
 		keepChanges,
 	});
-	const hookError = await runWorktreeCheckoutHook(worktreePath, baseCommit);
+	const hook = await runWorktreeCheckoutHook(worktreePath, baseCommit);
 	return {
 		path: await fs.realpath(worktreePath),
 		branch,
 		clonedWith: result.clonedWith ?? undefined,
 		cloneError: result.cloneError ?? undefined,
-		hookError,
+		hookError: hook.error,
+		hookSkipped: hook.skipped,
 		sourceCwd: cwd,
 		baseCommit,
 		keptChanges: keepChanges,

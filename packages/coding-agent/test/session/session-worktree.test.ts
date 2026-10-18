@@ -333,15 +333,25 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(wt.hookError).toBe("post-checkout hook exited with 17: setup failed in ~/proj");
 		});
 
-		it("reports a hook git skipped because it is not executable", async () => {
+		it("reports a hook git skipped because it is not executable, even with git's hint turned off", async () => {
 			await hook("touch .post-checkout-ran");
 			await fs.chmod(path.join(repo, ".git", "hooks", "post-checkout"), 0o644);
-			// Repo-local, so a developer's global `advice.ignoredHook false` can't silence git's hint.
-			git(repo, "config", "advice.ignoredHook", "true");
+			git(repo, "config", "advice.ignoredHook", "false");
 			const wt = await create();
 
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
-			expect(wt.hookError).toStartWith("post-checkout hook skipped: The '");
+			expect(wt.hookError).toBeUndefined();
+			expect(wt.hookSkipped).toBe(
+				`post-checkout hook ${path.join(repo, ".git", "hooks", "post-checkout")} is not executable, so git skipped it`,
+			);
+		});
+
+		it("does not mistake a successful hook's own hint output for a skipped hook", async () => {
+			await hook("echo 'hint: post-checkout setup complete' >&2");
+			const wt = await create();
+
+			expect(wt.hookError).toBeUndefined();
+			expect(wt.hookSkipped).toBeUndefined();
 		});
 
 		it("returns when the hook exits even if it left a background process running", async () => {

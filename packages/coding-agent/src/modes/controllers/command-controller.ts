@@ -1748,8 +1748,8 @@ export class CommandController {
 			if (cleanup.errorMessage !== undefined) {
 				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
 			}
-			if (worktree.hookError) {
-				this.ctx.showWarning(`Worktree created, but ${worktree.hookError}`);
+			for (const notice of [worktree.hookError, worktree.hookSkipped]) {
+				if (notice) this.ctx.showWarning(`Worktree created, but ${notice}`);
 			}
 			this.ctx.present([
 				new Spacer(1),
