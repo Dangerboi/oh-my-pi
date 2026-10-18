@@ -597,7 +597,7 @@ export function formatIsolationBackend(backend: IsoBackendKind): Exclude<Isolati
 export interface WorktreeCheckoutHookResult {
 	/** The hook ran and failed: exit status and its last output line. */
 	error?: string;
-	/** Git skipped the hook because it is not executable; no hook code ran. */
+	/** The hook exists but did not run: not executable, or no git that can run hooks. */
 	skipped?: string;
 }
 
@@ -616,8 +616,14 @@ export async function runWorktreeCheckoutHook(
 	const display = (line: string) =>
 		truncateToWidth(replaceTabs(shortenEmbeddedPaths(line.trim())), TRUNCATE_LENGTHS.LINE);
 	const result: WorktreeCheckoutHookResult = {};
-	if (hook.skippedHookPath) {
-		result.skipped = `post-checkout hook ${display(sanitizeText(hook.skippedHookPath))} is not executable, so git skipped it`;
+	if (hook.skipped) {
+		const shownPath = display(sanitizeText(hook.skipped.path));
+		const why = {
+			"not-executable": "is not executable, so git skipped it",
+			"no-git": "did not run: git is not installed",
+			"old-git": "did not run: running hooks needs Git 2.36 or newer",
+		}[hook.skipped.reason];
+		result.skipped = `post-checkout hook ${shownPath} ${why}`;
 	}
 	if (hook.exitCode !== 0) {
 		const decoder = new TextDecoder();

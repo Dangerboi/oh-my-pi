@@ -86,17 +86,24 @@ export declare function copyGitObjects(isolationRoot: string, sourceRoot: string
 
 /**
  * Run Git's checkout hook in a new linked worktree and return its exit status and the
- * last 64 KiB of each output stream. Returns once `git hook run` exits, even if the hook
- * left a background process running. `skippedHookPath` is the hook's path when it exists
- * but git skipped it as not executable (POSIX only). `env` replaces the inherited
- * environment; pass one without ambient `GIT_DIR`-family variables. Aborting `signal`
- * kills the hook's process tree and rejects with the abort reason.
+ * last 64 KiB of each output stream. The hook is found in-process (`core.hooksPath` or the
+ * shared hooks directory), so without one nothing is spawned and no git binary is needed.
+ * Returns once `git hook run` exits, even if the hook left a background process running.
+ * `skipped` is set when the hook exists but did not run: not executable (POSIX only), no
+ * git on PATH, or a git older than 2.36, which lacks `git hook run`. `env` replaces the
+ * inherited environment; pass one without ambient `GIT_DIR`-family variables. Aborting
+ * `signal` kills the hook's process tree and rejects with the abort reason.
  */
 export declare function runPostCheckoutHook(
 	worktreeRoot: string,
 	head: string,
 	options?: { signal?: AbortSignal; env?: Record<string, string> },
-): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array; skippedHookPath?: string }>;
+): Promise<{
+	exitCode: number;
+	stdout: Uint8Array;
+	stderr: Uint8Array;
+	skipped?: { path: string; reason: "not-executable" | "no-git" | "old-git" };
+}>;
 
 /** Join patch fragments, preserving each part's trailing newline. */
 export declare function joinPatches(parts: string[]): string;

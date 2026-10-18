@@ -170,65 +170,83 @@ async function sweepStaleHookCaptures() {
 	}
 }
 
+/** Oldest Git with `git hook run`. */
+const HOOK_RUN_MIN_GIT = [2, 36];
+
 /**
- * The worktree's `post-checkout` hook path when it exists but git would skip it as not
- * executable (git's `access(X_OK)` check), else undefined. Git for Windows ignores the bit.
- * Aborting `signal` kills the probe and rejects with the reason.
+ * Stdout of a short git command, or null when no git is on `env`'s PATH. Aborting `signal`
+ * kills it and rejects, even while a wrapper's child still holds stdout.
  */
-async function nonExecutableHookPath(worktreeRoot, env, signal) {
-	if (process.platform === "win32") return undefined;
-	const git = Bun.spawn(["git", "rev-parse", "--git-path", "hooks/post-checkout"], {
-		cwd: worktreeRoot,
-		env,
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "ignore",
-		signal,
-		killSignal: "SIGKILL",
-	});
-	const probe = Promise.all([new Response(git.stdout).text(), git.exited]);
-	let resolved;
-	let exitCode;
-	if (signal) {
-		// Race so a wrapper's child still holding stdout cannot keep the caller waiting after an abort.
-		const aborted = Promise.withResolvers();
-		const onAbort = () => aborted.reject(signal.reason);
-		signal.addEventListener("abort", onAbort, { once: true });
-		try {
-			signal.throwIfAborted();
-			[resolved, exitCode] = await Promise.race([probe, aborted.promise]);
-		} finally {
-			signal.removeEventListener("abort", onAbort);
-		}
-	} else {
-		[resolved, exitCode] = await probe;
+async function gitStdout(args, cwd, env, signal) {
+	let child;
+	try {
+		child = Bun.spawn(["git", ...args], {
+			cwd,
+			env,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "ignore",
+			signal,
+			killSignal: "SIGKILL",
+		});
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		throw error;
 	}
-	if (exitCode !== 0) return undefined;
-	// `--git-path` honours `core.hooksPath`; a relative result is relative to the worktree, as for `git hook run`.
-	const hookPath = path.resolve(worktreeRoot, resolved.trim());
-	const stat = await fs.promises.stat(hookPath).catch(() => null);
-	if (!stat?.isFile()) return undefined;
-	return fs.promises.access(hookPath, fs.constants.X_OK).then(
-		() => undefined,
-		() => hookPath,
-	);
+	const run = Promise.all([new Response(child.stdout).text(), child.exited]);
+	if (!signal) return (await run)[0];
+	const aborted = Promise.withResolvers();
+	const onAbort = () => aborted.reject(signal.reason);
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		signal.throwIfAborted();
+		return (await Promise.race([run, aborted.promise]))[0];
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
+
+/** Why a `post-checkout` hook that exists cannot run, or undefined when it can. */
+async function hookSkipReason(hookPath, worktreeRoot, env, signal) {
+	// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
+	if (process.platform !== "win32") {
+		const executable = await fs.promises.access(hookPath, fs.constants.X_OK).then(
+			() => true,
+			() => false,
+		);
+		if (!executable) return "not-executable";
+	}
+	const version = await gitStdout(["version"], worktreeRoot, env, signal);
+	if (version === null) return "no-git";
+	const match = /^git version (\d+)\.(\d+)/.exec(version);
+	// An unrecognised version string gets the benefit of the doubt.
+	if (!match) return undefined;
+	const [major, minor] = [Number(match[1]), Number(match[2])];
+	const [minMajor, minMinor] = HOOK_RUN_MIN_GIT;
+	return major < minMajor || (major === minMajor && minor < minMinor) ? "old-git" : undefined;
 }
 
 /**
  * Run Git's checkout hook in a newly created linked worktree, using the same
- * null old HEAD and branch-switch flag as `git worktree add`. Returns once
- * `git hook run` exits, even if the hook left a background process running,
- * with the last 64 KiB of each output stream, and the hook's path when git
- * skipped it as not executable. Aborting `options.signal` kills the hook's
- * process tree and rejects with the reason.
+ * null old HEAD and branch-switch flag as `git worktree add`. The hook is found
+ * in-process, as `find_hook` does, so without one nothing is spawned. Returns
+ * once `git hook run` exits, even if the hook left a background process running,
+ * with the last 64 KiB of each output stream; `skipped` says why an existing hook
+ * did not run. Aborting `options.signal` kills the hook's process tree and rejects
+ * with the reason.
  */
 export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	const { signal, env } = options;
 	signal?.throwIfAborted();
+	const notRun = { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+	const hookPath = await git(worktreeRoot)?.hookLocation("post-checkout", signal);
+	const stat = hookPath && (await fs.promises.stat(hookPath).catch(() => null));
+	if (!stat?.isFile()) return notRun;
+	const reason = await hookSkipReason(hookPath, worktreeRoot, env, signal);
+	if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
 	const nullOid = "0".repeat(head.length);
 	const posix = process.platform !== "win32";
 	if (!posix) void sweepStaleHookCaptures();
-	const skippedHookPath = await nonExecutableHookPath(worktreeRoot, env, signal);
 	// Files, not pipes: a background process the hook starts inherits them, and pipes would stay open until it exits.
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), HOOK_CAPTURE_PREFIX));
 	const outPath = path.join(dir, "stdout");
@@ -267,7 +285,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		signal?.throwIfAborted();
 		const tail = file => file.slice(Math.max(0, file.size - HOOK_OUTPUT_TAIL_BYTES)).bytes();
 		const [stdout, stderr] = await Promise.all([tail(Bun.file(outPath)), tail(Bun.file(errPath))]);
-		return { exitCode, stdout, stderr, skippedHookPath };
+		return { exitCode, stdout, stderr };
 	} finally {
 		// A lingering hook child may still hold the files open on Windows; leave them for the OS then.
 		await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});

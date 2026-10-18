@@ -894,11 +894,11 @@ impl GitRepo {
 			.map_err(|err| Error::backend("git worktree add", err))
 	}
 
-	/// Resolve the executable hook `name` as git's `find_hook` does: under
-	/// `core.hooksPath` (a relative value resolves against the checkout root)
-	/// or else the shared `hooks` directory, which linked worktrees read from
-	/// the common dir. `None` when the hook is missing or not executable.
-	pub fn hook_path(&self, name: &str) -> Result<Option<PathBuf>> {
+	/// Where git's `find_hook` looks for hook `name`, whether or not a file
+	/// exists there: under `core.hooksPath` (a relative value resolves against
+	/// the checkout root) or else the shared `hooks` directory, which linked
+	/// worktrees read from the common dir.
+	pub fn hook_location(&self, name: &str) -> Result<PathBuf> {
 		let dir = self
 			.gix()?
 			.config_snapshot()
@@ -907,7 +907,14 @@ impl GitRepo {
 				|| self.info().common_dir.join("hooks"),
 				|value| self.root().join(value.to_str_lossy().as_ref()),
 			);
-		let hook = dir.join(name);
+		Ok(dir.join(name))
+	}
+
+	/// Resolve the executable hook `name` as git's `find_hook` does (see
+	/// [`Self::hook_location`]). `None` when the hook is missing or not
+	/// executable.
+	pub fn hook_path(&self, name: &str) -> Result<Option<PathBuf>> {
+		let hook = self.hook_location(name)?;
 		Ok(hook_is_executable(&hook).then_some(hook))
 	}
 

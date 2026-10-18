@@ -1050,6 +1050,15 @@ impl VcsGitRepo {
 		})
 	}
 
+	/// Where Git looks for hook `name` (`core.hooksPath` or the shared hooks
+	/// directory), whether or not a file exists there.
+	#[napi]
+	pub fn hook_location(&self, name: String, signal: Option<Unknown>) -> Promise<String> {
+		blocking("vcs.hookLocation", self.inner.clone(), signal, move |r| {
+			r.hook_location(&name).map(path_string)
+		})
+	}
+
 	/// Render a patch.
 	#[napi]
 	pub fn diff_text(&self, options: VcsDiffOptions, signal: Option<Unknown>) -> Promise<String> {

@@ -31,7 +31,7 @@ export interface SessionWorktree {
 	cloneError?: string;
 	/** Why the worktree's `post-checkout` hook failed, when it did; the worktree is kept, as with `git worktree add`. */
 	hookError?: string;
-	/** Set when git skipped the worktree's `post-checkout` hook as not executable; no hook code ran. */
+	/** Set when the worktree's `post-checkout` hook exists but did not run (not executable, or no git that can run hooks). */
 	hookSkipped?: string;
 	/** Checkout the worktree was forked from. */
 	sourceCwd: string;

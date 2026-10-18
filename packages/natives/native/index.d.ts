@@ -682,6 +682,11 @@ export declare class VcsGitRepo {
   showCommit(rev: string, maxBytes?: number | undefined | null, signal?: unknown | undefined | null): Promise<VcsShowResult>
   /** Local LFS media directory. */
   lfsMediaDir(signal?: unknown | undefined | null): Promise<string | undefined | null>
+  /**
+   * Where Git looks for hook `name` (`core.hooksPath` or the shared hooks
+   * directory), whether or not a file exists there.
+   */
+  hookLocation(name: string, signal?: unknown | undefined | null): Promise<string>
   /** Render a patch. */
   diffText(options: VcsDiffOptions, signal?: unknown | undefined | null): Promise<string>
   /** Render a no-index patch between two filesystem paths. */

@@ -334,10 +334,9 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(wt.hookError).toBe("post-checkout hook exited with 17: setup failed in ~/proj");
 		});
 
-		it("reports a hook git skipped because it is not executable, even with git's hint turned off", async () => {
+		it("reports a non-executable hook without running it", async () => {
 			await hook("touch .post-checkout-ran");
 			await fs.chmod(path.join(repo, ".git", "hooks", "post-checkout"), 0o644);
-			git(repo, "config", "advice.ignoredHook", "false");
 			const wt = await create();
 
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
@@ -347,12 +346,32 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			);
 		});
 
-		it("does not mistake a successful hook's own hint output for a skipped hook", async () => {
-			await hook("echo 'hint: post-checkout setup complete' >&2");
+		const gitlessRows: [name: string, hookPresent: boolean, fakeGit: string | null, reason?: "no-git" | "old-git"][] =
+			[
+				["needs no git binary when there is no hook", false, null, undefined],
+				["reports, without failing, a hook it cannot run without git", true, null, "no-git"],
+				[
+					"reports, without failing, a hook a Git older than 2.36 cannot run",
+					true,
+					`[ "$1" = version ] && echo "git version 2.34.1" && exit 0\necho "git: '$1' is not a git command" >&2\nexit 1`,
+					"old-git",
+				],
+			];
+		it.each(gitlessRows)("%s", async (_name, hookPresent, fakeGit, reason) => {
+			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
 			const wt = await create();
+			if (hookPresent) await hook("touch .post-checkout-ran");
+			const bin = path.join(root, "bin");
+			await fs.mkdir(bin, { recursive: true });
+			if (fakeGit !== null) {
+				await Bun.write(path.join(bin, "git"), `#!/bin/sh\n${fakeGit}\n`);
+				await fs.chmod(path.join(bin, "git"), 0o755);
+			}
+			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env: { PATH: bin } });
 
-			expect(wt.hookError).toBeUndefined();
-			expect(wt.hookSkipped).toBeUndefined();
+			expect(result.exitCode).toBe(0);
+			expect(result.skipped?.reason).toBe(reason);
+			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
 		});
 
 		it("returns when the hook exits even if it left a background process running", async () => {
@@ -387,15 +406,16 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			}
 		});
 
-		it("abort also stops a hung hook-path probe", async () => {
+		it("abort also stops a hung git version check", async () => {
 			const wt = await create();
+			await hook("touch .post-checkout-ran");
 			const bin = path.join(root, "bin");
 			const ready = path.join(root, "probe-ready");
 			expect(Bun.spawnSync(["mkfifo", ready]).exitCode).toBe(0);
-			// A git wrapper that hangs on `rev-parse`; its child keeps stdout open after the wrapper is killed.
+			// A git wrapper that hangs on `version`; its child keeps stdout open after the wrapper is killed.
 			await Bun.write(
 				path.join(bin, "git"),
-				`#!/bin/sh\nif [ "$1" = rev-parse ]; then\n  sleep 30 &\n  echo $! > "${ready}"\n  wait\nfi\nexec "${Bun.which("git")}" "$@"\n`,
+				`#!/bin/sh\nif [ "$1" = version ]; then\n  sleep 30 &\n  echo $! > "${ready}"\n  wait\nfi\nexec "${Bun.which("git")}" "$@"\n`,
 			);
 			await fs.chmod(path.join(bin, "git"), 0o755);
 			const controller = new AbortController();

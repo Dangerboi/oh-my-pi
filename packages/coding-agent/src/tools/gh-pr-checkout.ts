@@ -405,7 +405,7 @@ export interface PrCheckoutOutcome {
 	clonedWith?: IsoBackendKind;
 	/** Why the new worktree's `post-checkout` hook failed, when it did. */
 	hookError?: string;
-	/** Set when git skipped the new worktree's `post-checkout` hook as not executable. */
+	/** Set when the new worktree's `post-checkout` hook exists but did not run (not executable, or no git that can run hooks). */
 	hookSkipped?: string;
 }
 
