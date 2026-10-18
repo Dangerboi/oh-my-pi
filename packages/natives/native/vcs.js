@@ -149,13 +149,18 @@ export async function copyGitObjects(isolationRoot, sourceRoot) {
 	}
 }
 
+/** Bytes kept from the end of each of the hook's output streams. */
+const HOOK_OUTPUT_TAIL_BYTES = 64 * 1024;
+
 /**
  * Run Git's checkout hook in a newly created linked worktree, using the same
  * null old HEAD and branch-switch flag as `git worktree add`. Returns once
- * `git hook run` exits, even if the hook left a background process running.
- * Aborting `signal` kills the hook's process tree and rejects with the reason.
+ * `git hook run` exits, even if the hook left a background process running,
+ * with the last 64 KiB of each output stream. Aborting `options.signal` kills
+ * the hook's process tree and rejects with the reason.
  */
-export async function runPostCheckoutHook(worktreeRoot, head, signal) {
+export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
+	const { signal, env } = options;
 	signal?.throwIfAborted();
 	const nullOid = "0".repeat(head.length);
 	const posix = process.platform !== "win32";
@@ -164,8 +169,11 @@ export async function runPostCheckoutHook(worktreeRoot, head, signal) {
 	const outPath = path.join(dir, "stdout");
 	const errPath = path.join(dir, "stderr");
 	try {
+		// No await between this check and the abort listener below, so no abort can be missed.
+		signal?.throwIfAborted();
 		const child = Bun.spawn(["git", "hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
 			cwd: worktreeRoot,
+			env,
 			stdin: "ignore",
 			stdout: Bun.file(outPath),
 			stderr: Bun.file(errPath),
@@ -192,7 +200,8 @@ export async function runPostCheckoutHook(worktreeRoot, head, signal) {
 			signal?.removeEventListener("abort", onAbort);
 		}
 		signal?.throwIfAborted();
-		const [stdout, stderr] = await Promise.all([Bun.file(outPath).bytes(), Bun.file(errPath).bytes()]);
+		const tail = file => file.slice(Math.max(0, file.size - HOOK_OUTPUT_TAIL_BYTES)).bytes();
+		const [stdout, stderr] = await Promise.all([tail(Bun.file(outPath)), tail(Bun.file(errPath))]);
 		return { exitCode, stdout, stderr };
 	} finally {
 		// A lingering hook child may still hold the files open on Windows; leave them for the OS then.

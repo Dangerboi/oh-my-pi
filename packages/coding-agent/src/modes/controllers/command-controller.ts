@@ -1747,7 +1747,7 @@ export class CommandController {
 				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
 			}
 			if (worktree.hookError) {
-				this.ctx.showWarning(`Worktree created, but ${replaceTabs(worktree.hookError)}`);
+				this.ctx.showWarning(`Worktree created, but ${worktree.hookError}`);
 			}
 			this.ctx.present([
 				new Spacer(1),

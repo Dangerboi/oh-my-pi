@@ -20,7 +20,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
 import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
@@ -161,7 +161,7 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	if (result.cloneError) {
 		console.error(chalk.dim(`warning: worktree clone fell back to plain checkout: ${result.cloneError}`));
 	}
-	const hook = await vcs.runPostCheckoutHook(worktreePath, commit.sha);
+	const hook = await vcs.runPostCheckoutHook(worktreePath, commit.sha, { env: filterChildShellEnv(process.env) });
 	process.stderr.write(hook.stdout);
 	process.stderr.write(hook.stderr);
 	if (hook.exitCode !== 0) process.exitCode = hook.exitCode;

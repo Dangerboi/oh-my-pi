@@ -85,14 +85,16 @@ export declare function detachGitDir(
 export declare function copyGitObjects(isolationRoot: string, sourceRoot: string): Promise<void>;
 
 /**
- * Run Git's checkout hook in a new linked worktree and return its output and exit status.
- * Returns once `git hook run` exits, even if the hook left a background process running.
- * Aborting `signal` kills the hook's process tree and rejects with the abort reason.
+ * Run Git's checkout hook in a new linked worktree and return its exit status and the
+ * last 64 KiB of each output stream. Returns once `git hook run` exits, even if the hook
+ * left a background process running. `env` replaces the inherited environment; pass one
+ * without ambient `GIT_DIR`-family variables. Aborting `signal` kills the hook's process
+ * tree and rejects with the abort reason.
  */
 export declare function runPostCheckoutHook(
 	worktreeRoot: string,
 	head: string,
-	signal?: AbortSignal,
+	options?: { signal?: AbortSignal; env?: Record<string, string> },
 ): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array }>;
 
 /** Join patch fragments, preserving each part's trailing newline. */

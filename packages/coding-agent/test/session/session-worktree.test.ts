@@ -307,6 +307,24 @@ describe("session worktree helpers (real git)", () => {
 			expect(wt.hookError).toBeUndefined();
 		});
 
+		it("hides the agent's own GIT_DIR from the hook", async () => {
+			const wt = await create();
+			await hook("git rev-parse --absolute-git-dir > .git-dir-seen");
+			const helper = path.resolve(import.meta.dir, "../../src/task/worktree.ts");
+			const script = `import { runWorktreeCheckoutHook } from ${JSON.stringify(helper)};
+await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.baseCommit)});`;
+			// Launched with GIT_DIR, as omp is from a git hook or `git --git-dir` wrapper; spawns inherit the launch env.
+			const run = Bun.spawnSync([process.execPath, "--no-install", "--eval", script], {
+				env: { ...process.env, GIT_DIR: path.join(repo, ".git") },
+				stderr: "pipe",
+			});
+
+			expect(run.stderr.toString()).toBe("");
+			expect((await Bun.file(path.join(wt.path, ".git-dir-seen")).text()).trim()).toBe(
+				git(wt.path, "rev-parse", "--absolute-git-dir"),
+			);
+		});
+
 		it("keeps the worktree and reports a failing hook without terminal escapes", async () => {
 			await hook("printf '\\033[31msetup-failed\\033[0m\\n' >&2; exit 17");
 			const wt = await create();
