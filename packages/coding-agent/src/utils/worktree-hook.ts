@@ -90,7 +90,8 @@ export function resolveWorktreePath(worktreePath: string, signal?: AbortSignal):
 }
 
 /**
- * Add a linked worktree of `branch` at the unused `worktreePath`, then run its `post-checkout`
+ * Add a linked worktree of `branch` at the unused `worktreePath` (the hook may move it; the
+ * returned path is where it ended up), then run its `post-checkout`
  * hook. Until the hook is done the worktree carries this process's setup mark, so another omp
  * process does not take it over (`pr_checkout` would reuse it); git commands, the hook's
  * included, see it as `git worktree add` leaves it. If the hook stage fails or `signal` aborts
@@ -114,22 +115,29 @@ export async function addWorktreeWithHook(
 		setupOwner: vcs.worktreeSetupOwner(),
 	});
 	let head: string | null | undefined;
+	// A hook may move its worktree, as under `git worktree add`; everything after it uses the current path.
+	let current = worktreePath;
 	try {
 		signal?.throwIfAborted();
 		head = await repository.resolveRef(`refs/heads/${branch}`, signal);
 		const hook = head ? await runWorktreeCheckoutHook(worktreePath, head, signal) : {};
+		// A branch is checked out in one worktree at most; none means the hook switched it or deleted the worktree.
+		// Raced like the path lookup below, so an abort rejects with its reason.
+		const listed = await untilAborted(signal, () => repository.worktrees());
+		const moved = listed.find(entry => entry.branch === `refs/heads/${branch}`);
+		if (moved) current = moved.path;
 		// The abort may also have landed as the hook finished: either way, or with a stalled `worktree.base`,
 		// the caller must not move into the worktree, so it is discarded below.
-		const resolved = await resolveWorktreePath(worktreePath, signal);
+		const resolved = await resolveWorktreePath(current, signal);
 		// The commit point: with the mark gone another omp process may reuse the worktree, so an abort from
 		// here on is too late to discard it, as one just after the return would be.
-		await repository.worktreeEndSetup(worktreePath).catch(error => {
+		await repository.worktreeEndSetup(current).catch(error => {
 			// Set up all the same; other omp processes only wait for it until this one exits.
-			logger.warn("could not mark a new worktree as set up", { path: worktreePath, error: String(error) });
+			logger.warn("could not mark a new worktree as set up", { path: current, error: String(error) });
 		});
 		return { added, path: resolved, hook };
 	} catch (error) {
-		await discardNewWorktree(repository, worktreePath);
+		await discardNewWorktree(repository, current);
 		if (head) await restoreBranch(repository, branch, head);
 		throw error;
 	}

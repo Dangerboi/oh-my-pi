@@ -1935,10 +1935,21 @@ fn register_worktree(
 
 /// Lift git's creation lock as git does, before any hook runs. If that fails,
 /// roll the add back: a live setup mark on a worktree reported as failed would
-/// make other processes refuse it for as long as this one lives.
+/// make other processes refuse it for as long as this one lives. A checkout
+/// that cannot be deleted stays listed and owned, recoverable by
+/// `git worktree remove`.
 fn finish_worktree_add(path: &Path, admin: &Path) -> Result<()> {
 	unlock_admin(admin).inspect_err(|_| {
-		let _ = fs::remove_dir_all(path);
+		let removed = match fs::remove_dir_all(path) {
+			Ok(()) => true,
+			Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+		};
+		// Unlisting a worktree whose checkout survives would leave a directory
+		// whose `.git` points at deleted admin data, and a retry would fail on
+		// it.
+		if !removed {
+			return;
+		}
 		// `gitdir` first: until it is gone the entry stays whole, listed and
 		// owned, so other processes refuse it. Once it is, nothing lists
 		// the entry, and the rest can go, mark included: `HEAD` next, which
@@ -3542,13 +3553,13 @@ mod tests {
 		assert!(!admin.join(SETUP_MARK).exists());
 	}
 
-	/// Roll back an add whose `locked` can't be lifted while `stuck` (a
-	/// directory in its admin dir) is made read-only, then report what
-	/// `worktrees()` lists for it.
+	/// Roll back an add whose `locked` can't be lifted while `stuck` (given the
+	/// admin dir and the checkout, and naming a directory in either) is made
+	/// read-only, then report what `worktrees()` lists for it.
 	#[cfg(unix)]
 	fn worktrees_after_a_stuck_rollback(
 		name: &str,
-		stuck: impl Fn(&Path) -> PathBuf,
+		stuck: impl Fn(&Path, &Path) -> PathBuf,
 	) -> (Result<()>, Result<Vec<Option<String>>>) {
 		use std::os::unix::fs::PermissionsExt;
 		let (temp, repo) = fixture();
@@ -3560,7 +3571,7 @@ mod tests {
 		// delete sharing on Windows.
 		fs::create_dir(admin.join("locked")).unwrap();
 		fs::write(admin.join("locked").join("stuck"), "").unwrap();
-		let stuck = stuck(&admin);
+		let stuck = stuck(&admin, &linked);
 		fs::set_permissions(&stuck, fs::Permissions::from_mode(0o500)).unwrap();
 
 		let rolled_back = finish_worktree_add(&linked, &admin);
@@ -3573,6 +3584,7 @@ mod tests {
 		});
 		fs::set_permissions(&stuck, fs::Permissions::from_mode(0o700)).unwrap();
 		let _ = fs::remove_dir_all(&admin);
+		let _ = fs::remove_dir_all(&linked);
 		(rolled_back, listed)
 	}
 
@@ -3584,7 +3596,7 @@ mod tests {
 			return;
 		}
 		let (rolled_back, listed) =
-			worktrees_after_a_stuck_rollback("linked-stuck-lock-dir", |admin| admin.join("locked"));
+			worktrees_after_a_stuck_rollback("linked-stuck-lock-dir", |admin, _| admin.join("locked"));
 		assert!(rolled_back.is_err());
 		// Never listed without its `HEAD`, which would fail every listing.
 		assert_eq!(listed.unwrap(), Vec::<Option<String>>::new());
@@ -3597,9 +3609,27 @@ mod tests {
 			return;
 		}
 		let (rolled_back, listed) =
-			worktrees_after_a_stuck_rollback("linked-stuck-admin", |admin| admin.to_path_buf());
+			worktrees_after_a_stuck_rollback("linked-stuck-admin", |admin, _| admin.to_path_buf());
 		assert!(rolled_back.is_err());
 		// Still listed, so other processes must see it as being set up.
+		assert_eq!(listed.unwrap(), [Some("owner-1".to_owned())]);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_rollback_that_cannot_delete_the_checkout_keeps_the_worktree_listed_and_owned() {
+		if unsafe { libc::geteuid() } == 0 {
+			return;
+		}
+		let (rolled_back, listed) =
+			worktrees_after_a_stuck_rollback("linked-stuck-checkout", |_, linked| {
+				let held = linked.join("held");
+				fs::create_dir(&held).unwrap();
+				fs::write(held.join("file"), "").unwrap();
+				held
+			});
+		assert!(rolled_back.is_err());
+		// Unlisted, the surviving checkout would point at deleted admin data.
 		assert_eq!(listed.unwrap(), [Some("owner-1".to_owned())]);
 	}
 

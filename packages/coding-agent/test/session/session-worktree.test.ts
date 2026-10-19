@@ -554,6 +554,19 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(branchSha(repo, branch)).not.toBeNull();
 		});
 
+		it("keeps a worktree its hook moved: /wt succeeds at the new path with the setup mark gone", async () => {
+			await hook(`unset GIT_DIR GIT_WORK_TREE\ngit -C "${repo}" worktree move "$PWD" "$PWD-moved"`);
+			const wt = await create();
+
+			const moved = await fs.realpath(wt.path);
+			expect(moved).toEndWith("-moved");
+			expect(worktreePaths(repo)).toContain(moved);
+			const entry = (await vcs.requireGit(repo).worktrees()).find(e => e.branch === `refs/heads/${branch}`);
+			expect(entry && (await fs.realpath(entry.path))).toBe(moved);
+			expect(entry?.setupOwner).toBeUndefined();
+			expect(branchSha(repo, branch)).not.toBeNull();
+		});
+
 		it("reports a hook as not run when the git on PATH cannot start", async () => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");
