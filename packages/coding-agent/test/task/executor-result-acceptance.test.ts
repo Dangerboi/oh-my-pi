@@ -68,6 +68,8 @@ interface SessionHarness {
 	emitTerminalYield: (data: unknown) => void;
 	/** End an assistant message carrying `text` and no tool calls. */
 	emitAssistantText: (text: string) => void;
+	/** Finish a `toolName` call whose result is `text`. */
+	emitToolResult: (toolName: string, text: string) => void;
 	/** The observer factory installed by {@link attachIrcWakeTurnMonitor}, if any. */
 	wakeObserver: () =>
 		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
@@ -86,6 +88,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 	const promptEntered = Promise.withResolvers<void>();
 	const hangingPrompt = Promise.withResolvers<void>();
 	let yieldSeq = 0;
+	let toolSeq = 0;
 	let wakeObserver: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined;
 	const emit = (event: AgentSessionEvent) => {
 		// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
@@ -95,6 +98,15 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		const message = assistantStopMessage(text);
 		messages.push(message);
 		emit({ type: "message_end", message } as AgentSessionEvent);
+	};
+	const emitToolResult = (toolName: string, text: string) => {
+		toolSeq += 1;
+		emit({
+			type: "tool_execution_end",
+			toolCallId: `${toolName}-${toolSeq}`,
+			toolName,
+			result: { content: [{ type: "text", text }] },
+		} as AgentSessionEvent);
 	};
 	const emitTerminalYield = (data: unknown) => {
 		yieldSeq += 1;
@@ -160,6 +172,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		promptEntered: promptEntered.promise,
 		emitTerminalYield,
 		emitAssistantText,
+		emitToolResult,
 		wakeObserver: () => wakeObserver,
 	};
 }
@@ -564,6 +577,53 @@ describe("runSubprocess result acceptance", () => {
 			await finish?.(undefined);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+			tempDir.removeSync();
+		}
+	});
+
+	it("gives a turn the owner woke a job whose widget reads the turn's tool calls and whose progress wait reads", async () => {
+		const tempDir = TempDir.createSync("@omp-wake-job-widget-");
+		const artifactsDir = tempDir.path();
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager });
+		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+
+		try {
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "label every bash output",
+					display: false,
+					details: { id: "msg-owner", from: "Parent", message: "label every bash output" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			harness.emitToolResult("bash", "BENCH tok_s_stream=171");
+			const inputs = manager.getJob(AGENT_ID)?.widgetInputs;
+			const [tools] = inputs?.sources() ?? [];
+			expect(tools?.id).toBe("tools");
+			expect(tools?.read(0).text).toContain("» bash\nBENCH tok_s_stream=171");
+			expect(inputs?.brief()).toMatchObject({ kind: "task", task: "label every bash output" });
+
+			harness.emitAssistantText("labelled");
+			await finish?.(undefined);
+			const details = manager.getJob(AGENT_ID)?.latestDetails;
+			expect(details?.progress).toMatchObject([{ id: AGENT_ID }]);
 		} finally {
 			await manager.dispose({ timeoutMs: 1000 });
 			tempDir.removeSync();

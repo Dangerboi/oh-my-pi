@@ -130,7 +130,7 @@ describe("IRC", () => {
 			expect(main.relayed[0]?.details).toEqual({ from: "0-A", to: "0-B", body: "sibling note" });
 		});
 
-		it("send to an unknown or aborted agent fails", async () => {
+		it("send to an unknown agent or a killed one without a transcript fails", async () => {
 			const unknown = await bus.send({ from: "0-Main", to: "0-Ghost", body: "hello?" });
 			expect(unknown.outcome).toBe("failed");
 
@@ -139,6 +139,30 @@ describe("IRC", () => {
 			registry.setStatus("0-Dead", "aborted");
 			const aborted = await bus.send({ from: "0-Main", to: "0-Dead", body: "hello?" });
 			expect(aborted.outcome).toBe("failed");
+			expect(sub.delivered).toEqual([]);
+		});
+
+		it("send revives a killed recipient from its transcript", async () => {
+			const sub = makeFakeSession();
+			sub.setOutcome("woken");
+			registry.register({
+				id: "0-Killed",
+				displayName: "task",
+				kind: "sub",
+				session: null,
+				sessionFile: "/tmp/0-Killed.jsonl",
+				status: "aborted",
+			});
+			AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
+				async () => async () => sub.session,
+				() => 0,
+			);
+
+			const receipt = await bus.send({ from: "0-Main", to: "0-Killed", body: "continue where you stopped" });
+
+			expect(receipt.outcome).toBe("revived");
+			expect(sub.delivered.map(msg => msg.body)).toEqual(["continue where you stopped"]);
+			expect(registry.get("0-Killed")?.status).toBe("idle");
 		});
 
 		it("send surfaces recipient delivery errors as failed", async () => {
