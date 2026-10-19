@@ -6,7 +6,7 @@
 import * as fs from "node:fs/promises";
 import type { VcsGitRepo, VcsWorktreeAddOptions, VcsWorktreeAddResult } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { filterChildShellEnv, logger, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnvAsync, logger, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import { sanitizeDisplayWarning, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 
 /** Display lines for a new worktree's `post-checkout` hook; both unset when it ran cleanly or there is none. */
@@ -32,6 +32,7 @@ export function describeSkippedHook(skipped: vcs.SkippedPostCheckoutHook): strin
 		"no-git": "did not run: no working git found",
 		"old-git": "did not run: running hooks needs Git 2.36 or newer",
 		inaccessible: "did not run: it could not be read",
+		"no-capture": "did not run: no directory for its output could be created in the temp directory (TMPDIR)",
 	}[skipped.reason];
 	const lead = "post-checkout hook ";
 	return `${lead}${displayLine(skipped.path, WARNING_WIDTH - Bun.stringWidth(`${lead} ${why}`))} ${why}`;
@@ -53,7 +54,8 @@ export async function runWorktreeCheckoutHook(
 	head: string,
 	signal?: AbortSignal,
 ): Promise<WorktreeCheckoutHookResult> {
-	const env = filterChildShellEnv(process.env);
+	// Its dotenv reads off the JS thread, raced against the abort like the hook itself.
+	const env = await filterChildShellEnvAsync(process.env, undefined, signal);
 	const hook = await vcs.runPostCheckoutHook(worktreeRoot, head, { signal, env, detached: true });
 	const result: WorktreeCheckoutHookResult = {};
 	if (hook.skipped) result.skipped = describeSkippedHook(hook.skipped);

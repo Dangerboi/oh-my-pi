@@ -498,9 +498,9 @@ impl GitRepo {
 			let mut entries =
 				parse_worktree_cli(&cli_text(self.root(), &["worktree", "list", "--porcelain"])?);
 			for entry in &mut entries {
-				entry.setup_owner = self
-					.worktree_admin(&entry.path)?
-					.and_then(|admin| read_setup_mark(&admin));
+				if let Some(admin) = self.worktree_admin(&entry.path)? {
+					entry.setup_owner = read_setup_mark(&admin)?;
+				}
 			}
 			return Ok(entries);
 		}
@@ -536,7 +536,7 @@ impl GitRepo {
 				continue;
 			};
 			let head = parse_head_with_refs(&dir.join("HEAD"), &self.info().common_dir)?;
-			out.push(entry_from_head(root, &head, read_setup_mark(&dir)));
+			out.push(entry_from_head(root, &head, read_setup_mark(&dir)?));
 		}
 		Ok(out)
 	}

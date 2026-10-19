@@ -42,6 +42,17 @@ export function git(dir) {
 export function repo(dir) {
 	return api().vcsDiscover(dir);
 }
+/**
+ * {@link git} off the JS thread: rejects with the abort reason as soon as `signal` aborts, also
+ * while a stalled checkout holds the lookup up.
+ */
+export async function discoverGit(dir, signal) {
+	return (await untilAborted(api().vcsGitDiscoverAsync(dir, signal), signal)) ?? null;
+}
+/** {@link repo} off the JS thread, like {@link discoverGit}. */
+export async function discoverRepo(dir, signal) {
+	return (await untilAborted(api().vcsDiscoverAsync(dir, signal), signal)) ?? null;
+}
 
 /** Like {@link repo}, but equal-root jj+git ties prefer Jujutsu for display. Git-safe automation must keep using {@link repo}. */
 export function repoForDisplay(dir) {
@@ -409,6 +420,49 @@ async function postCheckoutHookPath(captureDir, worktreeRoot, gitOptions) {
 }
 
 /**
+ * The hook file git would run for `foundAt`, with its stat: `null` when missing, the error when it
+ * can't be checked. Only a missing path means no hook (EACCES, EIO are reported, not mistaken for
+ * one). On Windows, as in Git for Windows' `find_hook`, the name with `.exe` appended counts too.
+ */
+async function hookFile(foundAt, signal) {
+	const missing = error => error?.code === "ENOENT" || error?.code === "ENOTDIR";
+	const statHook = file =>
+		untilAborted(
+			fs.promises.stat(file).catch(error => (missing(error) ? null : error)),
+			signal,
+		);
+	const stat = await statHook(foundAt);
+	if (process.platform === "win32" && stat === null) {
+		const exeStat = await statHook(`${foundAt}.exe`);
+		if (exeStat !== null) return { hookPath: `${foundAt}.exe`, stat: exeStat };
+	}
+	return { hookPath: foundAt, stat };
+}
+
+/**
+ * Why the hook file at `foundAt` would not run, as the finished result: `skip` is unset when git would run it.
+ * `hookPath` is the path checked.
+ */
+async function checkHookFile(foundAt, signal) {
+	const notRun = { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+	const { hookPath, stat } = await hookFile(foundAt, signal);
+	if (stat instanceof Error) return { hookPath, skip: { ...notRun, skipped: { path: hookPath, reason: "inaccessible" } } };
+	// Anything else there, even a directory, isn't missing: git tries to run it and reports the failure.
+	if (stat === null) return { hookPath, skip: notRun };
+	// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
+	if (process.platform !== "win32") {
+		const access = fs.promises.access(hookPath, fs.constants.X_OK).then(
+			() => true,
+			() => false,
+		);
+		if (!(await untilAborted(access, signal))) {
+			return { hookPath, skip: { ...notRun, skipped: { path: hookPath, reason: "not-executable" } } };
+		}
+	}
+	return { hookPath };
+}
+
+/**
  * Run Git's checkout hook in a newly created linked worktree, using the same
  * null old HEAD and branch-switch flag as `git worktree add`. Git locates the
  * hook; without a usable git the in-process lookup does, so no git binary is
@@ -416,13 +470,14 @@ async function postCheckoutHookPath(captureDir, worktreeRoot, gitOptions) {
  * hook left a background process running, with the last 64 KiB of each output
  * stream; `skipped` says why an existing hook did not run. Aborting
  * `options.signal` kills the hook's process tree and rejects with the reason, also while a
- * lookup, a file check or a read is stalled (starting git still happens on this thread).
+ * lookup, a file check or a read is stalled (starting git still happens on this thread). When no
+ * directory for the output can be created, the hook the in-process lookup finds is not run and is
+ * reported as skipped `no-capture`, after the same checks; the creation error is rethrown only if that lookup fails.
  */
 export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	const { signal, env, detached } = options;
 	signal?.throwIfAborted();
 	const notRun = { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
-	const posix = process.platform !== "win32";
 	// Awaited, raced against the abort: a stalled TMPDIR holds the run up until then, as `mkdtemp` would.
 	await untilAborted(sweepStaleHookCaptures(), signal);
 	// Files, not pipes: a background process git or the hook starts inherits them, and pipes would stay open until it exits.
@@ -437,39 +492,26 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	} catch (error) {
 		// Aborted while a stalled TMPDIR was still creating it: remove it once it exists.
 		creating.then(removeCapture, () => {});
-		throw error;
+		if (signal?.aborted) throw error;
+		// No capture directory (TMPDIR missing, read-only or full): the in-process lookup decides, as without a git,
+		// and a hook that would run is reported skipped. A failed lookup names no path, so the mkdtemp error stands.
+		let location;
+		try {
+			location = await untilAborted(api().vcsGitHookLocation(worktreeRoot, "post-checkout", signal), signal);
+		} catch (lookupError) {
+			if (signal?.aborted) throw lookupError;
+			throw error;
+		}
+		if (!location) return notRun;
+		const { hookPath, skip } = await checkHookFile(location, signal);
+		return skip ?? { ...notRun, skipped: { path: hookPath, reason: "no-capture" } };
 	}
 	const gitOptions = { env, signal, detached };
 	try {
 		const foundAt = await postCheckoutHookPath(dir, worktreeRoot, gitOptions);
 		if (!foundAt) return notRun;
-		// Only a missing path means no hook; any other failure (EACCES, EIO) is reported, not mistaken for one.
-		const missing = error => error?.code === "ENOENT" || error?.code === "ENOTDIR";
-		const statHook = file =>
-			untilAborted(
-				fs.promises.stat(file).catch(error => (missing(error) ? null : error)),
-				signal,
-			);
-		let hookPath = foundAt;
-		let stat = await statHook(hookPath);
-		// Git for Windows' `find_hook` also takes the name with `.exe` appended.
-		if (!posix && stat === null) {
-			const exeStat = await statHook(`${foundAt}.exe`);
-			if (exeStat !== null) [hookPath, stat] = [`${foundAt}.exe`, exeStat];
-		}
-		if (stat instanceof Error) return { ...notRun, skipped: { path: hookPath, reason: "inaccessible" } };
-		// Anything else there, even a directory, isn't missing: git tries to run it and reports the failure.
-		if (stat === null) return notRun;
-		// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
-		if (posix) {
-			const access = fs.promises.access(hookPath, fs.constants.X_OK).then(
-				() => true,
-				() => false,
-			);
-			if (!(await untilAborted(access, signal))) {
-				return { ...notRun, skipped: { path: hookPath, reason: "not-executable" } };
-			}
-		}
+		const { hookPath, skip } = await checkHookFile(foundAt, signal);
+		if (skip) return skip;
 		const reason = await hookRunnerProblem(dir, worktreeRoot, gitOptions);
 		if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
 		const outPath = path.join(dir, "stdout");

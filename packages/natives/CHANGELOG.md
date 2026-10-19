@@ -6,10 +6,11 @@
 
 - Added `vcsGitHookLocation(dir, name, signal?)`, where git looks for a hook in the checkout containing `dir` (`core.hooksPath`, with `~/` and `%(prefix)/` expanded, or the shared hooks directory) whether or not one exists there, found entirely off the JS thread ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Added a `setupOwner` option for `worktreeAdd` that marks the new worktree as still being set up until `VcsGitRepo.worktreeEndSetup(path, signal?)`, `setupOwner` on `worktrees()` entries, and `vcs.worktreeSetupOwner()`/`vcs.isWorktreeSetupOwnerAlive(owner)` ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- Added `vcs.discoverGit(dir, signal?)` and `vcs.discoverRepo(dir, signal?)`, which find the repository off the JS thread and reject as soon as `signal` aborts ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ### Changed
 
-- `vcs.runPostCheckoutHook` takes `{ signal, env, detached }`, reports a hook that exists but didn't run as `skipped`, returns once `git hook run` exits even if the hook left a background process running, and returns at most the last 64 KiB of each output stream ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- `vcs.runPostCheckoutHook` takes `{ signal, env, detached }`, reports a hook that exists but didn't run as `skipped` (including when TMPDIR has no room for its output), returns once `git hook run` exits even if the hook left a background process running, and returns at most the last 64 KiB of each output stream ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - `worktreeAdd` locks a new worktree as `initializing` while creating it and removes a half-written registration on failure, as git does ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ### Fixed

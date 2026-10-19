@@ -3868,6 +3868,9 @@ export interface VcsDiffOptions {
 /** Discover the repository owning a directory. */
 export declare function vcsDiscover(dir: string): VcsRepo | null
 
+/** [`vcs_discover`] off the JS thread, so a stalled checkout can't block it. */
+export declare function vcsDiscoverAsync(dir: string, signal?: unknown | undefined | null): Promise<VcsRepo | undefined | null>
+
 /**
  * Discover the repository presenting a directory: equal-root jj+git ties
  * prefer Jujutsu. Git-safe automation must keep using [`vcs_discover`].
@@ -3879,6 +3882,12 @@ export declare function vcsGitClone(url: string, target: string, options: VcsClo
 
 /** Discover the Git checkout containing a directory. */
 export declare function vcsGitDiscover(dir: string): VcsGitRepo | null
+
+/**
+ * [`vcs_git_discover`] off the JS thread, so a stalled checkout can't block
+ * it.
+ */
+export declare function vcsGitDiscoverAsync(dir: string, signal?: unknown | undefined | null): Promise<VcsGitRepo | undefined | null>
 
 /**
  * Where Git looks for hook `name` in the checkout containing `dir`.

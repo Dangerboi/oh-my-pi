@@ -69,7 +69,7 @@ export function toLocalBranchRef(value: string): string {
 
 export async function requireGitRepoRoot(cwd: string, signal?: AbortSignal): Promise<string> {
 	signal?.throwIfAborted();
-	const repoRoot = vcs.git(cwd)?.info().repoRoot;
+	const repoRoot = (await vcs.discoverGit(cwd, signal))?.info().repoRoot;
 	if (!repoRoot) {
 		throw new ToolError("Current git repository is unavailable.");
 	}
@@ -79,7 +79,7 @@ export async function requireGitRepoRoot(cwd: string, signal?: AbortSignal): Pro
 
 export async function requirePrimaryGitRepoRoot(cwd: string, signal?: AbortSignal): Promise<string> {
 	signal?.throwIfAborted();
-	const primaryRepoRoot = vcs.git(cwd)?.primaryRoot();
+	const primaryRepoRoot = (await vcs.discoverGit(cwd, signal))?.primaryRoot();
 	if (!primaryRepoRoot) {
 		throw new ToolError("Current git repository is unavailable.");
 	}
@@ -445,7 +445,8 @@ export async function checkoutPullRequest(
 	return withRepoLock(
 		repoRoot,
 		async () => {
-			const repository = vcs.requireGit(repoRoot);
+			const repository = await vcs.discoverGit(repoRoot, signal);
+			if (!repository) throw new ToolError("Current git repository is unavailable.");
 			const existingWorktrees = await repository.worktrees(signal);
 			const existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
 			const setupOwner = existingWorktree?.setupOwner;

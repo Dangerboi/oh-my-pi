@@ -518,6 +518,20 @@ pub fn vcs_discover_for_display(env: Env, dir: String) -> Result<Option<VcsRepo>
 		.map_err(|err| rich_error(env, err))
 }
 
+/// [`vcs_discover`] off the JS thread, so a stalled checkout can't block it.
+#[napi]
+pub fn vcs_discover_async(dir: String, signal: Option<Unknown>) -> Promise<Option<VcsRepo>> {
+	let ct = task::CancelToken::new(None, signal);
+	task::blocking_mapped("vcs.discoverAsync", ct, rich_error, canceled_error, move |ct| {
+		if ct.heartbeat().is_err() {
+			return Err(pi_vcs::Error::Canceled);
+		}
+		catch_panic("vcs.discoverAsync", || {
+			pi_vcs::detect(Path::new(&dir)).map(|repo| repo.map(|inner| VcsRepo { inner }))
+		})
+	})
+}
+
 #[napi]
 impl VcsRepo {
 	/// Backend kind (`"git"` or `"jj"`).
@@ -718,6 +732,21 @@ pub fn vcs_git_discover(env: Env, dir: String) -> Result<Option<VcsGitRepo>> {
 	pi_vcs::git::GitRepo::discover(Path::new(&dir))
 		.map(|v| v.map(|inner| VcsGitRepo { inner: Arc::new(inner) }))
 		.map_err(|err| rich_error(env, err))
+}
+/// [`vcs_git_discover`] off the JS thread, so a stalled checkout can't block
+/// it.
+#[napi]
+pub fn vcs_git_discover_async(dir: String, signal: Option<Unknown>) -> Promise<Option<VcsGitRepo>> {
+	let ct = task::CancelToken::new(None, signal);
+	task::blocking_mapped("vcs.gitDiscoverAsync", ct, rich_error, canceled_error, move |ct| {
+		if ct.heartbeat().is_err() {
+			return Err(pi_vcs::Error::Canceled);
+		}
+		catch_panic("vcs.gitDiscoverAsync", || {
+			pi_vcs::git::GitRepo::discover(Path::new(&dir))
+				.map(|v| v.map(|inner| VcsGitRepo { inner: Arc::new(inner) }))
+		})
+	})
 }
 /// Discover Git metadata without opening the repository.
 #[napi]

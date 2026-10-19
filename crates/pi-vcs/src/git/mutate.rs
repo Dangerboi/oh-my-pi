@@ -3270,6 +3270,21 @@ mod tests {
 	}
 
 	#[test]
+	fn an_unreadable_setup_mark_is_an_error_not_a_finished_setup() {
+		let (temp, repo) = fixture();
+		let linked = temp.path().join("../linked-setup-unreadable");
+		let _ = fs::remove_dir_all(&linked);
+		add_detached(&repo, &linked, None);
+		// Neither missing nor readable, as on shared metadata that is briefly
+		// unavailable.
+		let admin = repo.worktree_admin(&linked).unwrap().unwrap();
+		fs::create_dir(admin.join(SETUP_MARK)).unwrap();
+		assert!(repo.worktrees().is_err());
+		fs::remove_dir(admin.join(SETUP_MARK)).unwrap();
+		assert!(repo.worktree_remove(&linked, true).unwrap());
+	}
+
+	#[test]
 	fn ending_a_setup_finds_its_own_registration() {
 		let (temp, repo) = fixture();
 		// A stale registration of the same path: removed with `rm -rf`, never

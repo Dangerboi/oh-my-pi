@@ -157,7 +157,7 @@ Worktree and metadata behavior:
   - `branch.pr-<number>.ompPrIsCrossRepository`
   - `branch.pr-<number>.ompPrMaintainerCanModify`
 - When no matching worktree exists, an existing `refs/heads/pr-<number>` at a different commit fails unless `force=true`, which resets the branch to the fetched head.
-- An existing matching worktree is reused with `reused: true`; the remote is fetched and push metadata refreshed, but its local branch is not reset, even with `force=true`. One another omp process is still setting up (its `setupOwner` is alive, or in another host or container) is refused with a `ToolError` before anything changes, since that process discards it if its setup fails; one whose setting-up omp is gone is reused, and its mark cleared.
+- An existing matching worktree is reused with `reused: true`; the remote is fetched and push metadata refreshed, but its local branch is not reset, even with `force=true`. One another omp process is still setting up (its `setupOwner` is alive, or in another host or container) is refused with a `ToolError` before anything changes, since that process discards it if its setup fails; one whose setting-up omp is gone is reused, and its mark cleared. A setup mark that can't be read fails the checkout before anything changes, rather than counting as a finished setup.
 
 ### `pr_push`
 
@@ -262,7 +262,7 @@ Watch flow:
   - `pr_push` uses git network transport to the configured remote.
 - Subprocesses / native bindings
   - All `gh` calls use `Bun.spawn(["gh", ...args])`.
-  - `pr_checkout` and `pr_push` invoke git operations via `@oh-my-pi/pi-natives/vcs` (`vcs.requireGit()`). Checkout mutations use in-process `withRepoLock()`; `pr_push` does not acquire that lock.
+  - `pr_checkout` and `pr_push` invoke git operations via `@oh-my-pi/pi-natives/vcs`. `pr_checkout` finds the repository with `vcs.discoverGit()`, off the JS thread and raced against the abort, as `withRepoLock()` does for its key; `pr_push` uses `vcs.requireGit()`. Checkout mutations use in-process `withRepoLock()`; `pr_push` does not acquire that lock.
 - Session state (transcript, memory, jobs, checkpoints, registries)
   - `run_watch` consumes `session.allocateOutputArtifact()` when failed-job logs are persisted.
   - Returned `details` objects carry run/checkouts metadata for the renderer/UI.

@@ -151,7 +151,7 @@ export async function createSessionWorktree(
 	} catch (err) {
 		throw new Error(`Failed to save pending settings: ${err instanceof Error ? err.message : String(err)}`);
 	}
-	const repository = vcs.git(cwd);
+	const repository = await vcs.discoverGit(cwd, options.signal);
 	if (!repository) {
 		throw new Error(`Not inside a git repository: ${cwd}`);
 	}

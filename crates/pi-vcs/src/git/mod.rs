@@ -283,9 +283,15 @@ fn read_optional(path: &Path) -> Option<String> {
 /// setup that is not finished yet.
 pub(crate) const SETUP_MARK: &str = "omp-setup";
 
-/// Owner in the setup mark of the administration directory `admin`, if any.
-pub(crate) fn read_setup_mark(admin: &Path) -> Option<String> {
-	read_optional(&admin.join(SETUP_MARK)).map(|owner| owner.trim_end().to_owned())
+/// Owner in the setup mark of the administration directory `admin`; `None`
+/// only when there is none. A mark that can't be read is an error, never taken
+/// for a finished setup.
+pub(crate) fn read_setup_mark(admin: &Path) -> Result<Option<String>> {
+	match std::fs::read_to_string(admin.join(SETUP_MARK)) {
+		Ok(owner) => Ok(Some(owner.trim_end().to_owned())),
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(err) => Err(err.into()),
+	}
 }
 
 /// Lexically normalize `.`/`..` segments without touching the filesystem, so

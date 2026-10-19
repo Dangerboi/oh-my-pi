@@ -48,6 +48,13 @@ export declare function isEmptyCherryPick(error: unknown): error is VcsError & {
 export declare function git(dir: string): VcsGitRepo | null;
 /** Discover the repository owning `dir`; `null` outside any repository. */
 export declare function repo(dir: string): VcsRepo | null;
+/**
+ * {@link git} off the JS thread: rejects with the abort reason as soon as `signal` aborts, also
+ * while a stalled checkout holds the lookup up.
+ */
+export declare function discoverGit(dir: string, signal?: AbortSignal): Promise<VcsGitRepo | null>;
+/** {@link repo} off the JS thread, like {@link discoverGit}. */
+export declare function discoverRepo(dir: string, signal?: AbortSignal): Promise<VcsRepo | null>;
 /** Like {@link repo}, but equal-root jj+git ties prefer Jujutsu for display. Git-safe automation must keep using {@link repo}. */
 export declare function repoForDisplay(dir: string): VcsRepo | null;
 
@@ -97,8 +104,8 @@ export declare function isWorktreeSetupOwnerAlive(owner: string): boolean;
 /** A `post-checkout` hook that exists but did not run, and why. */
 export interface SkippedPostCheckoutHook {
 	path: string;
-	/** `no-git`: no git starts, or `git version` fails. `old-git`: older than 2.36, without `git hook run`. `inaccessible`: checking the hook file failed other than with ENOENT/ENOTDIR. */
-	reason: "not-executable" | "no-git" | "old-git" | "inaccessible";
+	/** `no-git`: no git starts, or `git version` fails. `old-git`: older than 2.36, without `git hook run`. `inaccessible`: checking the hook file failed other than with ENOENT/ENOTDIR. `no-capture`: no directory for the hook's output could be created in TMPDIR. */
+	reason: "not-executable" | "no-git" | "old-git" | "inaccessible" | "no-capture";
 }
 
 /**
@@ -112,7 +119,11 @@ export interface SkippedPostCheckoutHook {
  * unlike `git worktree add`'s, it sees `GIT_DIR` set to the new worktree's git dir. Returns
  * once `git hook run` exits, even if the hook left a background process running. `skipped` is
  * set when the hook exists but did not run: not executable (POSIX only), no working git on
- * PATH, a git older than 2.36, or a hook file that can't be checked. `env` replaces the
+ * PATH, a git older than 2.36, or a hook file that can't be checked. Its output is captured
+ * in files under TMPDIR; when none can be created there (missing, read-only, full), the hook
+ * the in-process lookup finds is reported as skipped `no-capture`, not run, after the usual
+ * existence and executable checks (no hook found: not run, no `skipped`).
+ * `env` replaces the
  * inherited environment; pass one without ambient `GIT_DIR`-family variables. `detached`
  * (POSIX) runs the hook, and the git calls that locate it, in their own session, without the
  * caller's controlling terminal, so a prompt on /dev/tty fails instead of writing into a TUI.

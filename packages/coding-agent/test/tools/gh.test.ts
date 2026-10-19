@@ -1220,6 +1220,12 @@ describe("github tool", () => {
 		});
 
 		describe.skipIf(process.platform === "win32")("a new worktree whose setup is cut short", () => {
+			/** Puts the shared fixture's config back if a test failed with it replaced, so later tests fail instead of hanging. */
+			let restoreConfig: (() => Promise<void>) | undefined;
+			afterEach(async () => {
+				await restoreConfig?.();
+				restoreConfig = undefined;
+			});
 			const mockPrView = (number: number) =>
 				vi
 					.spyOn(github, "json")
@@ -1392,6 +1398,29 @@ describe("github tool", () => {
 				});
 				await expect(checkout(126, controller.signal)).rejects.toThrow();
 				await expectDiscarded(126);
+			});
+
+			it("is cancelled while the repository is still being found, as on a stalled checkout", async () => {
+				mockPrView(134);
+				// A named pipe stalls the read of the shared config, as a stalled filesystem would.
+				const config = path.join(fixture.repoRoot, ".git", "config");
+				await fs.rename(config, `${config}.real`);
+				restoreConfig = () => fs.rename(`${config}.real`, config);
+				expect(Bun.spawnSync(["mkfifo", config]).exitCode).toBe(0);
+				const controller = new AbortController();
+				const pending = checkout(134, controller.signal);
+				// Opening the writing end waits until the lookup opened the pipe; its read then stalls.
+				const writer = await fs.open(config, "w");
+				try {
+					controller.abort();
+					await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+				} finally {
+					// The real config first: the abandoned lookup may open it again, and must not meet the pipe.
+					await restoreConfig();
+					restoreConfig = undefined;
+					await writer.close();
+				}
+				await expectDiscarded(134);
 			});
 
 			it("is cancelled while its worktree path is still being chosen, as on a stalled worktree.base", async () => {

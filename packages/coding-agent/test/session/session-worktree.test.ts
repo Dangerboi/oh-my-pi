@@ -449,16 +449,20 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 
 		it("discards the new worktree and branch when the hook runner fails, so the name can be reused", async () => {
 			await hook("touch .post-checkout-ran");
-			const realMkdtemp = nodeFs.promises.mkdtemp;
-			// Only the runner's capture directory fails, as on a full disk.
-			const mkdtemp = spyOn(nodeFs.promises, "mkdtemp").mockImplementation(((prefix: string, ...rest: []) =>
-				prefix.includes("omp-post-checkout-")
+			const realOpen = nodeFs.promises.open;
+			// Only the runner's capture file fails, as on a full disk.
+			const open = spyOn(nodeFs.promises, "open").mockImplementation(((
+				file: nodeFs.PathLike,
+				mode: string,
+				...rest: []
+			) =>
+				mode === "w" && path.basename(path.dirname(String(file))).startsWith("omp-post-checkout-")
 					? Promise.reject(Object.assign(new Error("no space left on device"), { code: "ENOSPC" }))
-					: realMkdtemp(prefix, ...rest)) as typeof realMkdtemp);
+					: realOpen(file, mode, ...rest)) as typeof realOpen);
 			try {
 				await expect(create()).rejects.toThrow("no space left on device");
 			} finally {
-				mkdtemp.mockRestore();
+				open.mockRestore();
 			}
 
 			expect(branchSha(repo, branch)).toBeNull();
@@ -541,27 +545,85 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
 		});
 
-		it("abort is not held up by a stalled repository when no git can locate the hook", async () => {
-			const wt = await create();
-			// A named pipe blocks the in-process lookup's read of the shared config, as a stalled filesystem would.
+		/** Start `run` while the repository's shared config is a named pipe, which stalls whatever reads it as a stalled filesystem would; abort once it is being read. */
+		const abortWhileConfigStalls = async (run: (signal: AbortSignal) => Promise<unknown>) => {
 			const config = path.join(repo, ".git", "config");
 			await fs.rename(config, `${config}.real`);
 			expect(Bun.spawnSync(["mkfifo", config]).exitCode).toBe(0);
 			const controller = new AbortController();
-			const pending = vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
-				signal: controller.signal,
-				env: { PATH: path.join(root, "no-git") },
-			});
-			// Opening the writing end waits until the lookup opened the pipe; the read then stalls.
+			const pending = run(controller.signal);
+			// Opening the writing end waits until the reader opened the pipe; its read then stalls.
 			const writer = await fs.open(config, "w");
 			try {
 				controller.abort();
 				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 			} finally {
-				// The real config first: the abandoned lookup opens it again after this read, and must not meet the pipe.
+				// The real config first: the abandoned reader may open it again after this read, and must not meet the pipe.
 				await fs.rename(`${config}.real`, config);
 				// End of file then lets that read finish.
 				await writer.close();
+			}
+		};
+
+		it("abort is not held up by a stalled repository when no git can locate the hook", async () => {
+			const wt = await create();
+			await abortWhileConfigStalls(signal =>
+				vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { signal, env: { PATH: path.join(root, "no-git") } }),
+			);
+		});
+
+		it("an abort while /wt is still finding the repository cancels it and leaves nothing behind", async () => {
+			await abortWhileConfigStalls(signal => createSessionWorktree(repo, Settings.isolated(), branch, { signal }));
+
+			expect(worktreePaths(repo)).toEqual([repo]);
+			expect(branchSha(repo, branch)).toBeNull();
+		});
+
+		it("an abort while the hook's environment is still being read cancels /wt and leaves nothing behind", async () => {
+			await hook("touch .post-checkout-ran");
+			const reached = Promise.withResolvers<void>();
+			const stalled = Promise.withResolvers<string>();
+			const realReadFile = nodeFs.promises.readFile;
+			// The project's dotenv files on a stalled filesystem.
+			const readFile = spyOn(nodeFs.promises, "readFile").mockImplementation(((
+				file: nodeFs.PathLike,
+				...rest: []
+			) => {
+				if (!path.basename(String(file)).startsWith(".env")) return realReadFile(file, ...rest);
+				reached.resolve();
+				return stalled.promise;
+			}) as typeof realReadFile);
+			const controller = new AbortController();
+			try {
+				const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+				await reached.promise;
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+			} finally {
+				readFile.mockRestore();
+				stalled.resolve("");
+			}
+
+			expect(worktreePaths(repo)).toEqual([repo]);
+			expect(branchSha(repo, branch)).toBeNull();
+		});
+
+		it.each([
+			["without a hook", undefined],
+			["without running a hook, which is reported", "touch .post-checkout-ran"],
+		])("/wt goes through %s when no capture directory can be created", async (_name, script) => {
+			// A hooks directory holding at most this hook, so no global hook counts either.
+			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
+			if (script) await hook(script);
+			const tmpdir = spyOn(os, "tmpdir").mockReturnValue(path.join(root, "no-such-tmp"));
+			try {
+				const wt = await create();
+				expect(await exists(path.join(wt.path, ".git"))).toBe(true);
+				expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
+				if (script) expect(wt.hook?.skipped).toContain("TMPDIR");
+				else expect(wt.hook?.skipped).toBeUndefined();
+			} finally {
+				tmpdir.mockRestore();
 			}
 		});
 
