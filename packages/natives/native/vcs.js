@@ -153,12 +153,34 @@ export async function copyGitObjects(isolationRoot, sourceRoot) {
 const HOOK_OUTPUT_TAIL_BYTES = 64 * 1024;
 const HOOK_CAPTURE_PREFIX = "omp-post-checkout-";
 /**
- * This host's tag in capture directory names. Pids only identify processes within one host (pid
- * namespace), so captures of another host or container sharing the TMPDIR are never judged by them.
+ * Where pids mean the same: hostname, plus on Linux the boot and pid namespace, so containers
+ * sharing a hostname and the TMPDIR but not their pids (a pod's sidecars) differ too. Read from
+ * /proc, which never stalls. Each part on its own: a missing one (no /proc, an AppArmor profile
+ * denying `boot_id`) must not take the others with it.
  */
-const HOOK_CAPTURE_HOST = Bun.hash(os.hostname()).toString(36);
-/** A capture directory of this host, with the pid of the omp process that created it. */
-const HOOK_CAPTURE_OWNED = new RegExp(`^${HOOK_CAPTURE_PREFIX}${HOOK_CAPTURE_HOST}-(\\d+)-`);
+function pidScope() {
+	const scope = [os.hostname()];
+	if (process.platform === "linux") {
+		for (const read of [
+			() => fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
+			() => fs.readlinkSync("/proc/self/ns/pid"),
+		]) {
+			try {
+				scope.push(read());
+			} catch {
+				scope.push("");
+			}
+		}
+	}
+	return scope.join("\0");
+}
+/**
+ * This process's pid scope as a tag. Pids only identify processes within one scope, so what
+ * another host or container left behind is never judged by them.
+ */
+const PID_SCOPE = Bun.hash(pidScope()).toString(36);
+/** A capture directory of this pid scope, with the pid of the omp process that created it. */
+const HOOK_CAPTURE_OWNED = new RegExp(`^${HOOK_CAPTURE_PREFIX}${PID_SCOPE}-(\\d+)-`);
 
 /** Whether process `pid` still exists (EPERM: it does, under another user). */
 function processAlive(pid) {
@@ -168,6 +190,21 @@ function processAlive(pid) {
 	} catch (error) {
 		return error?.code === "EPERM";
 	}
+}
+
+/** This process as the owner of a worktree setup (`setupOwner` of `worktreeAdd`). */
+export function worktreeSetupOwner() {
+	return `${PID_SCOPE}-${process.pid}`;
+}
+
+/**
+ * Whether the owner of a worktree setup may still be running it: its process exists, or it is
+ * in another pid scope (another host or container), where this process can't tell.
+ */
+export function isWorktreeSetupOwnerAlive(owner) {
+	const match = /^(.+)-(\d+)$/.exec(owner);
+	if (match?.[1] !== PID_SCOPE) return true;
+	return processAlive(Number(match[2]));
 }
 
 /**
@@ -392,7 +429,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	const removeCapture = dir => fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
 	// Host and pid let a later run tell this directory from one whose omp process is gone.
 	const creating = fs.promises.mkdtemp(
-		path.join(os.tmpdir(), `${HOOK_CAPTURE_PREFIX}${HOOK_CAPTURE_HOST}-${process.pid}-`),
+		path.join(os.tmpdir(), `${HOOK_CAPTURE_PREFIX}${PID_SCOPE}-${process.pid}-`),
 	);
 	let dir;
 	try {

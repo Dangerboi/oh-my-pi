@@ -279,6 +279,15 @@ fn read_optional(path: &Path) -> Option<String> {
 	std::fs::read_to_string(path).ok()
 }
 
+/// File in a linked worktree's administration directory naming the owner of a
+/// setup that is not finished yet.
+pub(crate) const SETUP_MARK: &str = "omp-setup";
+
+/// Owner in the setup mark of the administration directory `admin`, if any.
+pub(crate) fn read_setup_mark(admin: &Path) -> Option<String> {
+	read_optional(&admin.join(SETUP_MARK)).map(|owner| owner.trim_end().to_owned())
+}
+
 /// Lexically normalize `.`/`..` segments without touching the filesystem, so
 /// relative `gitdir`/`commondir` pointers resolve the same way git does.
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {

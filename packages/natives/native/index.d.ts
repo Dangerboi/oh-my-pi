@@ -681,6 +681,11 @@ export declare class VcsGitRepo {
   worktreeRemove(path: string, force: boolean, signal?: unknown | undefined | null): Promise<boolean>
   /** Prune worktrees. */
   worktreePrune(signal?: unknown | undefined | null): Promise<undefined>
+  /**
+   * Clear the setup mark `setupOwner` left on the worktree at `path`, also
+   * once its `.git` is gone.
+   */
+  worktreeEndSetup(path: string, signal?: unknown | undefined | null): Promise<undefined>
   /** Recent subjects. */
   logSubjects(count: number, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Recent one-line commits. */
@@ -3990,6 +3995,11 @@ export interface VcsWorktreeAddOptions {
    * (target must be the source `HEAD`).
    */
   keepChanges?: boolean
+  /**
+   * Mark the new worktree as still being set up by this owner, from before
+   * it is listed until `worktreeEndSetup`. Git commands ignore the mark.
+   */
+  setupOwner?: string
 }
 
 /** Worktree creation outcome. */
@@ -4004,6 +4014,11 @@ export interface VcsWorktreeEntry {
   head?: string
   branch?: string
   detached: boolean
+  /**
+   * Owner of a setup that is not finished yet (`setupOwner` when it was
+   * added); unset once it is done.
+   */
+  setupOwner?: string
 }
 
 /**

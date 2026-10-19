@@ -118,10 +118,13 @@ pub struct VcsLinkedWorktree {
 /// One worktree listing row.
 #[napi(object)]
 pub struct VcsWorktreeEntry {
-	pub path:     String,
-	pub head:     Option<String>,
-	pub branch:   Option<String>,
-	pub detached: bool,
+	pub path:        String,
+	pub head:        Option<String>,
+	pub branch:      Option<String>,
+	pub detached:    bool,
+	/// Owner of a setup that is not finished yet (`setupOwner` when it was
+	/// added); unset once it is done.
+	pub setup_owner: Option<String>,
 }
 /// Worktree creation options.
 #[napi(object)]
@@ -132,6 +135,9 @@ pub struct VcsWorktreeAddOptions {
 	/// Carry the source checkout's uncommitted changes into the new worktree
 	/// (target must be the source `HEAD`).
 	pub keep_changes: Option<bool>,
+	/// Mark the new worktree as still being set up by this owner, from before
+	/// it is listed until `worktreeEndSetup`. Git commands ignore the mark.
+	pub setup_owner:  Option<String>,
 }
 /// Worktree creation outcome.
 #[napi(object)]
@@ -295,10 +301,11 @@ impl From<core::LinkedWorktree> for VcsLinkedWorktree {
 impl From<core::WorktreeEntry> for VcsWorktreeEntry {
 	fn from(v: core::WorktreeEntry) -> Self {
 		Self {
-			path:     path_string(v.path),
-			head:     v.head,
-			branch:   v.branch,
-			detached: v.detached,
+			path:        path_string(v.path),
+			head:        v.head,
+			branch:      v.branch,
+			detached:    v.detached,
+			setup_owner: v.setup_owner,
 		}
 	}
 }
@@ -921,6 +928,7 @@ impl VcsGitRepo {
 				detach: options.detach,
 				clone,
 				keep_changes: options.keep_changes.unwrap_or(false),
+				setup_owner: options.setup_owner,
 			})
 			.map(|result| VcsWorktreeAddResult {
 				cloned_with: result.cloned_with.map(to_napi_kind),
@@ -946,6 +954,15 @@ impl VcsGitRepo {
 	#[napi]
 	pub fn worktree_prune(&self, signal: Option<Unknown>) -> Promise<()> {
 		blocking("vcs.worktreePrune", self.inner.clone(), signal, |r| r.worktree_prune())
+	}
+
+	/// Clear the setup mark `setupOwner` left on the worktree at `path`, also
+	/// once its `.git` is gone.
+	#[napi]
+	pub fn worktree_end_setup(&self, path: String, signal: Option<Unknown>) -> Promise<()> {
+		blocking("vcs.worktreeEndSetup", self.inner.clone(), signal, move |r| {
+			r.worktree_end_setup(Path::new(&path))
+		})
 	}
 
 	/// Recent subjects.

@@ -780,25 +780,35 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			const wt = await create();
 			const tmp = path.join(root, "tmp");
 			await fs.mkdir(tmp);
-			const host = Bun.hash(os.hostname()).toString(36);
-			// A pid whose process has already exited, as after omp crashed before its own cleanup.
-			const gone = Bun.spawnSync(["sh", "-c", "echo $$"]).stdout.toString().trim();
-			const left = path.join(tmp, `omp-post-checkout-${host}-${gone}-leftover`);
-			// Its omp is alive: a hook that may be running for hours.
-			const running = path.join(tmp, `omp-post-checkout-${host}-${process.pid}-running`);
-			// Another host or container sharing the TMPDIR, whose pids mean nothing here.
-			const foreign = path.join(tmp, `omp-post-checkout-otherhost-${gone}-elsewhere`);
-			for (const dir of [left, running, foreign]) await Bun.write(path.join(dir, "stdout"), "output\n");
 			const tmpdir = spyOn(os, "tmpdir").mockReturnValue(tmp);
+			const realMkdtemp = nodeFs.promises.mkdtemp;
+			let prefix = "";
+			const mkdtemp = spyOn(nodeFs.promises, "mkdtemp").mockImplementation(((given: string, ...rest: []) => {
+				prefix = path.basename(given);
+				return realMkdtemp(given, ...rest);
+			}) as typeof realMkdtemp);
+			const run = () => vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env: filterChildShellEnv(process.env) });
 			try {
-				await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env: filterChildShellEnv(process.env) });
+				// This host's own directory name, as a run creates it: `<prefix><host tag>-<pid>-`.
+				await run();
+				const own = prefix.slice(0, -`${process.pid}-`.length);
+				// A pid whose process has already exited, as after omp crashed before its own cleanup.
+				const gone = Bun.spawnSync(["sh", "-c", "echo $$"]).stdout.toString().trim();
+				const left = path.join(tmp, `${own}${gone}-leftover`);
+				// Its omp is alive: a hook that may be running for hours.
+				const running = path.join(tmp, `${own}${process.pid}-running`);
+				// Another host or container sharing the TMPDIR, whose pids mean nothing here.
+				const foreign = path.join(tmp, `omp-post-checkout-otherhost-${gone}-elsewhere`);
+				for (const dir of [left, running, foreign]) await Bun.write(path.join(dir, "stdout"), "output\n");
+				await run();
+
+				expect(await exists(left)).toBe(false);
+				expect(await exists(path.join(running, "stdout"))).toBe(true);
+				expect(await exists(path.join(foreign, "stdout"))).toBe(true);
 			} finally {
+				mkdtemp.mockRestore();
 				tmpdir.mockRestore();
 			}
-
-			expect(await exists(left)).toBe(false);
-			expect(await exists(path.join(running, "stdout"))).toBe(true);
-			expect(await exists(path.join(foreign, "stdout"))).toBe(true);
 		});
 
 		it("returns when the hook exits even if it left a background process running", async () => {

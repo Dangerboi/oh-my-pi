@@ -12,7 +12,7 @@ use std::{
 use gix::bstr::{BString, ByteSlice};
 
 use super::{
-	GitRepo,
+	GitRepo, SETUP_MARK,
 	filter::WorktreeFilter,
 	normalize_path,
 	open::{load_index_or_empty, load_index_or_head, status_with_fresh_index, status_with_index},
@@ -660,10 +660,12 @@ impl GitRepo {
 			WorktreeClone::Prefer(kind) => Some(Some(kind)),
 		};
 		let mut clone_error = None;
+		let owner = options.setup_owner.as_deref();
 		if let Some(preferred) = preferred {
 			for kind in pi_iso::clone_candidates(preferred) {
-				match self.worktree_add_cloned(path, id, &head, kind, options.keep_changes) {
-					Ok(()) => {
+				match self.worktree_add_cloned(path, id, &head, kind, options.keep_changes, owner) {
+					Ok(admin) => {
+						unlock_admin(&admin)?;
 						return Ok(WorktreeAddResult { cloned_with: Some(kind), clone_error });
 					},
 					Err(err) => {
@@ -675,13 +677,26 @@ impl GitRepo {
 		}
 
 		fs::create_dir_all(path)?;
-		let admin = register_worktree(path, &self.info().common_dir, &head)?;
-		let linked = Self::require(path)?;
-		let linked_repo = linked.gix()?;
-		checkout_tree(&linked, &linked_repo, id, true)?;
-		if options.keep_changes {
-			self.seed_worktree_changes(path, &admin, id)?;
+		let admin = register_worktree(path, &self.info().common_dir, &head, owner)?;
+		let materialized: Result<()> = (|| {
+			let linked = Self::require(path)?;
+			let linked_repo = linked.gix()?;
+			checkout_tree(&linked, &linked_repo, id, true)?;
+			if options.keep_changes {
+				self.seed_worktree_changes(path, &admin, id)?;
+			}
+			Ok(())
+		})();
+		if let Err(err) = materialized {
+			// Left registered, as before, but neither being created nor set up any
+			// more.
+			let _ = end_setup_admin(&admin);
+			let _ = unlock_admin(&admin);
+			return Err(err);
 		}
+		// Created: lifted as git lifts it, before any hook runs. A setup mark
+		// stays.
+		unlock_admin(&admin)?;
 		Ok(WorktreeAddResult { cloned_with: None, clone_error })
 	}
 
@@ -759,6 +774,7 @@ impl GitRepo {
 			.map_err(|err| Error::backend("git worktree add", err))
 	}
 
+	/// Returns the new worktree's administration directory.
 	fn worktree_add_cloned(
 		&self,
 		path: &Path,
@@ -766,7 +782,8 @@ impl GitRepo {
 		head: &str,
 		kind: pi_iso::BackendKind,
 		keep_changes: bool,
-	) -> Result<()> {
+		setup_owner: Option<&str>,
+	) -> Result<PathBuf> {
 		let repo = self.gix()?;
 		for key in ["core.sparseCheckout", "core.splitIndex"] {
 			if repo.config_snapshot().string(key).is_some_and(|value| {
@@ -783,7 +800,7 @@ impl GitRepo {
 		pi_iso::backend(kind)
 			.clone_tree(self.root(), path, &[OsStr::new(".git")])
 			.map_err(|err| Error::backend("git worktree add", err))?;
-		let admin = register_worktree(path, &self.info().common_dir, head)?;
+		let admin = register_worktree(path, &self.info().common_dir, head, setup_owner)?;
 		fs::copy(&source_index, admin.join("index"))?;
 
 		let (dirty_tracked, untracked) = collect_clone_reconciliation_paths(&repo)?;
@@ -796,9 +813,10 @@ impl GitRepo {
 			// (new inodes); refresh it for entries the source reports clean so
 			// dirty files still hash on the next status.
 			refresh_clean_index_stats(&mut current, path, &dirty_tracked)?;
-			return current
+			current
 				.write(INDEX_WRITE)
-				.map_err(|err| Error::backend("git worktree add", err));
+				.map_err(|err| Error::backend("git worktree add", err))?;
+			return Ok(admin);
 		}
 		let tree = commit_tree(&linked_repo, &id)?;
 		let mut target = linked_repo
@@ -891,7 +909,8 @@ impl GitRepo {
 		}
 		target
 			.write(INDEX_WRITE)
-			.map_err(|err| Error::backend("git worktree add", err))
+			.map_err(|err| Error::backend("git worktree add", err))?;
+		Ok(admin)
 	}
 
 	/// Where git's `find_hook` looks for hook `name`, whether or not a file
@@ -941,7 +960,8 @@ impl GitRepo {
 	}
 
 	/// Prune linked-worktree administration entries whose back-reference
-	/// vanished.
+	/// vanished. Locked entries are kept, as git keeps them (a worktree on a
+	/// volume that is offline, or one still being created).
 	pub fn worktree_prune(&self) -> Result<()> {
 		let root = self.info().common_dir.join("worktrees");
 		let Ok(entries) = fs::read_dir(&root) else {
@@ -949,6 +969,9 @@ impl GitRepo {
 		};
 		for entry in entries {
 			let entry = entry?;
+			if entry.path().join("locked").exists() {
+				continue;
+			}
 			let back = fs::read_to_string(entry.path().join("gitdir")).unwrap_or_default();
 			if back.trim().is_empty() || !Path::new(back.trim()).exists() {
 				fs::remove_dir_all(entry.path())?;
@@ -956,6 +979,53 @@ impl GitRepo {
 		}
 		Ok(())
 	}
+
+	/// Clear the setup mark [`WorktreeAddOptions::setup_owner`] left on the
+	/// worktree at `path`, also once its `.git` is gone.
+	pub fn worktree_end_setup(&self, path: &Path) -> Result<()> {
+		match self.worktree_admin(path)? {
+			Some(admin) => end_setup_admin(&admin),
+			None => Ok(()),
+		}
+	}
+
+	/// Administration directory of the linked worktree at `path`: the one its
+	/// `.git` names, else (it is gone) the registration pointing at it.
+	pub(crate) fn worktree_admin(&self, path: &Path) -> Result<Option<PathBuf>> {
+		let worktrees = self.info().common_dir.join("worktrees");
+		if let Ok(Some(admin)) = registered_admin(&path.join(".git"))
+			&& admin.starts_with(&worktrees)
+		{
+			return Ok(Some(admin));
+		}
+		let target = normalize_path(&path.join(".git"));
+		let Ok(entries) = fs::read_dir(&worktrees) else {
+			return Ok(None);
+		};
+		for entry in entries {
+			let admin = entry?.path();
+			let back = fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
+			if normalize_path(Path::new(back.trim())) == target {
+				return Ok(Some(admin));
+			}
+		}
+		Ok(None)
+	}
+}
+
+fn remove_if_present(file: &Path) -> Result<()> {
+	match fs::remove_file(file) {
+		Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+		_ => Ok(()),
+	}
+}
+
+fn unlock_admin(admin: &Path) -> Result<()> {
+	remove_if_present(&admin.join("locked"))
+}
+
+fn end_setup_admin(admin: &Path) -> Result<()> {
+	remove_if_present(&admin.join(SETUP_MARK))
 }
 
 fn run_commit_hook(repository: &GitRepo, name: &str, args: &[&OsStr]) -> Result<()> {
@@ -1828,15 +1898,35 @@ fn git_metadata_path(path: &Path) -> Cow<'_, str> {
 	}
 }
 
-fn register_worktree(path: &Path, common: &Path, head: &str) -> Result<PathBuf> {
+fn register_worktree(
+	path: &Path,
+	common: &Path,
+	head: &str,
+	setup_owner: Option<&str>,
+) -> Result<PathBuf> {
 	fs::create_dir_all(path)?;
 	let name = worktree_admin_name(common, path);
 	let admin = common.join("worktrees").join(name);
 	fs::create_dir_all(&admin)?;
-	fs::write(path.join(".git"), format!("gitdir: {}\n", git_metadata_path(&admin)))?;
-	fs::write(admin.join("gitdir"), format!("{}\n", git_metadata_path(&path.join(".git"))))?;
-	fs::write(admin.join("commondir"), "../..\n")?;
-	fs::write(admin.join("HEAD"), format!("{head}\n"))?;
+	let written: Result<()> = (|| {
+		// Both before the worktree is listed: git's lock while it is created, and
+		// the setup mark.
+		fs::write(admin.join("locked"), "initializing\n")?;
+		if let Some(owner) = setup_owner {
+			fs::write(admin.join(SETUP_MARK), format!("{owner}\n"))?;
+		}
+		fs::write(path.join(".git"), format!("gitdir: {}\n", git_metadata_path(&admin)))?;
+		fs::write(admin.join("gitdir"), format!("{}\n", git_metadata_path(&path.join(".git"))))?;
+		fs::write(admin.join("commondir"), "../..\n")?;
+		fs::write(admin.join("HEAD"), format!("{head}\n"))?;
+		Ok(())
+	})();
+	if let Err(err) = written {
+		// A locked entry without its back-reference would never be pruned: remove
+		// it, as git does.
+		let _ = fs::remove_dir_all(&admin);
+		return Err(err);
+	}
 	Ok(admin)
 }
 
@@ -2572,6 +2662,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				setup_owner:  None,
 			})
 			.unwrap();
 		assert_eq!(fs::read_to_string(linked.join("a")).unwrap(), "main\r\n");
@@ -2822,6 +2913,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				setup_owner:  None,
 			})
 			.unwrap();
 		let common = fs::canonicalize(repo.info().common_dir.clone()).unwrap();
@@ -2852,6 +2944,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				setup_owner:  None,
 			})
 			.unwrap();
 
@@ -2896,6 +2989,7 @@ mod tests {
 				detach:       false,
 				clone:        WorktreeClone::Auto,
 				keep_changes: false,
+				setup_owner:  None,
 			})
 			.unwrap();
 
@@ -2965,6 +3059,7 @@ mod tests {
 				detach:       false,
 				clone:        WorktreeClone::Auto,
 				keep_changes: false,
+				setup_owner:  None,
 			})
 			.unwrap();
 		if clone_works {
@@ -3008,6 +3103,7 @@ mod tests {
 					detach: false,
 					clone,
 					keep_changes: true,
+					setup_owner: None,
 				})
 				.unwrap();
 			if clone == WorktreeClone::Off {
@@ -3035,7 +3131,7 @@ mod tests {
 			let rejected = repo.worktree_add(
 				&temp.path().join("../linked-keep-rejected"),
 				"HEAD~1",
-				WorktreeAddOptions { detach: true, clone, keep_changes: true },
+				WorktreeAddOptions { detach: true, clone, keep_changes: true, setup_owner: None },
 			);
 			assert!(rejected.is_err(), "keep_changes must require the source HEAD as target");
 			let _ = repo.worktree_remove(&linked, true);
@@ -3068,6 +3164,7 @@ mod tests {
 					detach: false,
 					clone,
 					keep_changes: true,
+					setup_owner: None,
 				})
 				.unwrap();
 			if clone == WorktreeClone::Off {
@@ -3096,6 +3193,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				setup_owner:  None,
 			})
 			.unwrap();
 		assert!(
@@ -3111,6 +3209,7 @@ mod tests {
 				detach:       true,
 				clone:        WorktreeClone::Off,
 				keep_changes: false,
+				setup_owner:  None,
 			})
 			.unwrap();
 		let common = fs::canonicalize(repo.info().common_dir.clone()).unwrap();
@@ -3126,5 +3225,123 @@ mod tests {
 		);
 		assert!(repo.worktree_prune().is_ok());
 		let _ = fs::remove_dir_all(linked);
+	}
+
+	fn setup_owner_of(repo: &GitRepo, path: &Path) -> Vec<Option<String>> {
+		let entries = repo.worktrees().unwrap();
+		entries
+			.into_iter()
+			.filter(|entry| entry.path == path)
+			.map(|entry| entry.setup_owner)
+			.collect()
+	}
+
+	fn add_detached(repo: &GitRepo, path: &Path, setup_owner: Option<&str>) {
+		repo
+			.worktree_add(path, "main", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Off,
+				keep_changes: false,
+				setup_owner:  setup_owner.map(str::to_owned),
+			})
+			.unwrap();
+	}
+
+	#[test]
+	fn setup_mark_outlives_git_lock_and_leaves_git_commands_alone() {
+		let (temp, repo) = fixture();
+		let linked = temp.path().join("../linked-setup-mark");
+		let _ = fs::remove_dir_all(&linked);
+		add_detached(&repo, &linked, Some("owner-1"));
+
+		// Created: git's `initializing` lock is lifted, as git lifts it before
+		// running hooks…
+		assert!(!git(temp.path(), &["worktree", "list", "--porcelain"]).contains("locked"));
+		// …while other processes still see the setup as unfinished.
+		assert_eq!(setup_owner_of(&repo, &linked), [Some("owner-1".to_owned())]);
+		// A hook can lock its new worktree, and ending the setup leaves that lock
+		// alone.
+		git(temp.path(), &["worktree", "lock", "--reason", "by-hook", linked.to_str().unwrap()]);
+		repo.worktree_end_setup(&linked).unwrap();
+		assert_eq!(setup_owner_of(&repo, &linked), [None]);
+		assert!(git(temp.path(), &["worktree", "list", "--porcelain"]).contains("locked by-hook"));
+		git(temp.path(), &["worktree", "unlock", linked.to_str().unwrap()]);
+		assert!(repo.worktree_remove(&linked, true).unwrap());
+	}
+
+	#[test]
+	fn ending_a_setup_finds_its_own_registration() {
+		let (temp, repo) = fixture();
+		// A stale registration of the same path: removed with `rm -rf`, never
+		// pruned.
+		let twin = temp.path().join("../linked-setup-twin");
+		let _ = fs::remove_dir_all(&twin);
+		git(temp.path(), &["worktree", "add", "-q", "--detach", twin.to_str().unwrap()]);
+		fs::remove_dir_all(&twin).unwrap();
+		add_detached(&repo, &twin, Some("owner-1"));
+		repo.worktree_end_setup(&twin).unwrap();
+		assert!(setup_owner_of(&repo, &twin).iter().all(Option::is_none));
+		assert!(repo.worktree_remove(&twin, true).unwrap());
+
+		// The hook deleted the checkout's `.git`: found through the registration
+		// instead.
+		let gone = temp.path().join("../linked-setup-gone");
+		let _ = fs::remove_dir_all(&gone);
+		add_detached(&repo, &gone, Some("owner-1"));
+		fs::remove_file(gone.join(".git")).unwrap();
+		repo.worktree_end_setup(&gone).unwrap();
+		assert_eq!(setup_owner_of(&repo, &gone), [None]);
+		fs::remove_dir_all(&gone).unwrap();
+		repo.worktree_prune().unwrap();
+		assert!(setup_owner_of(&repo, &gone).is_empty());
+	}
+
+	#[test]
+	fn prune_keeps_worktrees_git_locked() {
+		let (temp, repo) = fixture();
+		let offline = temp.path().join("../linked-prune-offline");
+		let stale = temp.path().join("../linked-prune-stale");
+		for dir in [&offline, &stale] {
+			let _ = fs::remove_dir_all(dir);
+			add_detached(&repo, dir, None);
+		}
+		// Locked while its volume is offline: git keeps its registration.
+		git(temp.path(), &["worktree", "lock", "--reason", "offline", offline.to_str().unwrap()]);
+		fs::remove_dir_all(&offline).unwrap();
+		fs::remove_dir_all(&stale).unwrap();
+		repo.worktree_prune().unwrap();
+		assert_eq!(setup_owner_of(&repo, &offline).len(), 1);
+		assert!(setup_owner_of(&repo, &stale).is_empty());
+		git(temp.path(), &["worktree", "unlock", offline.to_str().unwrap()]);
+		repo.worktree_prune().unwrap();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn failed_registration_leaves_no_entry_behind() {
+		use std::os::unix::fs::PermissionsExt;
+		let (temp, repo) = fixture();
+		let target = temp.path().join("../linked-read-only");
+		let _ = fs::remove_dir_all(&target);
+		fs::create_dir(&target).unwrap();
+		fs::set_permissions(&target, fs::Permissions::from_mode(0o555)).unwrap();
+		// Root writes anyway, so there would be no failure to observe.
+		if fs::write(target.join("probe"), "").is_ok() {
+			let _ = fs::remove_dir_all(&target);
+			return;
+		}
+		let added = repo.worktree_add(&target, "main", WorktreeAddOptions {
+			detach:       true,
+			clone:        WorktreeClone::Off,
+			keep_changes: false,
+			setup_owner:  Some("owner-1".to_owned()),
+		});
+		fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+		let _ = fs::remove_dir_all(&target);
+
+		assert!(added.is_err());
+		// A locked leftover would be listed by nothing and pruned by nothing.
+		let admins = fs::read_dir(repo.info().common_dir.join("worktrees"));
+		assert!(admins.map_or(true, |mut admins| admins.next().is_none()));
 	}
 }

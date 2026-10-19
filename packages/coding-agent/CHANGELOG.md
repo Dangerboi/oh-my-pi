@@ -7,6 +7,8 @@
 - `/wt` (including the worktree `worktree.onStart` creates) and `github` `pr_checkout` now run the new worktree's `post-checkout` hook, like `git worktree add`; Esc cancels a hanging one in `/wt`, a hook that fails or can't run shows a warning, and a failed one also keeps `worktree.cleanSource` from cleaning the source checkout ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - `omp worktree add` now warns when the `post-checkout` hook exists but didn't run, and shows at most the last 64 KiB of the hook's output ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Git hooks in a `core.hooksPath` written with `~/` are now found for commits and the bash `git worktree add` rewrite, as git finds them ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- `github` `pr_checkout` no longer takes over a PR worktree another omp process is still setting up, so a failed setup there can't delete its work ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- `omp worktree clear` no longer drops the registration of a worktree git has locked, e.g. one on an offline drive ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ## [18.12.2] - 2026-10-18
 

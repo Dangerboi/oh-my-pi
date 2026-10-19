@@ -448,6 +448,17 @@ export async function checkoutPullRequest(
 			const repository = vcs.requireGit(repoRoot);
 			const existingWorktrees = await repository.worktrees(signal);
 			const existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
+			const setupOwner = existingWorktree?.setupOwner;
+			if (existingWorktree && setupOwner) {
+				// Another omp process is still creating it or running its hook, and discards it if that fails.
+				if (vcs.isWorktreeSetupOwnerAlive(setupOwner)) {
+					throw new ToolError(
+						`the worktree of ${localBranch} at ${existingWorktree.path} is still being set up by another omp process; retry once it is done (if none is, delete \`omp-setup\` in its git dir: \`git -C ${existingWorktree.path} rev-parse --git-dir\`)`,
+					);
+				}
+				// That omp exited mid-setup: the worktree is taken over as it is, as before setups were marked.
+				await repository.worktreeEndSetup(existingWorktree.path, signal);
+			}
 
 			const remote = await ensurePrRemoteWithRepo(repoRoot, data, repository, signal);
 			await repository.fetch(

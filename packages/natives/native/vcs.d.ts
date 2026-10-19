@@ -84,6 +84,16 @@ export declare function detachGitDir(
 /** Preserve isolation-local Git objects in the source without changing its refs or index. */
 export declare function copyGitObjects(isolationRoot: string, sourceRoot: string): Promise<void>;
 
+/** This process as the owner of a worktree setup: `setupOwner` for `worktreeAdd`. */
+export declare function worktreeSetupOwner(): string;
+
+/**
+ * Whether the owner of an unfinished worktree setup (`setupOwner` of a listed worktree) may still
+ * be running it: its process exists, or it is in another pid scope (host or container), which
+ * this process can't judge.
+ */
+export declare function isWorktreeSetupOwnerAlive(owner: string): boolean;
+
 /** A `post-checkout` hook that exists but did not run, and why. */
 export interface SkippedPostCheckoutHook {
 	path: string;

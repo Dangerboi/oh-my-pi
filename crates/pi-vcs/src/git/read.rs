@@ -10,6 +10,7 @@ use gix::bstr::ByteSlice;
 use super::{
 	GitRepo,
 	open::{load_index_or_empty, status_with_fresh_index},
+	read_setup_mark,
 };
 use crate::{
 	error::{Error, Result},
@@ -494,11 +495,14 @@ impl GitRepo {
 	/// List the primary and linked worktrees.
 	pub fn worktrees(&self) -> Result<Vec<WorktreeEntry>> {
 		if self.is_reftable() {
-			return Ok(parse_worktree_cli(&cli_text(self.root(), &[
-				"worktree",
-				"list",
-				"--porcelain",
-			])?));
+			let mut entries =
+				parse_worktree_cli(&cli_text(self.root(), &["worktree", "list", "--porcelain"])?);
+			for entry in &mut entries {
+				entry.setup_owner = self
+					.worktree_admin(&entry.path)?
+					.and_then(|admin| read_setup_mark(&admin));
+			}
+			return Ok(entries);
 		}
 		let primary_root = self
 			.info()
@@ -515,7 +519,7 @@ impl GitRepo {
 			.to_owned();
 		let primary_head =
 			parse_head_with_refs(&self.info().common_dir.join("HEAD"), &self.info().common_dir)?;
-		let mut out = vec![entry_from_head(primary_root, &primary_head)];
+		let mut out = vec![entry_from_head(primary_root, &primary_head, None)];
 		let admin_root = self.info().common_dir.join("worktrees");
 		let Ok(admins) = std::fs::read_dir(admin_root) else {
 			return Ok(out);
@@ -532,7 +536,7 @@ impl GitRepo {
 				continue;
 			};
 			let head = parse_head_with_refs(&dir.join("HEAD"), &self.info().common_dir)?;
-			out.push(entry_from_head(root, &head));
+			out.push(entry_from_head(root, &head, read_setup_mark(&dir)));
 		}
 		Ok(out)
 	}
@@ -1200,7 +1204,7 @@ fn version_key(value: &str) -> Vec<(bool, String)> {
 		.collect()
 }
 
-fn entry_from_head(path: PathBuf, head: &HeadState) -> WorktreeEntry {
+fn entry_from_head(path: PathBuf, head: &HeadState, setup_owner: Option<String>) -> WorktreeEntry {
 	WorktreeEntry {
 		path,
 		head: head.commit().map(str::to_owned),
@@ -1209,6 +1213,7 @@ fn entry_from_head(path: PathBuf, head: &HeadState) -> WorktreeEntry {
 			HeadState::Detached { .. } => None,
 		},
 		detached: matches!(head, HeadState::Detached { .. }),
+		setup_owner,
 	}
 }
 fn parse_head_with_refs(head_path: &Path, common_dir: &Path) -> Result<HeadState> {
@@ -1253,7 +1258,7 @@ fn parse_worktree_cli(raw: &str) -> Vec<WorktreeEntry> {
 			}
 		}
 		if let Some(path) = path {
-			out.push(WorktreeEntry { path, head, branch, detached });
+			out.push(WorktreeEntry { path, head, branch, detached, setup_owner: None });
 		}
 	}
 	out

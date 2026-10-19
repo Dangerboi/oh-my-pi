@@ -90,11 +90,13 @@ export function resolveWorktreePath(worktreePath: string, signal?: AbortSignal):
 
 /**
  * Add a linked worktree of `branch` at the unused `worktreePath`, then run its `post-checkout`
- * hook. If the hook stage fails or `signal` aborts, up to resolving the worktree's path, the
- * worktree is discarded and `branch` put back where the checkout left it, so a retry starts over
- * instead of reusing a half-set-up checkout or finding the branch diverged. The discard itself
- * takes no signal and runs to completion. A failed `worktreeAdd` discards nothing: another
- * process may own the path by then.
+ * hook. Until the hook is done the worktree carries this process's setup mark, so another omp
+ * process does not take it over (`pr_checkout` would reuse it); git commands, the hook's
+ * included, see it as `git worktree add` leaves it. If the hook stage fails or `signal` aborts,
+ * up to resolving the worktree's path, the worktree is discarded and `branch` put back where the
+ * checkout left it, so a retry starts over instead of reusing a half-set-up checkout or finding
+ * the branch diverged. The discard itself takes no signal and runs to completion. A failed
+ * `worktreeAdd` discards nothing: another process may own the path by then.
  */
 export async function addWorktreeWithHook(
 	repository: VcsGitRepo,
@@ -106,7 +108,10 @@ export async function addWorktreeWithHook(
 	signal?.throwIfAborted();
 	// No signal: the native checkout runs to completion regardless, and an abort-rejected call would
 	// not say whether this attempt created the worktree.
-	const added = await repository.worktreeAdd(worktreePath, branch, options);
+	const added = await repository.worktreeAdd(worktreePath, branch, {
+		...options,
+		setupOwner: vcs.worktreeSetupOwner(),
+	});
 	let head: string | null | undefined;
 	try {
 		signal?.throwIfAborted();
@@ -115,6 +120,10 @@ export async function addWorktreeWithHook(
 		// The abort may also have landed as the hook finished: either way, or with a stalled `worktree.base`,
 		// the caller must not move into the worktree, so it is discarded below.
 		const resolved = await resolveWorktreePath(worktreePath, signal);
+		await repository.worktreeEndSetup(worktreePath).catch(error => {
+			// Set up all the same; other omp processes only wait for it until this one exits.
+			logger.warn("could not mark a new worktree as set up", { path: worktreePath, error: String(error) });
+		});
 		return { added, path: resolved, hook };
 	} catch (error) {
 		await discardNewWorktree(repository, worktreePath);
@@ -124,21 +133,30 @@ export async function addWorktreeWithHook(
 }
 
 /**
- * Remove a worktree this attempt's own `worktreeAdd` created. When it is no longer discoverable
- * (its `.git` file is gone), deletes the directory and prunes the registration that now points
- * nowhere. Takes no signal, as the caller's may already be aborted; failures are logged, not
- * thrown, so the original error reaches the caller.
+ * Remove a worktree this attempt's own `worktreeAdd` created, or, when it is no longer
+ * discoverable (its `.git` file is gone), delete its directory. Either way its registration then
+ * loses the setup mark and, pointing nowhere, is pruned. Takes no signal, as the caller's may
+ * already be aborted; failures are logged, not thrown, so the original error reaches the caller.
  */
 async function discardNewWorktree(repository: VcsGitRepo, worktreePath: string): Promise<void> {
-	try {
-		if (await repository.worktreeRemove(worktreePath, true)) return;
-		await fs.rm(worktreePath, { recursive: true, force: true });
-		await repository.worktreePrune();
-	} catch (error) {
+	const warn = (error: unknown) =>
 		logger.warn("could not remove a worktree whose setup was cut short", {
 			path: worktreePath,
 			error: String(error),
 		});
+	try {
+		if (!(await repository.worktreeRemove(worktreePath, true))) {
+			await fs.rm(worktreePath, { recursive: true, force: true });
+		}
+	} catch (error) {
+		warn(error);
+	}
+	// Also after a removal: with the `.git` gone, it may have been another checkout around it that was found.
+	try {
+		await repository.worktreeEndSetup(worktreePath);
+		await repository.worktreePrune();
+	} catch (error) {
+		warn(error);
 	}
 }
 
