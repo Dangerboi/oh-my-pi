@@ -15,7 +15,8 @@ use super::{
 	input::{Parsed, Patch, PatchSection},
 	messages::{
 		HEADTAIL_DRIFT_WARNING, RevealedLine, UnseenLinesReveal, missing_snapshot_tag_message,
-		path_recovered_from_tag_message, unseen_lines_message, wide_unseen_lines_message,
+		path_recovered_from_tag_message, unseen_lines_message, unverified_wide_lines_message,
+		wide_unseen_lines_message,
 	},
 	mismatch::{MismatchDetails, mismatch_error},
 	parser::{ParseFailure, parse_patch},
@@ -346,15 +347,48 @@ fn rescue_shifted_anchors(
 	Ok(rescued)
 }
 
+/// Anchors on lines longer than `max_columns` bytes, which some display path
+/// may have cut, so the model may never have seen them whole.
+fn possibly_cut_anchors(
+	section: &PatchSection,
+	text: &str,
+	max_columns: usize,
+) -> Result<Vec<u32>, EditError> {
+	if max_columns == 0 {
+		return Ok(Vec::new());
+	}
+	let mut anchors = section.collect_anchor_lines()?.into_iter().peekable();
+	let mut wide = Vec::new();
+	for (number, line) in (1u32..).zip(text.split('\n')) {
+		while anchors.next_if(|&anchor| anchor < number).is_some() {}
+		if anchors.peek().is_none() {
+			break;
+		}
+		if anchors.next_if_eq(&number).is_some() && line.len() > max_columns {
+			wide.push(number);
+		}
+	}
+	Ok(wide)
+}
+
 fn assert_seen_lines(
 	section: &PatchSection,
 	expected: &str,
 	canonical: &Path,
 	store: &EditStore,
 	text: &str,
+	max_columns: usize,
 ) -> Result<(), EditError> {
 	let Some(snapshot) = store.by_content(canonical, text) else {
-		return Ok(());
+		// No retained read (restart, store eviction): the tag still matches the
+		// file, but which rows were displayed whole is unknown. Lines within
+		// every display cap were shown whole wherever they were shown; a longer
+		// one may have been cut, and replacing it from a cut view drops its tail.
+		let wide = possibly_cut_anchors(section, text, max_columns)?;
+		if wide.is_empty() {
+			return Ok(());
+		}
+		return Err(EditError::matched(unverified_wide_lines_message(section.path.as_str(), &wide)));
 	};
 	let Some(seen) = snapshot.seen_lines else {
 		return Ok(());
@@ -422,6 +456,8 @@ fn assert_seen_lines(
 	)))
 }
 
+/// `seen_line_guard` enables the displayed-line guard with its column cap
+/// (see [`crate::session::SessionConfig::max_columns`]); `None` disables it.
 pub(crate) fn apply_with_recovery(
 	section: &PatchSection,
 	canonical: &Path,
@@ -429,7 +465,7 @@ pub(crate) fn apply_with_recovery(
 	edits: &[Edit],
 	clipboard: &mut Clipboard,
 	store: &EditStore,
-	enforce_seen_lines: bool,
+	seen_line_guard: Option<usize>,
 ) -> Result<ApplyResult, EditError> {
 	let expected = section.file_hash.as_deref().unwrap_or_default();
 	let live_matches = file_hash(normalized).eq_ignore_ascii_case(expected);
@@ -457,8 +493,8 @@ pub(crate) fn apply_with_recovery(
 	};
 	validate_clipboard_sequence(&resolved, clipboard)?;
 	if live_matches {
-		if enforce_seen_lines {
-			assert_seen_lines(section, expected, canonical, store, normalized)?;
+		if let Some(max_columns) = seen_line_guard {
+			assert_seen_lines(section, expected, canonical, store, normalized, max_columns)?;
 		}
 		let mut result = apply_edits(normalized, &resolved, ApplyOptions {
 			clipboard:      Some(clipboard),
@@ -593,6 +629,7 @@ pub fn stage_patch(
 	patch: &Patch,
 	raw_input: &str,
 	enforce_seen_lines: bool,
+	max_columns: usize,
 	files: &mut dyn FileSource,
 	store: &EditStore,
 ) -> Result<Vec<StagedFile>, EditError> {
@@ -667,7 +704,7 @@ pub fn stage_patch(
 			edits,
 			&mut clipboard,
 			store,
-			enforce_seen_lines,
+			enforce_seen_lines.then_some(max_columns),
 		)?;
 		let mut warnings = parsed.warnings.clone();
 		if section.path != original.path {
@@ -801,6 +838,9 @@ mod lifecycle {
 		store::EditStore,
 	};
 
+	/// The host's default: grep's 512-byte cap, under read's 768 columns.
+	const MAX_COLUMNS: usize = 512;
+
 	struct DiskWriter;
 
 	#[async_trait]
@@ -868,6 +908,12 @@ mod lifecycle {
 			self.store.head(&self.canonical(file)).unwrap().hash
 		}
 
+		/// A resumed process: the on-disk tag still matches, read provenance is
+		/// gone.
+		fn forget_reads(&mut self) {
+			self.store = EditStore::new();
+		}
+
 		async fn edit(&self, patch: &str) -> Result<(), String> {
 			let mut session = Session::new(
 				SessionConfig {
@@ -876,6 +922,7 @@ mod lifecycle {
 					allow_fuzzy:        false,
 					fuzzy_threshold:    0.0,
 					enforce_seen_lines: true,
+					max_columns:        MAX_COLUMNS,
 					raw_input:          true,
 				},
 				self.store.clone(),
@@ -1138,5 +1185,47 @@ mod lifecycle {
 			.await
 			.unwrap();
 		assert_eq!(ctx.text("wide.txt"), full);
+	}
+
+	/// After a restart, a replace of a line wider than the display cap may come
+	/// from a cut view: it rejects until a full read records the line.
+	#[tokio::test]
+	async fn resumed_wide_anchor_requires_full_read() {
+		let mut ctx = Lifecycle::new("resumed.txt", 1);
+		let wide = format!("note: {} END-OF-LINE-TAIL", "abcdefghij".repeat(80));
+		let original = format!("first\n{wide}\n");
+		ctx.write_text("resumed.txt", &original);
+		let tag = ctx.read("resumed.txt", &[1]);
+		ctx.forget_reads();
+		let err = ctx
+			.edit(&format!("[resumed.txt#{tag}]\nPUT 2.=2:\n+NOTE: {}\n", &wide[6..MAX_COLUMNS]))
+			.await
+			.unwrap_err();
+		assert!(err.contains("resumed.txt:2:raw"), "unexpected error: {err}");
+		assert_eq!(ctx.text("resumed.txt"), original);
+
+		ctx.read("resumed.txt", &[2]);
+		ctx.edit(&format!(
+			"[resumed.txt#{tag}]\nPUT 2.=2:\n+{}\n",
+			wide.replacen("note:", "NOTE:", 1)
+		))
+		.await
+		.unwrap();
+		assert_eq!(ctx.text("resumed.txt"), original.replacen("note:", "NOTE:", 1));
+	}
+
+	/// Lines within the display cap were shown whole wherever they were shown,
+	/// so a resumed edit anchored on them applies even beside a wide line.
+	#[tokio::test]
+	async fn resumed_short_anchor_applies() {
+		let mut ctx = Lifecycle::new("short.txt", 1);
+		let wide = "x".repeat(MAX_COLUMNS + 1);
+		ctx.write_text("short.txt", &format!("first\n{wide}\nlast\n"));
+		let tag = ctx.read("short.txt", &[1, 3]);
+		ctx.forget_reads();
+		ctx.edit(&format!("[short.txt#{tag}]\nPUT 3.=3:\n+LAST\nPUT <1:\n+head\n"))
+			.await
+			.unwrap();
+		assert_eq!(ctx.text("short.txt"), format!("head\nfirst\n{wide}\nLAST\n"));
 	}
 }
