@@ -419,47 +419,18 @@ async function postCheckoutHookPath(captureDir, worktreeRoot, gitOptions) {
 	return path.resolve(worktreeRoot, reported);
 }
 
-/**
- * The hook file git would run for `foundAt`, with its stat: `null` when missing, the error when it
- * can't be checked. Only a missing path means no hook (EACCES, EIO are reported, not mistaken for
- * one). On Windows, as in Git for Windows' `find_hook`, the name with `.exe` appended counts too.
- */
-async function hookFile(foundAt, signal) {
-	const missing = error => error?.code === "ENOENT" || error?.code === "ENOTDIR";
-	const statHook = file =>
-		untilAborted(
-			fs.promises.stat(file).catch(error => (missing(error) ? null : error)),
-			signal,
-		);
-	const stat = await statHook(foundAt);
-	if (process.platform === "win32" && stat === null) {
-		const exeStat = await statHook(`${foundAt}.exe`);
-		if (exeStat !== null) return { hookPath: `${foundAt}.exe`, stat: exeStat };
-	}
-	return { hookPath: foundAt, stat };
-}
+/** Remove a capture directory. Failures leave it behind (a lingering child may hold its files open on Windows): a TMPDIR one is swept once this omp is gone, one in the worktree's git directory goes with the worktree. */
+const removeCapture = dir => fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
 
-/**
- * Why the hook file at `foundAt` would not run, as the finished result: `skip` is unset when git would run it.
- * `hookPath` is the path checked.
- */
-async function checkHookFile(foundAt, signal) {
-	const notRun = { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
-	const { hookPath, stat } = await hookFile(foundAt, signal);
-	if (stat instanceof Error) return { hookPath, skip: { ...notRun, skipped: { path: hookPath, reason: "inaccessible" } } };
-	// Anything else there, even a directory, isn't missing: git tries to run it and reports the failure.
-	if (stat === null) return { hookPath, skip: notRun };
-	// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
-	if (process.platform !== "win32") {
-		const access = fs.promises.access(hookPath, fs.constants.X_OK).then(
-			() => true,
-			() => false,
-		);
-		if (!(await untilAborted(access, signal))) {
-			return { hookPath, skip: { ...notRun, skipped: { path: hookPath, reason: "not-executable" } } };
-		}
+/** `mkdtemp(prefix)` raced against the abort; one created after the abort is removed once it exists. */
+async function makeCaptureDir(prefix, signal) {
+	const creating = fs.promises.mkdtemp(prefix);
+	try {
+		return await untilAborted(creating, signal);
+	} catch (error) {
+		creating.then(removeCapture, () => {});
+		throw error;
 	}
-	return { hookPath };
 }
 
 /**
@@ -470,48 +441,65 @@ async function checkHookFile(foundAt, signal) {
  * hook left a background process running, with the last 64 KiB of each output
  * stream; `skipped` says why an existing hook did not run. Aborting
  * `options.signal` kills the hook's process tree and rejects with the reason, also while a
- * lookup, a file check or a read is stalled (starting git still happens on this thread). When no
- * directory for the output can be created, the hook the in-process lookup finds is not run and is
- * reported as skipped `no-capture`, after the same checks; the creation error is rethrown only if that lookup fails.
+ * lookup, a file check or a read is stalled (starting git still happens on this thread). The output
+ * goes to files under TMPDIR, or, when none can be created there, under the worktree's git directory.
  */
 export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	const { signal, env, detached } = options;
 	signal?.throwIfAborted();
 	const notRun = { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+	const posix = process.platform !== "win32";
 	// Awaited, raced against the abort: a stalled TMPDIR holds the run up until then, as `mkdtemp` would.
 	await untilAborted(sweepStaleHookCaptures(), signal);
 	// Files, not pipes: a background process git or the hook starts inherits them, and pipes would stay open until it exits.
-	const removeCapture = dir => fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
-	// Host and pid let a later run tell this directory from one whose omp process is gone.
-	const creating = fs.promises.mkdtemp(
-		path.join(os.tmpdir(), `${HOOK_CAPTURE_PREFIX}${PID_SCOPE}-${process.pid}-`),
-	);
 	let dir;
 	try {
-		dir = await untilAborted(creating, signal);
+		// Host and pid let a later run tell this directory from one whose omp process is gone.
+		dir = await makeCaptureDir(path.join(os.tmpdir(), `${HOOK_CAPTURE_PREFIX}${PID_SCOPE}-${process.pid}-`), signal);
 	} catch (error) {
-		// Aborted while a stalled TMPDIR was still creating it: remove it once it exists.
-		creating.then(removeCapture, () => {});
 		if (signal?.aborted) throw error;
-		// No capture directory (TMPDIR missing, read-only or full): the in-process lookup decides, as without a git,
-		// and a hook that would run is reported skipped. A failed lookup names no path, so the mkdtemp error stands.
-		let location;
+		// TMPDIR missing, read-only or full: the new worktree's git directory, just written, holds the output instead, so
+		// the git on PATH still locates and runs the hook. Removed with the worktree should this process die first.
 		try {
-			location = await untilAborted(api().vcsGitHookLocation(worktreeRoot, "post-checkout", signal), signal);
-		} catch (lookupError) {
-			if (signal?.aborted) throw lookupError;
+			const gitDir = (await discoverGit(worktreeRoot, signal))?.info().gitDir;
+			if (!gitDir) throw error;
+			dir = await makeCaptureDir(path.join(gitDir, HOOK_CAPTURE_PREFIX), signal);
+		} catch (fallbackError) {
+			if (signal?.aborted) throw fallbackError;
 			throw error;
 		}
-		if (!location) return notRun;
-		const { hookPath, skip } = await checkHookFile(location, signal);
-		return skip ?? { ...notRun, skipped: { path: hookPath, reason: "no-capture" } };
 	}
 	const gitOptions = { env, signal, detached };
 	try {
 		const foundAt = await postCheckoutHookPath(dir, worktreeRoot, gitOptions);
 		if (!foundAt) return notRun;
-		const { hookPath, skip } = await checkHookFile(foundAt, signal);
-		if (skip) return skip;
+		// Only a missing path means no hook; any other failure (EACCES, EIO) is reported, not mistaken for one.
+		const missing = error => error?.code === "ENOENT" || error?.code === "ENOTDIR";
+		const statHook = file =>
+			untilAborted(
+				fs.promises.stat(file).catch(error => (missing(error) ? null : error)),
+				signal,
+			);
+		let hookPath = foundAt;
+		let stat = await statHook(hookPath);
+		// Git for Windows' `find_hook` also takes the name with `.exe` appended.
+		if (!posix && stat === null) {
+			const exeStat = await statHook(`${foundAt}.exe`);
+			if (exeStat !== null) [hookPath, stat] = [`${foundAt}.exe`, exeStat];
+		}
+		if (stat instanceof Error) return { ...notRun, skipped: { path: hookPath, reason: "inaccessible" } };
+		// Anything else there, even a directory, isn't missing: git tries to run it and reports the failure.
+		if (stat === null) return notRun;
+		// Git's own `access(X_OK)` check; Git for Windows ignores the bit.
+		if (posix) {
+			const access = fs.promises.access(hookPath, fs.constants.X_OK).then(
+				() => true,
+				() => false,
+			);
+			if (!(await untilAborted(access, signal))) {
+				return { ...notRun, skipped: { path: hookPath, reason: "not-executable" } };
+			}
+		}
 		const reason = await hookRunnerProblem(dir, worktreeRoot, gitOptions);
 		if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
 		const outPath = path.join(dir, "stdout");
@@ -529,7 +517,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		const [stdout, stderr] = await Promise.all([tail(outPath), tail(errPath)]);
 		return { exitCode, stdout, stderr };
 	} finally {
-		// Not awaited: a stalled TMPDIR must not hold up the result or an abort. A lingering child may still hold the files open on Windows; leave them for the OS then.
+		// Not awaited: a stalled filesystem must not hold up the result or an abort.
 		void removeCapture(dir);
 	}
 }

@@ -602,6 +602,9 @@ impl GitRepo {
 		ref_name: &str,
 		options: WorktreeAddOptions,
 	) -> Result<WorktreeAddResult> {
+		// Another omp process adding the same path at once would otherwise
+		// register into the same directory.
+		let _add_lock = lock_worktree_adds(&self.info().common_dir)?;
 		let repo = self.gix()?;
 		let id = resolve_commit(&repo, ref_name)?;
 		if path.exists() && fs::read_dir(path)?.next().is_some() {
@@ -665,7 +668,7 @@ impl GitRepo {
 			for kind in pi_iso::clone_candidates(preferred) {
 				match self.worktree_add_cloned(path, id, &head, kind, options.keep_changes, owner) {
 					Ok(admin) => {
-						unlock_admin(&admin)?;
+						finish_worktree_add(path, &self.info().common_dir, &admin)?;
 						return Ok(WorktreeAddResult { cloned_with: Some(kind), clone_error });
 					},
 					Err(err) => {
@@ -696,7 +699,7 @@ impl GitRepo {
 		}
 		// Created: lifted as git lifts it, before any hook runs. A setup mark
 		// stays.
-		unlock_admin(&admin)?;
+		finish_worktree_add(path, &self.info().common_dir, &admin)?;
 		Ok(WorktreeAddResult { cloned_with: None, clone_error })
 	}
 
@@ -1928,6 +1931,35 @@ fn register_worktree(
 		return Err(err);
 	}
 	Ok(admin)
+}
+
+/// Lift git's creation lock as git does, before any hook runs. If that fails,
+/// roll the add back: a live setup mark on a worktree reported as failed would
+/// make other processes refuse it for as long as this one lives.
+fn finish_worktree_add(path: &Path, common: &Path, admin: &Path) -> Result<()> {
+	unlock_admin(admin).inspect_err(|_| {
+		// Removed first: with the mark gone and the entry still listed, another
+		// process could take over a checkout being deleted.
+		cleanup_worktree_add(path, common);
+		let _ = end_setup_admin(admin);
+	})
+}
+
+fn lock_worktree_adds(common: &Path) -> Result<fs::File> {
+	let file = fs::OpenOptions::new()
+		.create(true)
+		.write(true)
+		.truncate(false)
+		.open(common.join("omp-worktree-add.lock"))?;
+	match file.lock() {
+		// Without lock support (e.g. NFSv3 without lockd), add unserialized, as
+		// before.
+		Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {},
+		#[cfg(unix)]
+		Err(err) if err.raw_os_error() == Some(libc::ENOLCK) => {},
+		locked => locked?,
+	}
+	Ok(file)
 }
 
 fn cleanup_worktree_add(path: &Path, common: &Path) {
@@ -3358,5 +3390,63 @@ mod tests {
 		// A locked leftover would be listed by nothing and pruned by nothing.
 		let admins = fs::read_dir(repo.info().common_dir.join("worktrees"));
 		assert!(admins.map_or(true, |mut admins| admins.next().is_none()));
+	}
+
+	#[test]
+	fn two_adds_of_one_path_at_once_never_share_a_checkout() {
+		let (temp, repo) = fixture();
+		let root = temp.path().to_path_buf();
+		for round in 0..10 {
+			let target = root.join(format!("../linked-race-{round}"));
+			let _ = fs::remove_dir_all(&target);
+			let barrier = std::sync::Barrier::new(2);
+			let results: Vec<std::result::Result<(), String>> = std::thread::scope(|scope| {
+				let racers: Vec<_> = (0..2)
+					.map(|_| {
+						scope.spawn(|| {
+							let own = GitRepo::require(&root).unwrap();
+							barrier.wait();
+							own.worktree_add(&target, "main", WorktreeAddOptions {
+								detach:       true,
+								clone:        WorktreeClone::Off,
+								keep_changes: false,
+								setup_owner:  None,
+							})
+							.map(|_| ())
+							.map_err(|err| err.to_string())
+						})
+					})
+					.collect();
+				racers
+					.into_iter()
+					.map(|racer| racer.join().unwrap())
+					.collect()
+			});
+			let failures: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+			assert_eq!(failures.len(), 1, "round {round}: exactly one add must win: {results:?}");
+			assert!(failures[0].contains("not empty"), "round {round}: {}", failures[0]);
+			assert_eq!(setup_owner_of(&repo, &target).len(), 1, "round {round}");
+			let _ = repo.worktree_remove(&target, true);
+			let _ = fs::remove_dir_all(&target);
+		}
+	}
+
+	#[test]
+	fn a_worktree_whose_creation_lock_cannot_be_lifted_is_rolled_back_not_left_owned() {
+		let (temp, repo) = fixture();
+		let linked = temp.path().join("../linked-stuck-lock");
+		let _ = fs::remove_dir_all(&linked);
+		add_detached(&repo, &linked, Some("owner-1"));
+		let admin = repo.worktree_admin(&linked).unwrap().unwrap();
+		// A non-empty directory cannot be removed as a file.
+		fs::create_dir(admin.join("locked")).unwrap();
+		fs::write(admin.join("locked").join("stuck"), "").unwrap();
+
+		let common = repo.info().common_dir.clone();
+		assert!(finish_worktree_add(&linked, &common, &admin).is_err());
+
+		assert!(!linked.exists());
+		assert!(setup_owner_of(&repo, &linked).is_empty());
+		assert!(!admin.join(SETUP_MARK).exists());
 	}
 }

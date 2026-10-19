@@ -104,8 +104,8 @@ export declare function isWorktreeSetupOwnerAlive(owner: string): boolean;
 /** A `post-checkout` hook that exists but did not run, and why. */
 export interface SkippedPostCheckoutHook {
 	path: string;
-	/** `no-git`: no git starts, or `git version` fails. `old-git`: older than 2.36, without `git hook run`. `inaccessible`: checking the hook file failed other than with ENOENT/ENOTDIR. `no-capture`: no directory for the hook's output could be created in TMPDIR. */
-	reason: "not-executable" | "no-git" | "old-git" | "inaccessible" | "no-capture";
+	/** `no-git`: no git starts, or `git version` fails. `old-git`: older than 2.36, without `git hook run`. `inaccessible`: checking the hook file failed other than with ENOENT/ENOTDIR. */
+	reason: "not-executable" | "no-git" | "old-git" | "inaccessible";
 }
 
 /**
@@ -120,10 +120,8 @@ export interface SkippedPostCheckoutHook {
  * once `git hook run` exits, even if the hook left a background process running. `skipped` is
  * set when the hook exists but did not run: not executable (POSIX only), no working git on
  * PATH, a git older than 2.36, or a hook file that can't be checked. Its output is captured
- * in files under TMPDIR; when none can be created there (missing, read-only, full), the hook
- * the in-process lookup finds is reported as skipped `no-capture`, not run, after the usual
- * existence and executable checks (no hook found: not run, no `skipped`).
- * `env` replaces the
+ * in files under TMPDIR or, when none can be created there (missing, read-only, full), under
+ * the worktree's git directory; only when neither works does it reject. `env` replaces the
  * inherited environment; pass one without ambient `GIT_DIR`-family variables. `detached`
  * (POSIX) runs the hook, and the git calls that locate it, in their own session, without the
  * caller's controlling terminal, so a prompt on /dev/tty fails instead of writing into a TUI.

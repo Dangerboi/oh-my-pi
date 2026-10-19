@@ -532,6 +532,28 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			},
 		);
 
+		it("an abort while the new worktree's setup mark is being removed comes too late: /wt keeps the finished worktree", async () => {
+			await hook("touch .post-checkout-ran");
+			const repoProto = Object.getPrototypeOf(vcs.requireGit(repo));
+			const worktreeEndSetup = repoProto.worktreeEndSetup;
+			const controller = new AbortController();
+			// Once the mark is gone another omp process may reuse the worktree, so discarding it then could delete its work.
+			const endSetup = spyOn(repoProto, "worktreeEndSetup").mockImplementation(function (
+				this: unknown,
+				...args: unknown[]
+			) {
+				controller.abort();
+				return worktreeEndSetup.apply(this, args);
+			});
+			const wt = await createSessionWorktree(repo, Settings.isolated(), branch, {
+				signal: controller.signal,
+			}).finally(() => endSetup.mockRestore());
+
+			expect(worktreePaths(repo)).toContain(wt.path);
+			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
+			expect(branchSha(repo, branch)).not.toBeNull();
+		});
+
 		it("reports a hook as not run when the git on PATH cannot start", async () => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");
@@ -608,25 +630,6 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(branchSha(repo, branch)).toBeNull();
 		});
 
-		it.each([
-			["without a hook", undefined],
-			["without running a hook, which is reported", "touch .post-checkout-ran"],
-		])("/wt goes through %s when no capture directory can be created", async (_name, script) => {
-			// A hooks directory holding at most this hook, so no global hook counts either.
-			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
-			if (script) await hook(script);
-			const tmpdir = spyOn(os, "tmpdir").mockReturnValue(path.join(root, "no-such-tmp"));
-			try {
-				const wt = await create();
-				expect(await exists(path.join(wt.path, ".git"))).toBe(true);
-				expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
-				if (script) expect(wt.hook?.skipped).toContain("TMPDIR");
-				else expect(wt.hook?.skipped).toBeUndefined();
-			} finally {
-				tmpdir.mockRestore();
-			}
-		});
-
 		it("leaves alone a worktree another process created at the chosen path first", async () => {
 			git(repo, "config", "core.hooksPath", path.join(repo, ".git", "hooks"));
 			const repoProto = Object.getPrototypeOf(vcs.requireGit(repo));
@@ -649,7 +652,10 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(branchSha(repo, branch)).toBeNull();
 		});
 
-		it("lets the git on PATH locate the hook, including config only it knows about", async () => {
+		it.each([
+			["", false],
+			[", also when TMPDIR can't hold its output", true],
+		])("lets the git on PATH locate the hook, including config only it knows about%s", async (_name, noTmp) => {
 			const wt = await create();
 			const injected = path.join(root, "wrapper-hooks");
 			await Bun.write(path.join(injected, "post-checkout"), "#!/bin/sh\ntouch .post-checkout-ran\n");
@@ -671,9 +677,14 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			} = filterChildShellEnv(process.env);
 			// The supplied environment itself carries no config override.
 			const env = { ...ambient, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
-			const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
+			const tmpdir = noTmp ? spyOn(os, "tmpdir").mockReturnValue(path.join(root, "no-such-tmp")) : undefined;
+			try {
+				const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
+				expect(result.exitCode).toBe(0);
+			} finally {
+				tmpdir?.mockRestore();
+			}
 
-			expect(result.exitCode).toBe(0);
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
 		});
 
