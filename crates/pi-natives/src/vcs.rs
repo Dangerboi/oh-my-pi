@@ -782,12 +782,21 @@ pub fn vcs_git_hook_location(
 	})
 }
 
-/// Remove the claim files of worktree adds still running in this process (only
-/// filesystems without file locks use them), for an exit that ends those adds
-/// without their own cleanup.
+/// Remove the claim files of worktree adds still running in this process.
+///
+/// Only filesystems without file locks use them; this is for an exit that ends
+/// those adds without their own cleanup. Waits for running adds to finish
+/// first, so their claims keep serializing them.
 #[napi]
-pub fn vcs_release_worktree_add_claims() {
-	pi_vcs::git::release_worktree_add_claims();
+pub fn vcs_release_worktree_add_claims() -> Promise<()> {
+	let ct = task::CancelToken::new(None, None);
+	task::blocking_mapped("vcs.releaseWorktreeAddClaims", ct, rich_error, canceled_error, |_| {
+		catch_panic("vcs.releaseWorktreeAddClaims", || {
+			// Just under postmortem's 10 s cleanup deadline.
+			pi_vcs::git::release_worktree_add_claims(Duration::from_secs(9));
+			Ok(())
+		})
+	})
 }
 
 #[napi]

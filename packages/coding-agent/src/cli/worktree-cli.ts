@@ -149,7 +149,7 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 		console.log(`Preparing worktree (${preparation})`);
 	}
 	// Ctrl-C mid-add ends the process without the add's own cleanup.
-	postmortem.register("worktree-add-claims", vcs.releaseWorktreeAddClaims, { exitOnly: true });
+	postmortem.register("worktree-add-claims", () => vcs.releaseWorktreeAddClaims(), { exitOnly: true });
 	const result = await repository.worktreeAdd(worktreePath, ref, {
 		detach,
 		clone: cfgWorktreeClone.get(settings),

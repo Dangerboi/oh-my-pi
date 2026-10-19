@@ -97,9 +97,10 @@ export declare function worktreeSetupOwner(): string;
 /**
  * Remove the claim files `worktreeAdd` holds in this process where the filesystem has no file
  * locks (an exclusively created `omp-worktree-add.claim` stands in for the lock). Register it as
- * exit cleanup: a signal exit ends a running add without its own cleanup.
+ * exit cleanup: a signal exit ends a running add without its own cleanup. Waits up to 9 s for
+ * running adds to finish (keeping their claims) before removing the claims of those still running.
  */
-export declare function releaseWorktreeAddClaims(): void;
+export declare function releaseWorktreeAddClaims(): Promise<void>;
 
 /**
  * Whether the owner of an unfinished worktree setup (`setupOwner` of a listed worktree) may still

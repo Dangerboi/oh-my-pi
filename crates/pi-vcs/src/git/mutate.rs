@@ -1971,8 +1971,9 @@ enum WorktreeAddLock {
 
 /// Claim files of adds running in this process, each with its own id (one
 /// path is claimed again by every later add), for
-/// [`release_worktree_add_claims`].
+/// [`release_worktree_add_claims`]. The condvar signals a claim's end.
 static HELD_CLAIMS: std::sync::Mutex<Vec<(u64, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+static CLAIM_ENDED: std::sync::Condvar = std::sync::Condvar::new();
 static NEXT_CLAIM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn held_claims() -> std::sync::MutexGuard<'static, Vec<(u64, PathBuf)>> {
@@ -1990,6 +1991,7 @@ impl Drop for WorktreeAddLock {
 				held.swap_remove(index);
 				let _ = fs::remove_file(claim);
 			}
+			CLAIM_ENDED.notify_all();
 		}
 	}
 }
@@ -1998,10 +2000,16 @@ impl Drop for WorktreeAddLock {
 ///
 /// For an exit that ends them without unwinding (a signal handler exiting the
 /// process), as git removes its lock files on a signal. Only filesystems
-/// without file locks use claim files.
-pub fn release_worktree_add_claims() {
-	let claims = std::mem::take(&mut *held_claims());
-	for (_, claim) in claims {
+/// without file locks use claim files. Adds are not abortable, so removing a
+/// running add's claim would let another process add concurrently: this waits
+/// up to `wait` for them to finish, and removes only the claims of adds still
+/// running then, just before the process exits.
+pub fn release_worktree_add_claims(wait: std::time::Duration) {
+	let held = held_claims();
+	let (mut held, _) = CLAIM_ENDED
+		.wait_timeout_while(held, wait, |held| !held.is_empty())
+		.unwrap_or_else(std::sync::PoisonError::into_inner);
+	for (_, claim) in std::mem::take(&mut *held) {
 		let _ = fs::remove_file(claim);
 	}
 }
@@ -3659,11 +3667,30 @@ mod tests {
 		let common = repo.info().common_dir.clone();
 		let claim = common.join("omp-worktree-add.claim");
 		let abandoned = claim_worktree_adds(&common, std::time::Duration::ZERO).unwrap();
-		release_worktree_add_claims();
+		release_worktree_add_claims(std::time::Duration::ZERO);
 		let next = claim_worktree_adds(&common, std::time::Duration::ZERO).unwrap();
 		drop(abandoned);
 		assert!(claim.exists(), "a released claim's holder must not remove the next add's claim");
 		drop(next);
+		assert!(!claim.exists());
+	}
+
+	#[test]
+	fn exit_cleanup_waits_for_a_running_add_before_freeing_its_claim() {
+		let (_temp, repo) = fixture();
+		let common = repo.info().common_dir.clone();
+		let claim = common.join("omp-worktree-add.claim");
+		let running = claim_worktree_adds(&common, std::time::Duration::ZERO).unwrap();
+		std::thread::scope(|scope| {
+			scope.spawn(|| {
+				// Only makes it likely the release already waits; it must not
+				// delete the file before the add ends either way.
+				std::thread::sleep(std::time::Duration::from_millis(100));
+				assert!(claim.exists(), "exit cleanup deleted the claim of a running add");
+				drop(running);
+			});
+			release_worktree_add_claims(std::time::Duration::from_secs(10));
+		});
 		assert!(!claim.exists());
 	}
 }

@@ -121,11 +121,8 @@ export async function addWorktreeWithHook(
 		signal?.throwIfAborted();
 		head = await repository.resolveRef(`refs/heads/${branch}`, signal);
 		const hook = head ? await runWorktreeCheckoutHook(worktreePath, head, signal) : {};
-		// A branch is checked out in one worktree at most; none means the hook switched it or deleted the worktree.
 		// Raced like the path lookup below, so an abort rejects with its reason.
-		const listed = await untilAborted(signal, () => repository.worktrees());
-		const moved = listed.find(entry => entry.branch === `refs/heads/${branch}`);
-		if (moved) current = moved.path;
+		current = await currentWorktreePath(repository, branch, current, signal);
 		// The abort may also have landed as the hook finished: either way, or with a stalled `worktree.base`,
 		// the caller must not move into the worktree, so it is discarded below.
 		const resolved = await resolveWorktreePath(current, signal);
@@ -137,6 +134,15 @@ export async function addWorktreeWithHook(
 		});
 		return { added, path: resolved, hook };
 	} catch (error) {
+		// The hook may have moved the worktree before it was cut short; discard where it is now.
+		try {
+			current = await currentWorktreePath(repository, branch, current);
+		} catch (lookupError) {
+			logger.warn("could not locate a new worktree its hook may have moved", {
+				path: current,
+				error: String(lookupError),
+			});
+		}
 		await discardNewWorktree(repository, current);
 		if (head) await restoreBranch(repository, branch, head);
 		throw error;
@@ -144,10 +150,26 @@ export async function addWorktreeWithHook(
 }
 
 /**
+ * Where `branch` is checked out now, or `fallback` when it is checked out nowhere (the hook
+ * switched it or deleted the worktree). A branch is checked out in one worktree at most.
+ */
+async function currentWorktreePath(
+	repository: VcsGitRepo,
+	branch: string,
+	fallback: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	const listed = await untilAborted(signal, () => repository.worktrees());
+	return listed.find(entry => entry.branch === `refs/heads/${branch}`)?.path ?? fallback;
+}
+
+/**
  * Remove a worktree this attempt's own `worktreeAdd` created, or, when it is no longer
- * discoverable (its `.git` file is gone), delete its directory. Either way its registration then
- * loses the setup mark and, pointing nowhere, is pruned. Takes no signal, as the caller's may
- * already be aborted; failures are logged, not thrown, so the original error reaches the caller.
+ * discoverable (its `.git` file is gone), delete its directory. Once it is gone its registration
+ * loses the setup mark and, pointing nowhere, is pruned. If it could not be removed, it keeps
+ * the mark: it stays owned by this live process, so other omp processes do not reuse the
+ * half-set-up checkout. Takes no signal, as the caller's may already be aborted; failures are
+ * logged, not thrown, so the original error reaches the caller.
  */
 async function discardNewWorktree(repository: VcsGitRepo, worktreePath: string): Promise<void> {
 	const warn = (error: unknown) =>
@@ -161,6 +183,7 @@ async function discardNewWorktree(repository: VcsGitRepo, worktreePath: string):
 		}
 	} catch (error) {
 		warn(error);
+		return;
 	}
 	// Also after a removal: with the `.git` gone, it may have been another checkout around it that was found.
 	try {

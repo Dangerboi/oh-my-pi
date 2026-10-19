@@ -567,6 +567,53 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(branchSha(repo, branch)).not.toBeNull();
 		});
 
+		/** Runs `/wt` with a hook that moves its worktree, tells the test, then hangs; aborts once told and returns the rejection. */
+		const abortAfterHookMoves = async () => {
+			const signalPipe = path.join(root, "hook-moved");
+			expect(Bun.spawnSync(["mkfifo", signalPipe]).exitCode).toBe(0);
+			await hook(
+				`unset GIT_DIR GIT_WORK_TREE\ngit -C "${repo}" worktree move "$PWD" "$PWD-moved"\necho moved > "${signalPipe}"\nsleep 600`,
+			);
+			const controller = new AbortController();
+			const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+			// Opening the reading end waits for the hook's write, which comes after its move.
+			await Bun.file(signalPipe).text();
+			controller.abort();
+			return pending;
+		};
+
+		it("an abort after the hook moved its worktree discards it at the new path", async () => {
+			await expect(abortAfterHookMoves()).rejects.toMatchObject({ name: "AbortError" });
+
+			expect(worktreePaths(repo)).toEqual([repo]);
+			expect(branchSha(repo, branch)).toBeNull();
+		});
+
+		it("keeps the setup mark on a cut-short worktree that could not be removed, so other processes refuse it", async () => {
+			const repoProto = Object.getPrototypeOf(vcs.requireGit(repo));
+			const remove = spyOn(repoProto, "worktreeRemove").mockRejectedValue(new Error("busy"));
+			try {
+				// The hook runs in the worktree at its chosen path; nothing moves it before the abort.
+				const signalPipe = path.join(root, "hook-started");
+				expect(Bun.spawnSync(["mkfifo", signalPipe]).exitCode).toBe(0);
+				await hook(`echo started > "${signalPipe}"\nsleep 600`);
+				const controller = new AbortController();
+				const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+				await Bun.file(signalPipe).text();
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+			} finally {
+				remove.mockRestore();
+			}
+
+			const leftover = (await vcs.requireGit(repo).worktrees()).find(e => e.branch === `refs/heads/${branch}`);
+			try {
+				expect(leftover?.setupOwner).toBe(vcs.worktreeSetupOwner());
+			} finally {
+				if (leftover) git(repo, "worktree", "remove", "--force", leftover.path);
+			}
+		});
+
 		it("reports a hook as not run when the git on PATH cannot start", async () => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");

@@ -211,9 +211,10 @@ export function worktreeSetupOwner() {
 /**
  * Remove the claim files `worktreeAdd` holds in this process where the filesystem has no file
  * locks; register it as exit cleanup, since a signal exit ends a running add without its own.
+ * Waits up to 9 s for running adds to finish before removing their claims.
  */
 export function releaseWorktreeAddClaims() {
-	api().vcsReleaseWorktreeAddClaims();
+	return api().vcsReleaseWorktreeAddClaims();
 }
 
 /**

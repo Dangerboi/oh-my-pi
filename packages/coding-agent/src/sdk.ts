@@ -1408,7 +1408,7 @@ let worktreeAddClaimCleanupRegistered = false;
 function registerWorktreeAddClaimCleanup(): void {
 	if (worktreeAddClaimCleanupRegistered) return;
 	worktreeAddClaimCleanupRegistered = true;
-	postmortem.register("worktree-add-claims", releaseWorktreeAddClaims, { exitOnly: true });
+	postmortem.register("worktree-add-claims", () => releaseWorktreeAddClaims(), { exitOnly: true });
 }
 
 export function customToolToDefinition(tool: CustomTool, sourcePath?: string): ToolDefinition {

@@ -3988,11 +3988,13 @@ export interface VcsPushOptions {
 }
 
 /**
- * Remove the claim files of worktree adds still running in this process (only
- * filesystems without file locks use them), for an exit that ends those adds
- * without their own cleanup.
+ * Remove the claim files of worktree adds still running in this process.
+ *
+ * Only filesystems without file locks use them; this is for an exit that ends
+ * those adds without their own cleanup. Waits for running adds to finish
+ * first, so their claims keep serializing them.
  */
-export declare function vcsReleaseWorktreeAddClaims(): void
+export declare function vcsReleaseWorktreeAddClaims(): Promise<undefined>
 
 /** Restore options. */
 export interface VcsRestoreOptions {
