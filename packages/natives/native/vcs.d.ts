@@ -95,6 +95,13 @@ export declare function copyGitObjects(isolationRoot: string, sourceRoot: string
 export declare function worktreeSetupOwner(): string;
 
 /**
+ * Remove the claim files `worktreeAdd` holds in this process where the filesystem has no file
+ * locks (an exclusively created `omp-worktree-add.claim` stands in for the lock). Register it as
+ * exit cleanup: a signal exit ends a running add without its own cleanup.
+ */
+export declare function releaseWorktreeAddClaims(): void;
+
+/**
  * Whether the owner of an unfinished worktree setup (`setupOwner` of a listed worktree) may still
  * be running it: its process exists, or it is in another pid scope (host or container), which
  * this process can't judge.

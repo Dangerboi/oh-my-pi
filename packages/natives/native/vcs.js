@@ -209,6 +209,14 @@ export function worktreeSetupOwner() {
 }
 
 /**
+ * Remove the claim files `worktreeAdd` holds in this process where the filesystem has no file
+ * locks; register it as exit cleanup, since a signal exit ends a running add without its own.
+ */
+export function releaseWorktreeAddClaims() {
+	api().vcsReleaseWorktreeAddClaims();
+}
+
+/**
  * Whether the owner of a worktree setup may still be running it: its process exists, or it is
  * in another pid scope (another host or container), where this process can't tell.
  */

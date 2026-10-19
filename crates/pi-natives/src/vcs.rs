@@ -782,6 +782,14 @@ pub fn vcs_git_hook_location(
 	})
 }
 
+/// Remove the claim files of worktree adds still running in this process (only
+/// filesystems without file locks use them), for an exit that ends those adds
+/// without their own cleanup.
+#[napi]
+pub fn vcs_release_worktree_add_claims() {
+	pi_vcs::git::release_worktree_add_claims();
+}
+
 #[napi]
 impl VcsGitRepo {
 	/// Repository metadata.

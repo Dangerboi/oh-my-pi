@@ -3987,6 +3987,13 @@ export interface VcsPushOptions {
   forceWithLease?: boolean
 }
 
+/**
+ * Remove the claim files of worktree adds still running in this process (only
+ * filesystems without file locks use them), for an exit that ends those adds
+ * without their own cleanup.
+ */
+export declare function vcsReleaseWorktreeAddClaims(): void
+
 /** Restore options. */
 export interface VcsRestoreOptions {
   source?: string

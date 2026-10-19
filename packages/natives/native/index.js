@@ -150,6 +150,7 @@ export const vcsGitRepoInfo = nativeBindings.vcsGitRepoInfo ?? missingNativeExpo
 export const vcsIsPureJj = nativeBindings.vcsIsPureJj ?? missingNativeExport("vcsIsPureJj");
 export const vcsJjDiscover = nativeBindings.vcsJjDiscover ?? missingNativeExport("vcsJjDiscover");
 export const vcsJoinPatches = nativeBindings.vcsJoinPatches ?? missingNativeExport("vcsJoinPatches");
+export const vcsReleaseWorktreeAddClaims = nativeBindings.vcsReleaseWorktreeAddClaims ?? missingNativeExport("vcsReleaseWorktreeAddClaims");
 export const vcsValidateHunkSelections = nativeBindings.vcsValidateHunkSelections ?? missingNativeExport("vcsValidateHunkSelections");
 export const vectorIndexTopK = nativeBindings.vectorIndexTopK ?? missingNativeExport("vectorIndexTopK");
 export const visibleWidth = nativeBindings.visibleWidth ?? missingNativeExport("visibleWidth");

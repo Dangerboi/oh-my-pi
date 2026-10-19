@@ -20,7 +20,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { filterChildShellEnv, getWorktreesDir, isEnoent } from "@oh-my-pi/pi-utils";
+import { filterChildShellEnv, getWorktreesDir, isEnoent, postmortem } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Settings } from "../config/settings";
 import { hasLiveIsolationOwner, ISOLATION_OWNER_FILE, readRetainedMountBackend } from "../task/isolation-ownership";
@@ -148,6 +148,8 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 				: `checking out '${ref}'`;
 		console.log(`Preparing worktree (${preparation})`);
 	}
+	// Ctrl-C mid-add ends the process without the add's own cleanup.
+	postmortem.register("worktree-add-claims", vcs.releaseWorktreeAddClaims, { exitOnly: true });
 	const result = await repository.worktreeAdd(worktreePath, ref, {
 		detach,
 		clone: cfgWorktreeClone.get(settings),

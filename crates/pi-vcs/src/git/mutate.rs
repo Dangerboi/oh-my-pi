@@ -668,7 +668,7 @@ impl GitRepo {
 			for kind in pi_iso::clone_candidates(preferred) {
 				match self.worktree_add_cloned(path, id, &head, kind, options.keep_changes, owner) {
 					Ok(admin) => {
-						finish_worktree_add(path, &self.info().common_dir, &admin)?;
+						finish_worktree_add(path, &admin)?;
 						return Ok(WorktreeAddResult { cloned_with: Some(kind), clone_error });
 					},
 					Err(err) => {
@@ -699,7 +699,7 @@ impl GitRepo {
 		}
 		// Created: lifted as git lifts it, before any hook runs. A setup mark
 		// stays.
-		finish_worktree_add(path, &self.info().common_dir, &admin)?;
+		finish_worktree_add(path, &admin)?;
 		Ok(WorktreeAddResult { cloned_with: None, clone_error })
 	}
 
@@ -1936,30 +1936,123 @@ fn register_worktree(
 /// Lift git's creation lock as git does, before any hook runs. If that fails,
 /// roll the add back: a live setup mark on a worktree reported as failed would
 /// make other processes refuse it for as long as this one lives.
-fn finish_worktree_add(path: &Path, common: &Path, admin: &Path) -> Result<()> {
+fn finish_worktree_add(path: &Path, admin: &Path) -> Result<()> {
 	unlock_admin(admin).inspect_err(|_| {
-		// Removed first: with the mark gone and the entry still listed, another
-		// process could take over a checkout being deleted.
-		cleanup_worktree_add(path, common);
-		let _ = end_setup_admin(admin);
+		let _ = fs::remove_dir_all(path);
+		// `gitdir` first: until it is gone the entry stays whole, listed and
+		// owned, so other processes refuse it. Once it is, nothing lists
+		// the entry, and the rest can go, mark included: `HEAD` next, which
+		// `branch_is_checked_out` reads from every entry, listed or not.
+		if remove_if_present(&admin.join("gitdir")).is_ok() {
+			let _ = remove_if_present(&admin.join("HEAD"));
+			let _ = fs::remove_dir_all(admin);
+		}
 	})
 }
 
-fn lock_worktree_adds(common: &Path) -> Result<fs::File> {
+/// Held for one `worktree_add`: a file lock, or, where the filesystem has none,
+/// an exclusively created claim file, removed when dropped.
+enum WorktreeAddLock {
+	Locked(#[allow(dead_code, reason = "held for its lock")] fs::File),
+	/// The claim file, with its id in [`HELD_CLAIMS`].
+	Claimed(u64, PathBuf),
+}
+
+/// Claim files of adds running in this process, each with its own id (one
+/// path is claimed again by every later add), for
+/// [`release_worktree_add_claims`].
+static HELD_CLAIMS: std::sync::Mutex<Vec<(u64, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+static NEXT_CLAIM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn held_claims() -> std::sync::MutexGuard<'static, Vec<(u64, PathBuf)>> {
+	HELD_CLAIMS
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Drop for WorktreeAddLock {
+	fn drop(&mut self) {
+		if let Self::Claimed(id, claim) = self {
+			let mut held = held_claims();
+			// Already released: the file may be another add's claim by now.
+			if let Some(index) = held.iter().position(|(held, _)| held == id) {
+				held.swap_remove(index);
+				let _ = fs::remove_file(claim);
+			}
+		}
+	}
+}
+
+/// Remove the claim files of worktree adds still running in this process.
+///
+/// For an exit that ends them without unwinding (a signal handler exiting the
+/// process), as git removes its lock files on a signal. Only filesystems
+/// without file locks use claim files.
+pub fn release_worktree_add_claims() {
+	let claims = std::mem::take(&mut *held_claims());
+	for (_, claim) in claims {
+		let _ = fs::remove_file(claim);
+	}
+}
+
+/// How long an add waits for another one holding the claim file.
+const WORKTREE_ADD_CLAIM_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn lock_worktree_adds(common: &Path) -> Result<WorktreeAddLock> {
 	let file = fs::OpenOptions::new()
 		.create(true)
 		.write(true)
 		.truncate(false)
 		.open(common.join("omp-worktree-add.lock"))?;
 	match file.lock() {
-		// Without lock support (e.g. NFSv3 without lockd), add unserialized, as
-		// before.
-		Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {},
+		Ok(()) => Ok(WorktreeAddLock::Locked(file)),
+		// Without lock support (e.g. NFSv3 without lockd): O_EXCL creation, as
+		// git's own lock files use.
+		Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+			claim_worktree_adds(common, WORKTREE_ADD_CLAIM_WAIT)
+		},
 		#[cfg(unix)]
-		Err(err) if err.raw_os_error() == Some(libc::ENOLCK) => {},
-		locked => locked?,
+		Err(err) if err.raw_os_error() == Some(libc::ENOLCK) => {
+			claim_worktree_adds(common, WORKTREE_ADD_CLAIM_WAIT)
+		},
+		Err(err) => Err(err.into()),
 	}
-	Ok(file)
+}
+
+fn claim_worktree_adds(common: &Path, wait: std::time::Duration) -> Result<WorktreeAddLock> {
+	let claim = common.join("omp-worktree-add.claim");
+	let deadline = std::time::Instant::now() + wait;
+	let mut pause = std::time::Duration::from_millis(10);
+	loop {
+		match fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&claim)
+		{
+			Ok(_) => {
+				let id = NEXT_CLAIM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				held_claims().push((id, claim.clone()));
+				return Ok(WorktreeAddLock::Claimed(id, claim));
+			},
+			Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+				if std::time::Instant::now() >= deadline {
+					// Left by a process that died mid-add without its exit cleanup,
+					// as with git's `index.lock`.
+					return Err(Error::backend(
+						"git worktree add",
+						format!(
+							"'{}' exists: another omp process seems to be adding a worktree; if none is, \
+							 remove the file",
+							claim.display()
+						),
+					));
+				}
+				std::thread::sleep(pause);
+				pause = (pause * 2).min(std::time::Duration::from_millis(500));
+			},
+			Err(err) => return Err(err.into()),
+		}
+	}
 }
 
 fn cleanup_worktree_add(path: &Path, common: &Path) {
@@ -3442,11 +3535,105 @@ mod tests {
 		fs::create_dir(admin.join("locked")).unwrap();
 		fs::write(admin.join("locked").join("stuck"), "").unwrap();
 
-		let common = repo.info().common_dir.clone();
-		assert!(finish_worktree_add(&linked, &common, &admin).is_err());
+		assert!(finish_worktree_add(&linked, &admin).is_err());
 
 		assert!(!linked.exists());
 		assert!(setup_owner_of(&repo, &linked).is_empty());
 		assert!(!admin.join(SETUP_MARK).exists());
+	}
+
+	/// Roll back an add whose `locked` can't be lifted while `stuck` (a
+	/// directory in its admin dir) is made read-only, then report what
+	/// `worktrees()` lists for it.
+	#[cfg(unix)]
+	fn worktrees_after_a_stuck_rollback(
+		name: &str,
+		stuck: impl Fn(&Path) -> PathBuf,
+	) -> (Result<()>, Result<Vec<Option<String>>>) {
+		use std::os::unix::fs::PermissionsExt;
+		let (temp, repo) = fixture();
+		let linked = temp.path().join(format!("../{name}"));
+		let _ = fs::remove_dir_all(&linked);
+		add_detached(&repo, &linked, Some("owner-1"));
+		let admin = repo.worktree_admin(&linked).unwrap().unwrap();
+		// A `locked` that can't be removed as a file, as one held open without
+		// delete sharing on Windows.
+		fs::create_dir(admin.join("locked")).unwrap();
+		fs::write(admin.join("locked").join("stuck"), "").unwrap();
+		let stuck = stuck(&admin);
+		fs::set_permissions(&stuck, fs::Permissions::from_mode(0o500)).unwrap();
+
+		let rolled_back = finish_worktree_add(&linked, &admin);
+		let listed = repo.worktrees().map(|entries| {
+			entries
+				.into_iter()
+				.filter(|entry| entry.path == linked)
+				.map(|entry| entry.setup_owner)
+				.collect()
+		});
+		fs::set_permissions(&stuck, fs::Permissions::from_mode(0o700)).unwrap();
+		let _ = fs::remove_dir_all(&admin);
+		(rolled_back, listed)
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_rollback_stuck_on_the_creation_lock_unlists_the_worktree_instead_of_half_listing_it() {
+		// Root deletes regardless of permissions.
+		if unsafe { libc::geteuid() } == 0 {
+			return;
+		}
+		let (rolled_back, listed) =
+			worktrees_after_a_stuck_rollback("linked-stuck-lock-dir", |admin| admin.join("locked"));
+		assert!(rolled_back.is_err());
+		// Never listed without its `HEAD`, which would fail every listing.
+		assert_eq!(listed.unwrap(), Vec::<Option<String>>::new());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_rollback_that_cannot_unlist_the_worktree_leaves_it_owned() {
+		if unsafe { libc::geteuid() } == 0 {
+			return;
+		}
+		let (rolled_back, listed) =
+			worktrees_after_a_stuck_rollback("linked-stuck-admin", |admin| admin.to_path_buf());
+		assert!(rolled_back.is_err());
+		// Still listed, so other processes must see it as being set up.
+		assert_eq!(listed.unwrap(), [Some("owner-1".to_owned())]);
+	}
+
+	#[test]
+	fn without_file_locks_a_second_add_waits_for_the_first_claim_and_is_refused_after_the_wait() {
+		let (_temp, repo) = fixture();
+		let common = repo.info().common_dir.clone();
+		let first = claim_worktree_adds(&common, std::time::Duration::ZERO).unwrap();
+		let refused = claim_worktree_adds(&common, std::time::Duration::ZERO)
+			.err()
+			.unwrap();
+		assert!(refused.to_string().contains("omp-worktree-add.claim"), "{refused}");
+		std::thread::scope(|scope| {
+			let waiting = scope
+				.spawn(|| claim_worktree_adds(&common, std::time::Duration::from_secs(10)).is_ok());
+			// Only makes it likely the waiter already met the claim; it gets it
+			// either way.
+			std::thread::sleep(std::time::Duration::from_millis(50));
+			drop(first);
+			assert!(waiting.join().unwrap(), "a waiting add must get the claim once it is free");
+		});
+	}
+
+	#[test]
+	fn exit_cleanup_frees_a_held_claim_without_its_holder_deleting_a_later_one() {
+		let (_temp, repo) = fixture();
+		let common = repo.info().common_dir.clone();
+		let claim = common.join("omp-worktree-add.claim");
+		let abandoned = claim_worktree_adds(&common, std::time::Duration::ZERO).unwrap();
+		release_worktree_add_claims();
+		let next = claim_worktree_adds(&common, std::time::Duration::ZERO).unwrap();
+		drop(abandoned);
+		assert!(claim.exists(), "a released claim's holder must not remove the next add's claim");
+		drop(next);
+		assert!(!claim.exists());
 	}
 }
