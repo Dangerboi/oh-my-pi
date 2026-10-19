@@ -83,7 +83,12 @@ import {
 	scanFileForConflicts,
 } from "./conflict-detect";
 import { executeReadUrl, fetchReadUrl, parseReadUrlTarget } from "./fetch";
-import { postProcessToolResult, resolveOutputMaxColumns } from "./output-meta";
+import {
+	postProcessToolResult,
+	resolveArtifactSpillThreshold,
+	resolveInlineByteCapBudget,
+	resolveOutputMaxColumns,
+} from "./output-meta";
 import {
 	expandPath,
 	formatPathRelativeToCwd,
@@ -2348,9 +2353,22 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					const effectiveLimit = limit ?? DEFAULT_LIMIT;
 					const maxLinesToCollect = Math.min(effectiveLimit + leadingContext + trailingContext, DEFAULT_MAX_LINES);
 					const selectedLineLimit = effectiveLimit + leadingContext + trailingContext;
-					// Scale byte budget with line limit so the configured line count actually fits.
-					// Assume ~512 bytes/line average; never go below the shared default.
-					const maxBytesForRead = Math.max(DEFAULT_MAX_BYTES, maxLinesToCollect * 512);
+					// Scale byte budget with line limit so the configured line count actually fits
+					// (~512 bytes/line, never below the shared default). Pages that would otherwise
+					// spill also stop at the spill threshold: past it the page would be middle-elided
+					// into an artifact, while stopping here pages at a line boundary with an exact
+					// `:N` continuation. Row prefixes (`N|`/`N:`) count against that threshold, so
+					// their worst-case width is reserved (at most half the threshold). Artifact-storage
+					// pages never spill, so they keep the full budget.
+					const scaledBudget = Math.max(DEFAULT_MAX_BYTES, maxLinesToCollect * 512);
+					let maxBytesForRead = scaledBudget;
+					if (!located?.spec.artifactStore) {
+						const threshold = resolveArtifactSpillThreshold(this.session.settings);
+						const prefixWidth =
+							!rawSelector && displayMode.lineNumbers ? String(startLine + maxLinesToCollect).length + 1 : 0;
+						const prefixReserve = Math.min(maxLinesToCollect * prefixWidth, Math.floor(threshold / 2));
+						maxBytesForRead = Math.min(scaledBudget, threshold - prefixReserve);
+					}
 
 					const lineWindow = buffered
 						? collectLineWindowFromBuffer(
@@ -2707,10 +2725,15 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					}
 
 					content = [{ type: "text", text: outputText }];
+					// `maxBytesForRead` bounds only the selected source lines; row prefixes and
+					// off-window block context ride on top. Skip the spill only while the final page
+					// still fits the inline cap, so block context can never bypass the bound.
+					pagedSource =
+						Buffer.byteLength(outputText, "utf-8") <= resolveInlineByteCapBudget(this.session.settings);
 				}
 			}
 			// A page of artifact storage is re-readable with selectors: spilling it would only
-			// duplicate it into another artifact. Every other located read spills like a plain file.
+			// duplicate it into another artifact. Every other unpaged located read spills like a plain file.
 			if (located?.spec.artifactStore) pagedSource = true;
 			// Immutable sources have no write path, so the hint never lands in a written-back file.
 			if (located && immutable && !isRawSelector(parsed) && fileSize > MAX_URL_RAW_INLINE_BYTES) {

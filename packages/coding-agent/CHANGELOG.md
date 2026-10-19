@@ -9,6 +9,8 @@
 - Git hooks in a `core.hooksPath` written with `~/` are now found for commits and the bash `git worktree add` rewrite, as git finds them ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - `github` `pr_checkout` no longer takes over a PR worktree another omp process is still setting up, so a failed setup there can't delete its work ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - `omp worktree clear` no longer drops the registration of a worktree git has locked, e.g. one on an offline drive ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- Fixed `read` middle-eliding large file pages into an artifact; a page past the output spill threshold now stops at a line boundary with an exact `:N` continuation ([#16277](https://github.com/can1357/oh-my-pi/issues/16277))
+- Fixed Enter on an unknown slash command such as `/not-a-command` running a command whose description happened to match it (e.g. `/loop`, which then resent every later prompt after each turn); Enter now sends what you typed, including as the deny-and-steer message for a pending tool approval, unless you select a suggestion first ([#16265](https://github.com/can1357/oh-my-pi/issues/16265))
 
 ## [18.12.2] - 2026-10-18
 
