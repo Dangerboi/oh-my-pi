@@ -363,7 +363,9 @@ async function postCheckoutHookPath(captureDir, worktreeRoot, gitOptions) {
 	const reported = answer?.replace(/\r?\n$/, "");
 	// Nothing usable (no answer, empty, or an MSYS/Cygwin `/c/…` path on Windows; `//server/share` UNC paths are fine).
 	if (!reported || (process.platform === "win32" && reported.startsWith("/") && !reported.startsWith("//"))) {
-		return git(worktreeRoot)?.hookLocation("post-checkout", gitOptions.signal);
+		// Discovery reads the repository too: off the JS thread, raced against the abort like the rest.
+		const location = api().vcsGitHookLocation(worktreeRoot, "post-checkout", gitOptions.signal);
+		return (await untilAborted(location, gitOptions.signal)) ?? undefined;
 	}
 	// A relative result is relative to the worktree, where `git hook run` runs.
 	return path.resolve(worktreeRoot, reported);
@@ -376,8 +378,8 @@ async function postCheckoutHookPath(captureDir, worktreeRoot, gitOptions) {
  * needed when there is no hook. Returns once `git hook run` exits, even if the
  * hook left a background process running, with the last 64 KiB of each output
  * stream; `skipped` says why an existing hook did not run. Aborting
- * `options.signal` kills the hook's process tree and rejects with the reason,
- * also while a filesystem check or a read is stalled.
+ * `options.signal` kills the hook's process tree and rejects with the reason, also while a
+ * lookup, a file check or a read is stalled (starting git still happens on this thread).
  */
 export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	const { signal, env, detached } = options;

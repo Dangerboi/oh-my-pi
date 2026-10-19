@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added `VcsGitRepo.hookLocation(name, signal?)`, where git looks for a hook (`core.hooksPath`, with `~/` and `%(prefix)/` expanded, or the shared hooks directory) whether or not one exists there ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- Added `vcsGitHookLocation(dir, name, signal?)`, where git looks for a hook in the checkout containing `dir` (`core.hooksPath`, with `~/` and `%(prefix)/` expanded, or the shared hooks directory) whether or not one exists there, found entirely off the JS thread ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ### Changed
 

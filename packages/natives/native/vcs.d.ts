@@ -109,7 +109,8 @@ export interface SkippedPostCheckoutHook {
  * Aborting `signal` kills the hook's process tree, descendants that moved into their own
  * session included (one that double-forks out to init escapes, and on Windows so do commands
  * MSYS `sh` started through its fork stubs), and rejects with the abort reason, also while a
- * filesystem check or a read is stalled; a `signal` implies `detached`.
+ * lookup, a file check or a read is stalled; starting git (finding it on PATH, entering the
+ * worktree) still happens on the calling thread. A `signal` implies `detached`.
  */
 export declare function runPostCheckoutHook(
 	worktreeRoot: string,

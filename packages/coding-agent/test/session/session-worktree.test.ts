@@ -495,32 +495,38 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			},
 		);
 
-		it("an abort while the new worktree's path is still being resolved cancels /wt and leaves nothing behind", async () => {
-			await hook("touch .post-checkout-ran");
-			const worktrees = path.join(root, "wt");
-			const reached = Promise.withResolvers<void>();
-			const realRealpath = fs.realpath;
-			// A lookup that never settles, as with `worktree.base` on a stalled network filesystem.
-			const realpath = spyOn(fs, "realpath").mockImplementation(((file: nodeFs.PathLike, ...rest: []) => {
-				if (!String(file).startsWith(`${worktrees}${path.sep}`)) return realRealpath(file, ...rest);
-				reached.resolve();
-				const stalled = Promise.withResolvers<string>();
-				releaseStalled = () => stalled.reject(Object.assign(new Error("released"), { code: "ENOENT" }));
-				return stalled.promise;
-			}) as typeof realRealpath);
-			const controller = new AbortController();
-			const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
-			try {
-				await reached.promise;
-			} finally {
-				realpath.mockRestore();
-			}
-			controller.abort();
-			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+		it.each([
+			["chosen", "stat"],
+			["resolved", "realpath"],
+		] as const)(
+			"an abort while the new worktree's path is still being %s cancels /wt and leaves nothing behind",
+			async (_name, method) => {
+				await hook("touch .post-checkout-ran");
+				const worktrees = path.join(root, "wt");
+				const reached = Promise.withResolvers<void>();
+				const real = fs[method] as (file: nodeFs.PathLike, ...rest: unknown[]) => Promise<unknown>;
+				// A lookup that never settles, as with `worktree.base` on a stalled network filesystem.
+				const lookup = spyOn(fs, method).mockImplementation(((file: nodeFs.PathLike, ...rest: unknown[]) => {
+					if (!String(file).startsWith(`${worktrees}${path.sep}`)) return real(file, ...rest);
+					reached.resolve();
+					const stalled = Promise.withResolvers<never>();
+					releaseStalled = () => stalled.reject(Object.assign(new Error("released"), { code: "ENOENT" }));
+					return stalled.promise;
+				}) as never);
+				const controller = new AbortController();
+				const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+				try {
+					await reached.promise;
+				} finally {
+					lookup.mockRestore();
+				}
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 
-			expect(worktreePaths(repo)).toEqual([repo]);
-			expect(branchSha(repo, branch)).toBeNull();
-		});
+				expect(worktreePaths(repo)).toEqual([repo]);
+				expect(branchSha(repo, branch)).toBeNull();
+			},
+		);
 
 		it("reports a hook as not run when the git on PATH cannot start", async () => {
 			const wt = await create();
@@ -533,6 +539,30 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 
 			expect(result.skipped?.reason).toBe("no-git");
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(false);
+		});
+
+		it("abort is not held up by a stalled repository when no git can locate the hook", async () => {
+			const wt = await create();
+			// A named pipe blocks the in-process lookup's read of the shared config, as a stalled filesystem would.
+			const config = path.join(repo, ".git", "config");
+			await fs.rename(config, `${config}.real`);
+			expect(Bun.spawnSync(["mkfifo", config]).exitCode).toBe(0);
+			const controller = new AbortController();
+			const pending = vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
+				signal: controller.signal,
+				env: { PATH: path.join(root, "no-git") },
+			});
+			// Opening the writing end waits until the lookup opened the pipe; the read then stalls.
+			const writer = await fs.open(config, "w");
+			try {
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+			} finally {
+				// The real config first: the abandoned lookup opens it again after this read, and must not meet the pipe.
+				await fs.rename(`${config}.real`, config);
+				// End of file then lets that read finish.
+				await writer.close();
+			}
 		});
 
 		it("leaves alone a worktree another process created at the chosen path first", async () => {

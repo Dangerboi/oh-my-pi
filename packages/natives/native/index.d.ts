@@ -705,11 +705,6 @@ export declare class VcsGitRepo {
   showCommit(rev: string, maxBytes?: number | undefined | null, signal?: unknown | undefined | null): Promise<VcsShowResult>
   /** Local LFS media directory. */
   lfsMediaDir(signal?: unknown | undefined | null): Promise<string | undefined | null>
-  /**
-   * Where Git looks for hook `name` (`core.hooksPath` or the shared hooks
-   * directory), whether or not a file exists there.
-   */
-  hookLocation(name: string, signal?: unknown | undefined | null): Promise<string>
   /** Render a patch. */
   diffText(options: VcsDiffOptions, signal?: unknown | undefined | null): Promise<string>
   /** Render a no-index patch between two filesystem paths. */
@@ -3879,6 +3874,15 @@ export declare function vcsGitClone(url: string, target: string, options: VcsClo
 
 /** Discover the Git checkout containing a directory. */
 export declare function vcsGitDiscover(dir: string): VcsGitRepo | null
+
+/**
+ * Where Git looks for hook `name` in the checkout containing `dir`.
+ *
+ * `core.hooksPath` or the shared hooks directory, whether or not a file
+ * exists there; `null` outside any checkout. Discovery runs off the JS thread
+ * too, so a stalled repository can't block it.
+ */
+export declare function vcsGitHookLocation(dir: string, name: string, signal?: unknown | undefined | null): Promise<string | undefined | null>
 
 /** Discover Git metadata without opening the repository. */
 export declare function vcsGitRepoInfo(dir: string): VcsGitRepoInfo | null

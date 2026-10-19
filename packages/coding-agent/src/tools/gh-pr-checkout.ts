@@ -4,7 +4,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { IsoBackendKind, VcsGitRepo, VcsWorktreeEntry } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { getWorktreeDir, hashPath, isEnoent, logger, slugify } from "@oh-my-pi/pi-utils";
+import { getWorktreeDir, hashPath, isEnoent, logger, slugify, untilAborted } from "@oh-my-pi/pi-utils";
 import { github } from "../utils/github";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 import {
@@ -504,8 +504,12 @@ export async function checkoutPullRequest(
 			let clonedWith: IsoBackendKind | undefined;
 			let hook: WorktreeCheckoutHookResult | undefined;
 			if (!existingWorktree) {
-				finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
-				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
+				// Only reads and the base directory, so a stalled `worktree.base` is simply abandoned on abort.
+				finalWorktreePath = await untilAborted(signal, async () => {
+					const available = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
+					await fs.mkdir(path.dirname(available), { recursive: true });
+					return available;
+				});
 				const setUp = await addWorktreeWithHook(
 					repository,
 					finalWorktreePath,

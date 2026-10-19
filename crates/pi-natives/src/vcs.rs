@@ -719,6 +719,32 @@ pub fn vcs_git_repo_info(env: Env, dir: String) -> Result<Option<VcsGitRepoInfo>
 		.map(|v| v.map(Into::into))
 		.map_err(|err| rich_error(env, err))
 }
+/// Where Git looks for hook `name` in the checkout containing `dir`.
+///
+/// `core.hooksPath` or the shared hooks directory, whether or not a file
+/// exists there; `null` outside any checkout. Discovery runs off the JS thread
+/// too, so a stalled repository can't block it.
+#[napi]
+pub fn vcs_git_hook_location(
+	dir: String,
+	name: String,
+	signal: Option<Unknown>,
+) -> Promise<Option<String>> {
+	let ct = task::CancelToken::new(None, signal);
+	task::blocking_mapped("vcs.gitHookLocation", ct, rich_error, canceled_error, move |ct| {
+		if ct.heartbeat().is_err() {
+			return Err(pi_vcs::Error::Canceled);
+		}
+		catch_panic("vcs.gitHookLocation", || {
+			let Some(repo) = pi_vcs::git::GitRepo::discover(Path::new(&dir))? else {
+				return Ok(None);
+			};
+			repo
+				.hook_location(&name)
+				.map(|location| Some(path_string(location)))
+		})
+	})
+}
 
 #[napi]
 impl VcsGitRepo {
@@ -1047,15 +1073,6 @@ impl VcsGitRepo {
 	pub fn lfs_media_dir(&self, signal: Option<Unknown>) -> Promise<Option<String>> {
 		blocking("vcs.lfsMediaDir", self.inner.clone(), signal, |r| {
 			r.lfs_media_dir().map(|v| v.map(path_string))
-		})
-	}
-
-	/// Where Git looks for hook `name` (`core.hooksPath` or the shared hooks
-	/// directory), whether or not a file exists there.
-	#[napi]
-	pub fn hook_location(&self, name: String, signal: Option<Unknown>) -> Promise<String> {
-		blocking("vcs.hookLocation", self.inner.clone(), signal, move |r| {
-			r.hook_location(&name).map(path_string)
 		})
 	}
 

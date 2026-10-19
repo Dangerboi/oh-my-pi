@@ -1326,6 +1326,30 @@ describe("github tool", () => {
 				await expectDiscarded(126);
 			});
 
+			it("is cancelled while its worktree path is still being chosen, as on a stalled worktree.base", async () => {
+				mockPrView(129);
+				const candidates = path.join(tempHome.home, ".omp", "wt", "129-");
+				const reached = Promise.withResolvers<void>();
+				const stalled = Promise.withResolvers<never>();
+				const realStat = fs.stat;
+				vi.spyOn(fs, "stat").mockImplementation(((file: string, ...rest: []) => {
+					if (!String(file).startsWith(candidates)) return realStat(file, ...rest);
+					reached.resolve();
+					return stalled.promise;
+				}) as never);
+				const controller = new AbortController();
+				const pending = checkout(129, controller.signal);
+				try {
+					await reached.promise;
+					controller.abort();
+					await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+				} finally {
+					// Failing, not ENOENT: the abandoned lookup then stops without creating anything.
+					stalled.reject(Object.assign(new Error("released"), { code: "EIO" }));
+				}
+				await expectDiscarded(129);
+			});
+
 			it("leaves alone a worktree another process created at the chosen path first", async () => {
 				mockPrView(127);
 				const repoProto = Object.getPrototypeOf(vcs.requireGit(fixture.repoRoot));

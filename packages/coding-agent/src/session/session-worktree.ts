@@ -12,7 +12,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { IsoBackendKind } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { getWorktreeDir, hashPath, logger } from "@oh-my-pi/pi-utils";
+import { getWorktreeDir, hashPath, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { Settings } from "../config/settings";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
@@ -159,18 +159,23 @@ export async function createSessionWorktree(
 		throw new Error(`Invalid branch name: ${branch}`);
 	}
 	const branchRef = `refs/heads/${branch}`;
-	if (await repository.refExists(branchRef)) {
-		throw new Error(`Branch '${branch}' already exists; pick another name.`);
-	}
-	const baseCommit = await repository.headSha();
-	if (!baseCommit) {
-		throw new Error(`Cannot create a worktree: ${cwd} has no commits.`);
-	}
-	const primaryRoot = repository.primaryRoot() ?? repository.info().repoRoot;
-	const slug = branch.replaceAll(/[^A-Za-z0-9._-]+/g, "-");
-	const basePath = getWorktreeDir(`${slug}-${hashPath(primaryRoot)}`);
-	const worktreePath = await resolveAvailableWorktreePath(basePath, await repository.worktrees());
-	await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+	// Only reads (and the base directory) until the branch is created, so a stalled ref lookup or
+	// `worktree.base` is simply abandoned on abort.
+	const { baseCommit, worktreePath } = await untilAborted(options.signal, async () => {
+		if (await repository.refExists(branchRef)) {
+			throw new Error(`Branch '${branch}' already exists; pick another name.`);
+		}
+		const baseCommit = await repository.headSha();
+		if (!baseCommit) {
+			throw new Error(`Cannot create a worktree: ${cwd} has no commits.`);
+		}
+		const primaryRoot = repository.primaryRoot() ?? repository.info().repoRoot;
+		const slug = branch.replaceAll(/[^A-Za-z0-9._-]+/g, "-");
+		const basePath = getWorktreeDir(`${slug}-${hashPath(primaryRoot)}`);
+		const worktreePath = await resolveAvailableWorktreePath(basePath, await repository.worktrees());
+		await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+		return { baseCommit, worktreePath };
+	});
 
 	await repository.createBranch(branch, baseCommit, false);
 	let setUp: WorktreeSetup;
