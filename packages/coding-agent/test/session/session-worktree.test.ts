@@ -764,6 +764,51 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
 		});
 
+		it("keeps a running hook's output files small, returning its latest output", async () => {
+			const wt = await create();
+			const printed = path.join(root, "hook-printed");
+			const release = path.join(root, "hook-release");
+			for (const fifo of [printed, release]) expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+			await hook(
+				`head -c 5000000 /dev/zero | tr '\\0' x\necho LAST-LINE\necho printed > "${printed}"\ncat "${release}" > /dev/null`,
+			);
+			const captureFiles = async () => {
+				const dirs = (await fs.readdir(os.tmpdir())).filter(name => name.startsWith("omp-post-checkout-"));
+				return dirs
+					.filter(name => !before.has(name))
+					.flatMap(name => ["stdout", "stderr"].map(f => path.join(os.tmpdir(), name, f)));
+			};
+			const before = new Set((await fs.readdir(os.tmpdir())).filter(name => name.startsWith("omp-post-checkout-")));
+			const pending = vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env: filterChildShellEnv(process.env) });
+			let largest = Number.POSITIVE_INFINITY;
+			try {
+				await fs.readFile(printed, "utf8");
+				for (let i = 0; i < 100; i++) {
+					const sizes = await Promise.all(
+						(await captureFiles()).map(file =>
+							fs.stat(file).then(
+								s => s.size,
+								() => 0,
+							),
+						),
+					);
+					largest = Math.max(0, ...sizes);
+					if (largest <= 1024 * 1024) break;
+					// Real wait: the trim is a timer inside the run, visible only as the file's size.
+					await Bun.sleep(50);
+				}
+			} finally {
+				await fs.writeFile(release, "go");
+			}
+			const result = await pending;
+
+			expect(largest).toBeLessThanOrEqual(1024 * 1024);
+			// git routes a hook's stdout to its stderr; whichever stream carried it holds the tail.
+			const output = result.stdout.length > result.stderr.length ? result.stdout : result.stderr;
+			expect(output.length).toBeLessThanOrEqual(64 * 1024);
+			expect(new TextDecoder().decode(output).trimEnd().endsWith("LAST-LINE")).toBe(true);
+		});
+
 		it("runs the hook away from the terminal of the agent that started it", async () => {
 			await hook("ps -o pgid= -p $$ > .post-checkout-group");
 			const wt = await create();
@@ -876,7 +921,7 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 		it.each([
 			["reading the hook-path probe's output", "rev-parse", "r"],
 			["reading the hook's output", "stdout", "r"],
-			["creating the hook's output file", "stdout", "w"],
+			["creating the hook's output file", "stdout", "a"],
 		])("abort is not held up by a stalled filesystem when %s", async (_name, capture, flags) => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");

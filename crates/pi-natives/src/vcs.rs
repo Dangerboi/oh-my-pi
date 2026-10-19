@@ -799,6 +799,28 @@ pub fn vcs_release_worktree_add_claims() -> Promise<()> {
 	})
 }
 
+/// Opaque start identity of process `pid`, to tell it from a later process
+/// reusing the pid.
+///
+/// `None` where the platform reports none, or when the process is gone.
+#[napi]
+pub fn vcs_process_start_time(pid: u32) -> Option<String> {
+	#[cfg(target_os = "linux")]
+	{
+		pi_builtins::proc_sys::start_time(i32::try_from(pid).ok()?).map(|ticks| ticks.to_string())
+	}
+	#[cfg(target_os = "macos")]
+	{
+		let info = pi_builtins::proc_sys::bsdinfo(i32::try_from(pid).ok()?)?;
+		Some((info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec).to_string())
+	}
+	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+	{
+		let _ = pid;
+		None
+	}
+}
+
 #[napi]
 impl VcsGitRepo {
 	/// Repository metadata.

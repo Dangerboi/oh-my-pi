@@ -4075,6 +4075,14 @@ export interface VcsNumstatEntry {
   removed?: number
 }
 
+/**
+ * Opaque start identity of process `pid`, to tell it from a later process
+ * reusing the pid.
+ *
+ * `None` where the platform reports none, or when the process is gone.
+ */
+export declare function vcsProcessStartTime(pid: number): string | null
+
 /** Push options. */
 export interface VcsPushOptions {
   remote?: string

@@ -2014,27 +2014,64 @@ pub fn release_worktree_add_claims(wait: std::time::Duration) {
 	}
 }
 
-/// How long an add waits for another one holding the claim file.
-const WORKTREE_ADD_CLAIM_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long an add waits for another one holding the lock or claim file.
+const WORKTREE_ADD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sleeps one backoff step (10 ms doubling to 500 ms); false once `deadline`
+/// has passed.
+fn back_off(deadline: std::time::Instant, pause: &mut std::time::Duration) -> bool {
+	if std::time::Instant::now() >= deadline {
+		return false;
+	}
+	std::thread::sleep(*pause);
+	*pause = (*pause * 2).min(std::time::Duration::from_millis(500));
+	true
+}
 
 fn lock_worktree_adds(common: &Path) -> Result<WorktreeAddLock> {
+	lock_worktree_adds_within(common, WORKTREE_ADD_WAIT)
+}
+
+fn lock_worktree_adds_within(common: &Path, wait: std::time::Duration) -> Result<WorktreeAddLock> {
+	let lock_path = common.join("omp-worktree-add.lock");
 	let file = fs::OpenOptions::new()
 		.create(true)
 		.write(true)
 		.truncate(false)
-		.open(common.join("omp-worktree-add.lock"))?;
-	match file.lock() {
-		Ok(()) => Ok(WorktreeAddLock::Locked(file)),
+		.open(&lock_path)?;
+	let deadline = std::time::Instant::now() + wait;
+	let mut pause = std::time::Duration::from_millis(10);
+	loop {
+		let err = match file.try_lock() {
+			Ok(()) => return Ok(WorktreeAddLock::Locked(file)),
+			// Bounded so a stalled holder cannot hang every later add, and the
+			// callers cannot be aborted.
+			Err(std::fs::TryLockError::WouldBlock) => {
+				if back_off(deadline, &mut pause) {
+					continue;
+				}
+				return Err(Error::backend(
+					"git worktree add",
+					format!(
+						"another omp process has been adding a worktree in this repository for over {} \
+						 s (holding '{}'); try again",
+						wait.as_secs(),
+						lock_path.display()
+					),
+				));
+			},
+			Err(std::fs::TryLockError::Error(err)) => err,
+		};
 		// Without lock support (e.g. NFSv3 without lockd): O_EXCL creation, as
-		// git's own lock files use.
-		Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
-			claim_worktree_adds(common, WORKTREE_ADD_CLAIM_WAIT)
-		},
+		// git's own lock files use, with a fresh wait.
+		let unsupported = err.kind() == std::io::ErrorKind::Unsupported;
 		#[cfg(unix)]
-		Err(err) if err.raw_os_error() == Some(libc::ENOLCK) => {
-			claim_worktree_adds(common, WORKTREE_ADD_CLAIM_WAIT)
-		},
-		Err(err) => Err(err.into()),
+		let unsupported = unsupported || err.raw_os_error() == Some(libc::ENOLCK);
+		return if unsupported {
+			claim_worktree_adds(common, wait)
+		} else {
+			Err(err.into())
+		};
 	}
 }
 
@@ -2054,7 +2091,7 @@ fn claim_worktree_adds(common: &Path, wait: std::time::Duration) -> Result<Workt
 				return Ok(WorktreeAddLock::Claimed(id, claim));
 			},
 			Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-				if std::time::Instant::now() >= deadline {
+				if !back_off(deadline, &mut pause) {
 					// Left by a process that died mid-add without its exit cleanup,
 					// as with git's `index.lock`.
 					return Err(Error::backend(
@@ -2066,8 +2103,6 @@ fn claim_worktree_adds(common: &Path, wait: std::time::Duration) -> Result<Workt
 						),
 					));
 				}
-				std::thread::sleep(pause);
-				pause = (pause * 2).min(std::time::Duration::from_millis(500));
 			},
 			Err(err) => return Err(err.into()),
 		}
@@ -3692,5 +3727,54 @@ mod tests {
 			release_worktree_add_claims(std::time::Duration::from_secs(10));
 		});
 		assert!(!claim.exists());
+	}
+
+	fn hold_add_lock(common: &Path) -> fs::File {
+		let file = fs::OpenOptions::new()
+			.create(true)
+			.write(true)
+			.truncate(false)
+			.open(common.join("omp-worktree-add.lock"))
+			.unwrap();
+		file.lock().unwrap();
+		file
+	}
+
+	#[test]
+	fn an_add_behind_a_stalled_lock_holder_is_refused_after_the_wait_instead_of_hanging() {
+		let (_temp, repo) = fixture();
+		let common = repo.info().common_dir.clone();
+		let _stalled = hold_add_lock(&common);
+		let (sender, receiver) = std::sync::mpsc::channel();
+		// Detached: on a build that blocks forever this must fail the test, not
+		// hang it.
+		std::thread::spawn(move || {
+			let refused = lock_worktree_adds_within(&common, std::time::Duration::ZERO)
+				.err()
+				.map(|err| err.to_string());
+			let _ = sender.send(refused);
+		});
+		let refused = receiver
+			.recv_timeout(std::time::Duration::from_secs(5))
+			.expect("the add waited on the lock past its deadline")
+			.expect("an add must not get a lock another process holds");
+		assert!(refused.contains("omp-worktree-add.lock"), "{refused}");
+	}
+
+	#[test]
+	fn a_waiting_add_gets_the_lock_once_the_holder_releases_it() {
+		let (_temp, repo) = fixture();
+		let common = repo.info().common_dir.clone();
+		let holder = hold_add_lock(&common);
+		std::thread::scope(|scope| {
+			let waiting = scope.spawn(|| {
+				lock_worktree_adds_within(&common, std::time::Duration::from_secs(10)).is_ok()
+			});
+			// Only makes it likely the waiter already met the lock; it gets it
+			// either way.
+			std::thread::sleep(std::time::Duration::from_millis(50));
+			drop(holder);
+			assert!(waiting.join().unwrap(), "a waiting add must get the lock once it is free");
+		});
 	}
 }

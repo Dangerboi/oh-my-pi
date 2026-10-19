@@ -162,6 +162,11 @@ export async function copyGitObjects(isolationRoot, sourceRoot) {
 
 /** Bytes kept from the end of each of the hook's output streams. */
 const HOOK_OUTPUT_TAIL_BYTES = 64 * 1024;
+/** Size of a running hook's capture file above which it is cut down to its tail. */
+const HOOK_CAPTURE_CAP_BYTES = 1024 * 1024;
+const HOOK_CAPTURE_POLL_MS = 250;
+// Windows: a child can't write to an append-mode handle, and without append mode truncating doesn't free space.
+const CAP_HOOK_CAPTURE = process.platform !== "win32";
 const HOOK_CAPTURE_PREFIX = "omp-post-checkout-";
 /**
  * Where pids mean the same: hostname, plus on Linux the boot and pid namespace, so containers
@@ -203,9 +208,19 @@ function processAlive(pid) {
 	}
 }
 
-/** This process as the owner of a worktree setup (`setupOwner` of `worktreeAdd`). */
+/** Start identity of process `pid`, where the platform reports one (see `isWorktreeSetupOwnerAlive`). */
+function processStart(pid) {
+	return api().vcsProcessStartTime(pid) ?? undefined;
+}
+
+const OWN_START = processStart(process.pid);
+
+/**
+ * This process as the owner of a worktree setup (`setupOwner` of `worktreeAdd`): scope, pid and,
+ * where the platform reports it, start time.
+ */
 export function worktreeSetupOwner() {
-	return `${PID_SCOPE}-${process.pid}`;
+	return OWN_START === undefined ? `${PID_SCOPE}-${process.pid}` : `${PID_SCOPE}-${process.pid}-${OWN_START}`;
 }
 
 /**
@@ -218,13 +233,17 @@ export function releaseWorktreeAddClaims() {
 }
 
 /**
- * Whether the owner of a worktree setup may still be running it: its process exists, or it is
- * in another pid scope (another host or container), where this process can't tell.
+ * Whether the owner of a worktree setup may still be running it: its process exists and, when the
+ * owner recorded a start time and the platform reports one, started then (else the pid was reused);
+ * or it is in another pid scope (another host or container), where this process can't tell.
  */
 export function isWorktreeSetupOwnerAlive(owner) {
-	const match = /^(.+)-(\d+)$/.exec(owner);
+	const match = /^([^-]+)-(\d+)(?:-(\d+))?$/.exec(owner);
 	if (match?.[1] !== PID_SCOPE) return true;
-	return processAlive(Number(match[2]));
+	const pid = Number(match[2]);
+	if (!processAlive(pid)) return false;
+	const current = match[3] === undefined ? undefined : processStart(pid);
+	return current === undefined || current === match[3];
 }
 
 /**
@@ -265,8 +284,8 @@ async function untilAborted(promise, signal) {
  * Open `file` for a child's output, raced against the abort. Asynchronous, unlike handing
  * `Bun.spawn` a `BunFile`, which opens it on the JS thread, where a stalled TMPDIR would block it.
  */
-async function openCapture(file, signal) {
-	const opening = fs.promises.open(file, "w");
+async function openCapture(file, signal, flags = "w") {
+	const opening = fs.promises.open(file, flags);
 	try {
 		return await untilAborted(opening, signal);
 	} catch (error) {
@@ -309,12 +328,16 @@ function readCapture(file, maxBytes, { fromEnd = false, signal } = {}) {
  * `env`'s PATH. `detached` runs it in its own session even without a signal (POSIX), away from the
  * caller's terminal.
  */
-async function runGitToFiles(args, { cwd, env, stdout = "ignore", stderr = "ignore", signal, detached = false }) {
+async function runGitToFiles(
+	args,
+	{ cwd, env, stdout = "ignore", stderr = "ignore", signal, detached = false, append = false },
+) {
 	const posix = process.platform !== "win32";
 	const handles = [];
 	const sink = async file => {
 		if (file === "ignore") return file;
-		const handle = await openCapture(file, signal);
+		// O_APPEND: the child's writes land at the current end even after the capture is truncated.
+		const handle = await openCapture(file, signal, append ? "a" : "w");
 		handles.push(handle);
 		return handle.fd;
 	};
@@ -514,15 +537,52 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		const outPath = path.join(dir, "stdout");
 		const errPath = path.join(dir, "stderr");
 		const nullOid = "0".repeat(head.length);
-		const exitCode = await runGitToFiles(["hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
-			cwd: worktreeRoot,
-			env,
-			stdout: outPath,
-			stderr: errPath,
-			signal,
-			detached,
-		});
-		const tail = file => readCapture(file, HOOK_OUTPUT_TAIL_BYTES, { fromEnd: true, signal });
+		// Cut each capture file down to its tail while the hook runs, so a chatty one cannot fill the disk.
+		// Output written between reading the tail and truncating is lost; only matters past the cap, and the latest output survives.
+		const saved = new Map([
+			[outPath, new Uint8Array()],
+			[errPath, new Uint8Array()],
+		]);
+		const stopped = Promise.withResolvers();
+		const trim = async file => {
+			const { size } = await untilAborted(fs.promises.stat(file), signal);
+			if (size <= HOOK_CAPTURE_CAP_BYTES) return;
+			saved.set(file, await readCapture(file, HOOK_OUTPUT_TAIL_BYTES, { fromEnd: true, signal }));
+			await untilAborted(fs.promises.truncate(file, 0), signal);
+		};
+		let running = true;
+		const poll = (async () => {
+			while (running && CAP_HOOK_CAPTURE) {
+				await Promise.race([Bun.sleep(HOOK_CAPTURE_POLL_MS), stopped.promise]);
+				if (running) await Promise.all([trim(outPath), trim(errPath)]);
+			}
+		})();
+		// Observed now so a failure during the run is not unhandled; it is rethrown below.
+		poll.catch(() => {});
+		let exitCode;
+		try {
+			exitCode = await runGitToFiles(["hook", "run", "--ignore-missing", "post-checkout", "--", nullOid, head, "1"], {
+				cwd: worktreeRoot,
+				env,
+				stdout: outPath,
+				stderr: errPath,
+				signal,
+				detached,
+				append: CAP_HOOK_CAPTURE,
+			});
+		} finally {
+			running = false;
+			stopped.resolve();
+		}
+		await untilAborted(poll, signal);
+		const tail = async file => {
+			const kept = saved.get(file);
+			const current = await readCapture(file, HOOK_OUTPUT_TAIL_BYTES, { fromEnd: true, signal });
+			const joined = new Uint8Array(kept.length + current.length);
+			joined.set(kept);
+			joined.set(current, kept.length);
+			return joined.subarray(Math.max(0, joined.length - HOOK_OUTPUT_TAIL_BYTES));
+		};
 		const [stdout, stderr] = await Promise.all([tail(outPath), tail(errPath)]);
 		return { exitCode, stdout, stderr };
 	} finally {

@@ -1341,7 +1341,8 @@ describe("github tool", () => {
 				runGit(fixture.repoRoot, ["worktree", "add", "-q", "-b", branch, dir, fixture.headRefOid]);
 				// Another omp process's mark, of this host: one still running, or one that crashed mid-setup.
 				const other = alive ? Bun.spawn(["sleep", "30"]) : Bun.spawnSync(["sh", "-c", "exit 0"]);
-				const owner = vcs.worktreeSetupOwner().replace(/-\d+$/, `-${other.pid}`);
+				// No start time: how an older build wrote it.
+				const owner = vcs.worktreeSetupOwner().replace(/-\d+(-\d+)?$/, `-${other.pid}`);
 				await Bun.write(path.join(runGit(dir, ["rev-parse", "--absolute-git-dir"]), "omp-setup"), `${owner}\n`);
 				try {
 					const checkedOut = checkout(number, new AbortController().signal);
@@ -1358,6 +1359,15 @@ describe("github tool", () => {
 					runGit(fixture.repoRoot, ["worktree", "remove", "--force", dir]);
 				}
 			});
+			it.skipIf(!/^[^-]+-\d+-\d+$/.test(vcs.worktreeSetupOwner()))(
+				"counts an owner whose pid now belongs to a process that started at another time as gone",
+				() => {
+					const own = vcs.worktreeSetupOwner();
+					expect(vcs.isWorktreeSetupOwnerAlive(own)).toBe(true);
+					// Start times are never 1: this is the pid of a process that has since been replaced.
+					expect(vcs.isWorktreeSetupOwnerAlive(own.replace(/-\d+$/, "-1"))).toBe(false);
+				},
+			);
 			it.each([
 				[
 					"committed to",

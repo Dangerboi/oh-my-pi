@@ -91,7 +91,10 @@ export declare function detachGitDir(
 /** Preserve isolation-local Git objects in the source without changing its refs or index. */
 export declare function copyGitObjects(isolationRoot: string, sourceRoot: string): Promise<void>;
 
-/** This process as the owner of a worktree setup: `setupOwner` for `worktreeAdd`. */
+/**
+ * This process as the owner of a worktree setup: `setupOwner` for `worktreeAdd`. Identifies the
+ * process by pid and, where the platform reports it, start time.
+ */
 export declare function worktreeSetupOwner(): string;
 
 /**
@@ -104,8 +107,9 @@ export declare function releaseWorktreeAddClaims(): Promise<void>;
 
 /**
  * Whether the owner of an unfinished worktree setup (`setupOwner` of a listed worktree) may still
- * be running it: its process exists, or it is in another pid scope (host or container), which
- * this process can't judge.
+ * be running it: its process exists and, where the owner recorded a start time and the platform
+ * reports one, started then (else the pid was reused); or it is in another pid scope (host or
+ * container), which this process can't judge.
  */
 export declare function isWorktreeSetupOwnerAlive(owner: string): boolean;
 
@@ -118,7 +122,8 @@ export interface SkippedPostCheckoutHook {
 
 /**
  * Run Git's checkout hook in a new linked worktree and return its exit status and the
- * last 64 KiB of each output stream. The git on `env`'s PATH locates the hook
+ * last 64 KiB of each output stream (the capture files are kept bounded while the hook runs, except on Windows).
+ * The git on `env`'s PATH locates the hook
  * (`git rev-parse --git-path`), seeing every config source; without a git that starts and
  * answers, the in-process lookup (`core.hooksPath`, path expanded, or the shared hooks
  * directory) does, so no git binary is needed when there is no hook. On Windows a
