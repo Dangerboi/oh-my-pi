@@ -2427,7 +2427,9 @@ describe("expanded computer APIs", () => {
 				await shown.promise;
 				expect(native.acquireCount).toBe(0);
 				answer.resolve(approved);
-				expect((await acquiring).details).toMatchObject({ value: { active: approved } });
+				expect((await acquiring).details).toMatchObject({
+					value: approved ? { active: true } : { active: false, reason: "denied" },
+				});
 				expect(
 					(await supervisor.run("return await desktop.control.state()", 2000, snapshot(true))).returnValue,
 				).toEqual({ active: approved });
@@ -2463,7 +2465,7 @@ describe("expanded computer APIs", () => {
 			expect(
 				(await supervisor.run('return await desktop.control.acquire({ reason: "Headless" })', 2000, snapshot()))
 					.returnValue,
-			).toEqual({ active: false });
+			).toEqual({ active: false, reason: "no-ui" });
 			expect(native.acquireCount).toBe(0);
 			const answer = Promise.withResolvers<boolean>();
 			const shown = Promise.withResolvers<void>();
@@ -3519,12 +3521,33 @@ describe("display hold follows the agent turn", () => {
 		expect(native.displayHolds).toEqual(["turn", "release"]);
 		transport.inbound({ type: "resume-display", from: 1, turn: 2 });
 		expect(native.displayHolds).toEqual(["turn", "release", "turn"]);
-		transport.inbound({ type: "tool-reply", id: confirm.id, reply: { ok: true, value: true } });
+		transport.inbound({ type: "tool-reply", id: confirm.id, reply: { ok: true, value: "approved" } });
 		await transport.waitFor(message => message.type === "result" && message.id === "confirming");
 
 		// With no run of that turn active, a resume holds nothing.
 		transport.inbound({ type: "resume-display", from: 2, turn: 3 });
 		expect(native.displayHolds).toEqual(["turn", "release", "turn"]);
+	});
+
+	it("treats the old boolean control reply as a refusal, not a grant", async () => {
+		const native = new FakeNativeSession();
+		const transport = new MemoryTransport();
+		new ComputerWorkerCore(transport, () => native);
+		transport.inbound({
+			type: "run",
+			id: "unknown-verdict",
+			code: 'return await desktop.control.acquire({ reason: "Edit" });',
+			timeoutMs: 2_000,
+			session: snapshot(),
+			escape: escapeScope(),
+		});
+		const confirm = await transport.waitFor(message => message.type === "control-request");
+		if (confirm.type !== "control-request") throw new Error("Expected the run's control confirmation");
+		transport.inbound({ type: "tool-reply", id: confirm.id, reply: { ok: true, value: true } });
+		const result = await transport.waitFor(message => message.type === "result" && message.id === "unknown-verdict");
+		if (result.type !== "result" || !result.ok) throw new Error("control.acquire failed");
+		expect(result.payload.returnValue).toEqual({ active: false, reason: "denied" });
+		expect(native.acquireCount).toBe(0);
 	});
 
 	it("carries a turn resumed while a cold run starts into that run's hold", async () => {

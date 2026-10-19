@@ -347,17 +347,34 @@ fn rescue_shifted_anchors(
 	Ok(rescued)
 }
 
-/// Anchors on lines longer than `max_columns` bytes, which some display path
+/// Lines the seen-line guard checks: the section's authored anchors plus every
+/// line a resolved `PUT N*:`/`CUT N*` replaces or removes. Block inserts and
+/// pastes after a block leave its lines intact, so they keep only their anchor.
+fn guarded_lines(
+	section: &PatchSection,
+	blocks: &[BlockResolution],
+) -> Result<Vec<u32>, EditError> {
+	let mut lines: BTreeSet<u32> = section.collect_anchor_lines()?.into_iter().collect();
+	for block in blocks {
+		if matches!(block.op, BlockOpKind::Replace | BlockOpKind::Cut) {
+			lines.extend(block.start..=block.end);
+		}
+	}
+	Ok(lines.into_iter().collect())
+}
+
+/// Guarded lines longer than `max_columns` bytes, which some display path
 /// may have cut, so the model may never have seen them whole.
 fn possibly_cut_anchors(
 	section: &PatchSection,
+	blocks: &[BlockResolution],
 	text: &str,
 	max_columns: usize,
 ) -> Result<Vec<u32>, EditError> {
 	if max_columns == 0 {
 		return Ok(Vec::new());
 	}
-	let mut anchors = section.collect_anchor_lines()?.into_iter().peekable();
+	let mut anchors = guarded_lines(section, blocks)?.into_iter().peekable();
 	let mut wide = Vec::new();
 	for (number, line) in (1u32..).zip(text.split('\n')) {
 		while anchors.next_if(|&anchor| anchor < number).is_some() {}
@@ -373,6 +390,7 @@ fn possibly_cut_anchors(
 
 fn assert_seen_lines(
 	section: &PatchSection,
+	blocks: &[BlockResolution],
 	expected: &str,
 	canonical: &Path,
 	store: &EditStore,
@@ -384,7 +402,7 @@ fn assert_seen_lines(
 		// file, but which rows were displayed whole is unknown. Lines within
 		// every display cap were shown whole wherever they were shown; a longer
 		// one may have been cut, and replacing it from a cut view drops its tail.
-		let wide = possibly_cut_anchors(section, text, max_columns)?;
+		let wide = possibly_cut_anchors(section, blocks, text, max_columns)?;
 		if wide.is_empty() {
 			return Ok(());
 		}
@@ -396,8 +414,7 @@ fn assert_seen_lines(
 	if seen.is_empty() {
 		return Ok(());
 	}
-	let mut unseen = section
-		.collect_anchor_lines()?
+	let mut unseen = guarded_lines(section, blocks)?
 		.into_iter()
 		.filter(|line| !seen.contains(line))
 		.collect::<Vec<_>>();
@@ -494,7 +511,15 @@ pub(crate) fn apply_with_recovery(
 	validate_clipboard_sequence(&resolved, clipboard)?;
 	if live_matches {
 		if let Some(max_columns) = seen_line_guard {
-			assert_seen_lines(section, expected, canonical, store, normalized, max_columns)?;
+			assert_seen_lines(
+				section,
+				&block_resolutions,
+				expected,
+				canonical,
+				store,
+				normalized,
+				max_columns,
+			)?;
 		}
 		let mut result = apply_edits(normalized, &resolved, ApplyOptions {
 			clipboard:      Some(clipboard),
@@ -1212,6 +1237,24 @@ mod lifecycle {
 		.await
 		.unwrap();
 		assert_eq!(ctx.text("resumed.txt"), original.replacen("note:", "NOTE:", 1));
+	}
+
+	/// A resumed block op guards every line it replaces, not just its anchor:
+	/// a wide interior line may have been shown cut.
+	#[tokio::test]
+	async fn resumed_block_over_wide_line_requires_full_read() {
+		let mut ctx = Lifecycle::new("block.ts", 1);
+		let wide = format!("note: {} END-OF-LINE-TAIL", "abcdefghij".repeat(80));
+		let original = format!("function f() {{\n\tconst x = \"{wide}\";\n\treturn x;\n}}\n");
+		ctx.write_text("block.ts", &original);
+		let tag = ctx.read("block.ts", &[1]);
+		ctx.forget_reads();
+		let err = ctx
+			.edit(&format!("[block.ts#{tag}]\nCUT 1*\n"))
+			.await
+			.unwrap_err();
+		assert!(err.contains("block.ts:2:raw"), "unexpected error: {err}");
+		assert_eq!(ctx.text("block.ts"), original);
 	}
 
 	/// Lines within the display cap were shown whole wherever they were shown,

@@ -213,6 +213,6 @@ Only the transcript is forked; artifacts stay in the source. In the consult, `hi
 
 The consult excludes additional roots, workspace tree, context files, skills, rules, inherited agents, extensions, MCP, IRC, and LSP. It is limited to `read`, `grep`, and `glob` as enabled; `task.structured` (default off) adds hidden `yield`, otherwise the final assistant message completes the report. Cold revival requires the `seanceSource` header and `read` in the persisted tools, restores the persisted prompt, and keeps only seance tools.
 
-Warm or revived IRC follow-ups preserve this completion contract. A yielded follow-up republishes canonical `agent://<id>` output; successful, nonempty unstructured follow-ups also republish their final report when parent-woken or user-prompted, removing a stale `<id>.json` sidecar; peer-only unstructured replies and cancelled or empty follow-ups do not publish.
+Warm or revived IRC follow-ups preserve this completion contract. A yielded follow-up republishes canonical `agent://<id>` output; successful, nonempty unstructured follow-ups also republish their final report when woken by a direct parent message (not an `agent://all` broadcast) or user-prompted, removing a stale `<id>.json` sidecar; peer-only unstructured replies and cancelled or empty follow-ups do not publish.
 
 Inherited source charges are zeroed; new consultation turns use existing task/Agent Hub usage tracking.

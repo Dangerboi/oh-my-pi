@@ -2160,6 +2160,11 @@ export class SelectorController {
 			// are left untouched. `refreshProvider` swallows discovery failures, so
 			// awaiting cannot reject the login.
 			await this.ctx.session.modelRegistry.refreshProvider(getOAuthCredentialProvider(providerId), "online");
+			try {
+				await this.ctx.refreshScopedModelsAfterLogin?.();
+			} catch (error) {
+				logger.warn("Scoped model refresh after login failed", { error: String(error) });
+			}
 			const block = new TranscriptBlock();
 			// Name the account (and Anthropic organization) that was stored so a
 			// login that lands on an unintended account/subscription is visible

@@ -27,6 +27,7 @@ import {
 	relativeSearchResultPath,
 	resolveSearchResultPath,
 	resolveToolSearchScope,
+	searchPathTier,
 } from "./path-utils";
 import { searchApprovalCacheTargets } from "./search-approval-targets";
 import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -141,7 +142,7 @@ async function runMultiTargetAstGrep(
 
 export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolDetails> {
 	readonly name = "ast_grep";
-	readonly approval = "read" as const;
+	readonly approval = searchPathTier;
 	/** `always-ask-cached` keys: the tree (or file) of every root it searches, as `grep` reports them. */
 	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined =>
 		searchApprovalCacheTargets(

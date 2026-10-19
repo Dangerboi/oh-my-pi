@@ -6,6 +6,10 @@
 
 - `AgentTool` gained the optional `approvalCacheTargets` hook, which the `always-ask-cached` approval mode uses to check and record per-file grants ([#16049](https://github.com/can1357/oh-my-pi/pull/16049) by [@Peribunt](https://github.com/Peribunt))
 
+### Changed
+
+- Tools with `lenientArgValidation` now receive unknown root arguments that their closed schema would otherwise drop, so they can reject them ([#16317](https://github.com/can1357/oh-my-pi/issues/16317))
+
 ## [18.12.2] - 2026-10-18
 
 ### Changed

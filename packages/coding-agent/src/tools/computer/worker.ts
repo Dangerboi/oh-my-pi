@@ -46,6 +46,7 @@ import {
 	type ComputerSessionSnapshot,
 	type ComputerWorkerInbound,
 	type ComputerWorkerTransport,
+	type ControlVerdict,
 	ESCAPE_AFTER_CALL_MESSAGE,
 	ESCAPE_STOPPED_MESSAGE,
 	type RunErrorPayload,
@@ -163,7 +164,7 @@ interface ComputerRunContext {
 	readOnly: boolean;
 	snapshot: ComputerSessionSnapshot;
 	output: RunOutput;
-	confirmControl(reason: string): Promise<boolean>;
+	confirmControl(reason: string): Promise<ControlVerdict>;
 	screenshots: ComputerScreenshot[];
 }
 
@@ -1623,13 +1624,14 @@ export class ComputerWorkerCore {
 		return await promise;
 	}
 
-	async #confirmControl(active: ActiveRun, reason: string): Promise<boolean> {
+	async #confirmControl(active: ActiveRun, reason: string): Promise<ControlVerdict> {
 		throwIfAborted(active.signal);
 		const id = `computer-control-${active.id}-${crypto.randomUUID()}`;
 		const pending = Promise.withResolvers<unknown>();
 		active.pendingTools.set(id, pending);
 		this.#transport.send({ type: "control-request", id, runId: active.id, reason });
-		return (await pending.promise) === true;
+		const verdict = await pending.promise;
+		return verdict === "approved" || verdict === "no-ui" ? verdict : "denied";
 	}
 
 	#deliverToolReply(id: string, reply: ToolReply): void {
@@ -1739,7 +1741,9 @@ export class ComputerWorkerCore {
 				},
 			},
 			control: {
-				acquire: async (options: { reason: string }): Promise<{ active: boolean }> => {
+				acquire: async (options: {
+					reason: string;
+				}): Promise<{ active: boolean; reason?: Exclude<ControlVerdict, "approved"> }> => {
 					const context = getContext();
 					guardRun(context, "control.acquire");
 					refuseForeground(
@@ -1752,9 +1756,9 @@ export class ComputerWorkerCore {
 					if (typeof options.reason !== "string" || !options.reason.trim())
 						throw new ToolError("control.acquire requires a non-empty reason");
 					if (session.controlState().active) return { active: true };
-					const approved = await context.confirmControl(options.reason);
+					const verdict = await context.confirmControl(options.reason);
 					throwIfAborted(context.signal);
-					if (!approved) return { active: false };
+					if (verdict !== "approved") return { active: false, reason: verdict };
 					return await nativeCall(context.signal, () => session.acquireControl());
 				},
 				release: async (): Promise<void> => {

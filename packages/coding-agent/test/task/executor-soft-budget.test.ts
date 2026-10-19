@@ -106,6 +106,7 @@ function createMockSession(
 			ircWakeTurnObserver = observer;
 		},
 		trackIrcReply: () => {},
+		isParentIrcSteer: () => false,
 		deliverIrcMessage: async msg => {
 			const record: CustomMessage = {
 				role: "custom",

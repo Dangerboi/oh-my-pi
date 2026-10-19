@@ -31,12 +31,12 @@ describe("session transitions while a tool runs", () => {
 	});
 
 	/** Start a turn whose only tool call settles when the turn is aborted, like `wait` on a long job. */
-	async function startRunningTool() {
+	async function startRunningTool(toolName = "wait") {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic model");
 		const toolStarted = Promise.withResolvers<void>();
 		const waitTool: AgentTool = {
-			name: "wait",
+			name: toolName,
 			label: "Wait",
 			description: "Waits until aborted",
 			parameters: type({}),
@@ -49,7 +49,7 @@ describe("session transitions while a tool runs", () => {
 			},
 		};
 		const mock = createMockModel({
-			responses: [{ content: [{ type: "toolCall", id: CALL_ID, name: "wait", arguments: {} }] }],
+			responses: [{ content: [{ type: "toolCall", id: CALL_ID, name: toolName, arguments: {} }] }],
 			handler: { content: ["done"] },
 		});
 		const agent = new Agent({
@@ -123,6 +123,16 @@ describe("session transitions while a tool runs", () => {
 
 		expect(await persistedCallEntries(sessionFile)).toEqual(["assistant", "toolResult"]);
 		expect(sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
+	});
+
+	it("does not record a rewind the interrupted turn never applied", async () => {
+		const { active, sessionManager, sessionFile, prompt } = await startRunningTool("rewind");
+
+		await active.compact();
+		await prompt;
+		await sessionManager.flush();
+
+		expect(await persistedCallEntries(sessionFile)).toEqual(["assistant"]);
 	});
 
 	it("keeps the interrupted tool's result in the old session on /new", async () => {

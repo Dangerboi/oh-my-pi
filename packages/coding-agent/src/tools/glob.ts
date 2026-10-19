@@ -23,6 +23,7 @@ import {
 	resolveExplicitFindPatterns,
 	resolveSearchBase,
 	resolveSearchResultPath,
+	searchPathTier,
 } from "./path-utils";
 import { searchApprovalCacheTargets } from "./search-approval-targets";
 import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -117,7 +118,7 @@ interface NativePreparedTarget {
 
 export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 	readonly name = "glob";
-	readonly approval = "read" as const;
+	readonly approval = searchPathTier;
 	/**
 	 * `always-ask-cached` keys: the folders and files this glob searches, so a
 	 * folder grant recorded by a `read` (or by a grep) covers a search inside it

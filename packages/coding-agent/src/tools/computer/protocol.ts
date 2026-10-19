@@ -29,6 +29,12 @@ export interface ComputerSessionSnapshot {
 /** Reply envelope for a session tool invoked by desktop JavaScript. */
 export type ToolReply = { ok: true; value: unknown } | { ok: false; error: RunErrorPayload };
 
+/**
+ * The host's answer to a `control.acquire` confirmation: the user approved or declined, or nobody could be
+ * asked because the session has no interactive UI (a subagent, print mode or another headless run).
+ */
+export type ControlVerdict = "approved" | "denied" | "no-ui";
+
 /** Where the native session counts the user's Escape stops, and how many the user's latest message acknowledged. */
 export interface ComputerEscapeScope {
 	key: string;
