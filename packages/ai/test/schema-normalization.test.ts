@@ -1612,6 +1612,31 @@ describe("normalizeSchemaForFactoryDroid", () => {
 		expect(both).toEqual({ anyOf: [{ type: "string" }, { type: "number", minimum: 3 }] });
 	});
 
+	it("keeps intersected enums, untyped-branch narrowing and union patterns faithful to the source", () => {
+		// Enum conjunction admits only values both sides allow; an empty pairing drops out.
+		const enums = normalizeSchemaForFactoryDroid({
+			allOf: [
+				{ anyOf: [{ type: "string", enum: ["a", "b"] }, { type: "number" }] },
+				{ anyOf: [{ type: "string", enum: ["b", "c"] }, { type: "boolean" }] },
+			],
+		});
+		expect(enums).toEqual({ type: "string", enum: ["b"], nullable: false });
+
+		// A typed branch of another type does not lend `items` to a string through an untyped sibling.
+		const untyped = normalizeSchemaForFactoryDroid({
+			anyOf: [{}, { type: "array", items: { type: "string" } }],
+			allOf: [{ type: "string" }],
+		});
+		expect(untyped).toEqual({ type: "string", nullable: false });
+
+		// The union's pattern is narrower than a match-all an allOf merged in first.
+		const patterned = normalizeSchemaForFactoryDroid({
+			anyOf: [{ type: "string", pattern: "^a$" }],
+			allOf: [{ type: "string", pattern: ".*" }],
+		});
+		expect(patterned).toEqual({ type: "string", pattern: "^a$", nullable: false });
+	});
+
 	it("drops required names a mixed-union branch does not define", () => {
 		const normalized = normalizeSchemaForFactoryDroid({
 			anyOf: [{ type: "object", required: ["a"] }, { type: "string" }],

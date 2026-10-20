@@ -158,6 +158,7 @@ export class IrcBridge {
 				const from = Reflect.get(details, "from");
 				const body = Reflect.get(details, "message");
 				const replyTo = Reflect.get(details, "replyTo");
+				const broadcast = Reflect.get(details, "broadcast") === true;
 				if (typeof id !== "string" || typeof from !== "string" || typeof body !== "string") {
 					queue.remaining.push(record);
 					continue;
@@ -177,6 +178,7 @@ export class IrcBridge {
 					body,
 					ts: record.timestamp,
 					...(typeof replyTo === "string" ? { replyTo } : {}),
+					...(broadcast ? { broadcast: true } : {}),
 				});
 			}
 		}
@@ -234,7 +236,8 @@ export class IrcBridge {
 					timestamp: msg.ts,
 					steering: true,
 				};
-				this.#parentSteers.add(steer);
+				// A broadcast leg asks no one in particular: consuming it never makes the turn the parent's.
+				if (msg.broadcast !== true) this.#parentSteers.add(steer);
 				this.#host.agent.steer(steer);
 			} else {
 				this.#interrupts.push(record);

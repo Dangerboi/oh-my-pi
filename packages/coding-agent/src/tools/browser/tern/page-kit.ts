@@ -470,9 +470,9 @@ const idrefText = (el, attribute) => {
 	return normalizeSpace(ids.map(id => {
 		const target = lookup(id);
 		if (!target) return "";
-		// A hidden target is read whole, as the accessibility tree reads one aria-labelledby names;
-		// its own aria-labelledby is not followed (no chains, no cycles).
-		return contentText(target, null, getComputedStyle(target).visibility === "visible" ? "visible" : "any", false);
+		// A hidden target (visibility, display: none, aria-hidden, a hidden ancestor) is read whole, as the
+		// accessibility tree reads one aria-labelledby names; its own aria-labelledby is not followed.
+		return contentText(target, null, hiddenForA11y(target) ? "any" : "visible", false);
 	}).join(" "));
 };
 const hiddenForA11y = el => {
@@ -496,7 +496,7 @@ const contentText = (el, skip, visibility = "visible", followRefs = true) => {
 				continue;
 			}
 			if (child.nodeType !== Node.ELEMENT_NODE || child === skip || SKIP_TAGS.has(child.localName)) continue;
-			if (child.getAttribute("aria-hidden") === "true") continue;
+			if (visibility !== "any" && child.getAttribute("aria-hidden") === "true") continue;
 			const style = getComputedStyle(child);
 			if (style.display === "none" && visibility !== "any") continue;
 			const block = style.display !== "inline" && style.display !== "contents";

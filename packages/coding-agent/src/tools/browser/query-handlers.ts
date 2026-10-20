@@ -169,7 +169,7 @@ export function queryByRole(node: QueryNode, selector: string): Element[] {
 				const childElement = child as Element;
 				const tag = childElement.tagName.toLocaleLowerCase();
 				if (["script", "style", "template", "noscript"].includes(tag)) continue;
-				if (childElement.getAttribute("aria-hidden") === "true") continue;
+				if (visibility !== "any" && childElement.getAttribute("aria-hidden") === "true") continue;
 				const style = getComputedStyle(childElement);
 				if (style.display === "none" && visibility !== "any") continue;
 				const gap = style.display === "inline" || style.display === "contents" ? "" : " ";
@@ -226,12 +226,13 @@ export function queryByRole(node: QueryNode, selector: string): Element[] {
 				.map(id => {
 					const target = element.ownerDocument?.getElementById(id);
 					if (!target) return "";
-					return contentText(
-						target,
-						null,
-						getComputedStyle(target).visibility === "visible" ? "visible" : "any",
-						false,
-					);
+					// Hidden by visibility, `display: none`, or a `hidden`/`aria-hidden` ancestor: read the whole subtree.
+					const targetStyle = getComputedStyle(target);
+					const hidden =
+						targetStyle.visibility !== "visible" ||
+						targetStyle.display === "none" ||
+						target.closest("[hidden], [aria-hidden='true']") !== null;
+					return contentText(target, null, hidden ? "any" : "visible", false);
 				})
 				.join(" "),
 		);

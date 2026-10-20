@@ -1201,7 +1201,7 @@ fn break_long_word(
 		{
 			let seq = &word[i..i + seq_len];
 			if let Some(seq_width) = osc66_visible_width_u16(seq, tab_width) {
-				if current_width.saturating_add(seq_width) > width {
+				if current_width > 0 && current_width.saturating_add(seq_width) > width {
 					write_line_end_reset(state, &mut current_line);
 					lines.push(current_line);
 					current_line = Vec::new();
@@ -1241,7 +1241,8 @@ fn break_long_word(
 		if is_ascii {
 			for &u in seg {
 				let gw = ascii_cell_width_u16(u, tab_width);
-				if current_width + gw > width {
+				// A glyph wider than the row starts it, never after an empty row.
+				if current_width > 0 && current_width + gw > width {
 					write_line_end_reset(state, &mut current_line);
 					lines.push(current_line);
 					current_line = Vec::new();
@@ -1253,7 +1254,7 @@ fn break_long_word(
 			}
 		} else {
 			let _ = for_each_grapheme_u16_slow(seg, tab_width, |gu16, gw| {
-				if current_width + gw > width {
+				if current_width > 0 && current_width + gw > width {
 					write_line_end_reset(state, &mut current_line);
 					lines.push(std::mem::take(&mut current_line));
 					write_active_codes(state, &mut current_line);
@@ -2293,6 +2294,11 @@ mod tests {
 	#[test]
 	fn test_wrap_text_with_ansi_wave_dash_never_starts_row() {
 		assert_eq!(wrap("一二〜三", 4), ["一", "二〜", "三"]);
+	}
+
+	#[test]
+	fn test_wrap_text_with_ansi_wide_glyphs_at_width_one_leave_no_blank_rows() {
+		assert_eq!(wrap("中文", 1), ["中", "文"]);
 	}
 
 	#[test]

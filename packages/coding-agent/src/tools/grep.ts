@@ -149,17 +149,18 @@ function parseExternalUrlSpec(entry: string): { clean: string; ranges?: [LineRan
 	// by line number, exactly like it does for a filesystem path.
 	if (parseLineRanges(split.sel) !== null) return null;
 	if (!isReadableUrlPath(split.path)) return null;
-	if (split.sel.toLowerCase() === "conflicts") {
-		// Display-only mode: drop the selector and search the whole resource.
-		return { clean: split.path };
-	}
-	const target = parseReadUrlTarget(entry);
-	if (!target) return null;
+	// `:conflicts` is display-only: drop it, then read whatever selectors precede it
+	// (`…:10-20:conflicts` keeps its range, `…:-5:conflicts` is still rejected).
+	const conflicts = split.sel.toLowerCase() === "conflicts";
+	const target = parseReadUrlTarget(conflicts ? split.path : entry);
+	if (!target) return conflicts ? { clean: split.path } : null;
 	if (target.sel.kind === "tail") {
 		throw new ToolError(
 			`path entry "${entry}" has an invalid selector ":-${target.sel.count}" — use ":N-M" line ranges, ":raw"/":conflicts", a range plus ":raw", or percent-encode a literal ":" as %3A`,
 		);
 	}
+	// No URL selector left: only `:conflicts` names the whole resource; anything else (`:img`) is not URL grammar.
+	if (target.sel.kind === "none") return conflicts ? { clean: target.path } : null;
 	if (target.sel.kind === "raw") {
 		// Forward the selector verbatim — the fetch path reads it back.
 		return { clean: `${target.path}:raw` };

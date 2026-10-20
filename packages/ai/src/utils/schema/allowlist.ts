@@ -102,13 +102,20 @@ function mergeFactoryDroidSchemas(left: JsonObject, right: JsonObject, requiredM
 	return merged;
 }
 
-/** Branch-wise conjunction of two unions: each same-typed (or untyped) pair merged. */
+/** Branch-wise conjunction of two unions: each same-typed (or untyped) pair merged, enums intersected. */
 function intersectUnionBranches(left: JsonObject[], right: JsonObject[]): JsonObject[] {
 	const pairs: JsonObject[] = [];
 	for (const a of left) {
 		for (const b of right) {
 			if (a.type !== undefined && b.type !== undefined && a.type !== b.type) continue;
-			pairs.push(mergeFactoryDroidSchemas(a, b, "union"));
+			const pair = mergeFactoryDroidSchemas(a, b, "union");
+			if (Array.isArray(a.enum) && Array.isArray(b.enum)) {
+				// The merge unions enums; a conjunction admits only values both allow.
+				const allowed = (a.enum as unknown[]).filter(value => (b.enum as unknown[]).includes(value));
+				if (allowed.length === 0) continue;
+				pair.enum = allowed;
+			}
+			pairs.push(pair);
 		}
 	}
 	return pairs;
@@ -152,6 +159,11 @@ function settleUnion(out: JsonObject, branches: JsonObject[], nullable: boolean)
 			: (out.type ?? (isJsonObject(out.properties) ? "object" : undefined));
 		const kept = ownType ?? nonNull[0].type;
 		nonNull = nonNull.filter(branch => branch.type === kept);
+	} else if (typeof out.type === "string") {
+		// An untyped branch keeps the union from counting as mixed, but a typed branch of another type
+		// still must not lend its fields (`items` on a string) to this node.
+		const compatible = nonNull.filter(branch => branch.type === undefined || branch.type === out.type);
+		if (compatible.length > 0) nonNull = compatible;
 	}
 	let collapsed: JsonObject | undefined;
 	for (const branch of nonNull) {
@@ -160,6 +172,9 @@ function settleUnion(out: JsonObject, branches: JsonObject[], nullable: boolean)
 	if (collapsed) {
 		collapsed.nullable = nullable;
 		Object.assign(out, mergeFactoryDroidSchemas(out, collapsed, "union"));
+		// A pattern cannot be conjoined into one regex the proxy accepts; the union's own,
+		// narrower one wins over one an `allOf` merged in first.
+		if (typeof collapsed.pattern === "string") out.pattern = collapsed.pattern;
 		// Narrowing can drop the branch that defined a required property.
 		if (mixedTypes && Array.isArray(out.required)) {
 			const kept = withoutUndefinedRequired(out);

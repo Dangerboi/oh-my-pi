@@ -2,6 +2,7 @@ import type { ToolTier } from "@oh-my-pi/pi-agent-core";
 import { extractUriScheme } from "../internal-urls/parse";
 import { type LineRange } from "@oh-my-pi/pi-tui/tools/line-ranges";
 import { splitPathAndSel, isReadableUrlPath } from "@oh-my-pi/pi-tui/tools/read";
+import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -258,7 +259,9 @@ export async function probeLiteralPathExists(filePath: string, cwd: string): Pro
  * filenames or NTFS alternate data streams, so a confirmed `lstat` always
  * preserves the literal path. Ambiguous probe errors preserve the literal on
  * POSIX, where colon filenames are valid, but fall back to the strict split on
- * Windows, where only a confirmed alternate data stream can be literal.
+ * Windows, where only a confirmed alternate data stream can be literal. A list
+ * repeating its colon (`a:1-30,:-30`) folds into one selector unless the path
+ * before the last colon (`a:1-30,`) names an existing file.
  */
 export async function splitPathAndSelPreferringLiteral(
 	rawPath: string,
@@ -267,7 +270,11 @@ export async function splitPathAndSelPreferringLiteral(
 	const strict = splitPathAndSel(rawPath);
 	if (strict.sel === undefined) return strict;
 	const probe = await probeLiteralPathExists(rawPath, cwd);
-	return probe === "exists" || (probe === "unknown" && process.platform !== "win32") ? { path: rawPath } : strict;
+	if (probe === "exists" || (probe === "unknown" && process.platform !== "win32")) return { path: rawPath };
+	const unfolded = splitPathAndSel(rawPath, { foldListColons: false });
+	if (unfolded.path !== strict.path && (await probeLiteralPathExists(unfolded.path, cwd)) === "exists")
+		return unfolded;
+	return strict;
 }
 
 /**
@@ -296,7 +303,10 @@ export function splitPathAndSelPreferringLiteralSync(rawPath: string, cwd: strin
 	const strict = splitPathAndSel(rawPath);
 	if (strict.sel === undefined) return strict;
 	const probe = probeLiteralPathExistsSync(rawPath, cwd);
-	return probe === "exists" || (probe === "unknown" && process.platform !== "win32") ? { path: rawPath } : strict;
+	if (probe === "exists" || (probe === "unknown" && process.platform !== "win32")) return { path: rawPath };
+	const unfolded = splitPathAndSel(rawPath, { foldListColons: false });
+	if (unfolded.path !== strict.path && probeLiteralPathExistsSync(unfolded.path, cwd) === "exists") return unfolded;
+	return strict;
 }
 
 function assertNotInternalUrl(expanded: string, original: string): void {
@@ -724,6 +734,9 @@ export async function splitDelimitedPathEntry(
 	// with glob syntax (`a;b[1].md:1-2`). Check the exact peeled path before the
 	// search splitter interprets those characters and semicolon fan-out wins.
 	if (selectorSplit.sel !== undefined && (await probeLiteralPathExists(peeledEntry, cwd)) !== "missing") return null;
+	// `a:1-30,:-30` may name a literal `a:1-30,` with a tail selector instead of `a` with a list.
+	const unfoldedPath = splitPathAndSel(normalizedEntry, { foldListColons: false }).path;
+	if (unfoldedPath !== peeledEntry && (await probeLiteralPathExists(unfoldedPath, cwd)) !== "missing") return null;
 	if (!hasGlobPathChars(peeledEntry) && (await delimitedPathPartResolves(normalizedEntry, cwd, splitter))) {
 		return null;
 	}
@@ -1409,8 +1422,13 @@ export interface ToolScopeResolution {
 /** Approval tier for a search tool's raw `path` (or legacy `paths`) input: the highest scheme read tier named anywhere in it. */
 export function searchPathTier(args: unknown): ToolTier {
 	const raw = isRecord(args) ? (args.path ?? args.paths) : undefined;
+	// The tools decode JSON-encoded arrays (`["ssh:\/\/host"]`) the same way before resolving.
 	const entries =
-		typeof raw === "string" ? [raw] : Array.isArray(raw) ? raw.filter(entry => typeof entry === "string") : [];
+		typeof raw === "string"
+			? toPathList(raw)
+			: Array.isArray(raw)
+				? raw.filter(entry => typeof entry === "string")
+				: [];
 	// Substring scan over the raw entries: delimited lists are only split after approval.
 	return InternalUrlRouter.instance().readTier(entries.join("\n"));
 }

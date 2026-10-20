@@ -51,6 +51,7 @@ describe("ssh:// tools require exec-tier approval", () => {
 		// Unvalidated args may still carry a list or the legacy `paths` key.
 		expect(callApproval(tool, { path: ["src", "ssh://icaro/etc/hosts"] })).toBe("exec");
 		expect(callApproval(tool, { paths: "src,ssh://icaro/etc/hosts" })).toBe("exec");
+		expect(callApproval(tool, { path: '["src","ssh:\\/\\/icaro\\/etc\\/hosts"]' })).toBe("exec");
 		expect(callApproval(tool, { path: "src,lib" })).toBe("read");
 		expect(callApproval(tool, { path: "src" })).toBe("read");
 		expect(callApproval(tool, {})).toBe("read");

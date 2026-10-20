@@ -71,6 +71,19 @@ describe("GrepTool external URL selectors", () => {
 		const tool = new GrepTool(createSession());
 
 		await expect(tool.execute("tail", { pattern: "needle", path: `${url}:-5` })).rejects.toThrow(/invalid selector/i);
+		await expect(tool.execute("tail-conflicts", { pattern: "needle", path: `${url}:-5:conflicts` })).rejects.toThrow(
+			/invalid selector/i,
+		);
+	});
+
+	it("keeps a line range that precedes :conflicts as a match filter", async () => {
+		const tool = new GrepTool(createSession());
+
+		// The rendered body puts the match on line 2: a 1-1 range excludes it, a 2-2 range keeps it.
+		const outside = await tool.execute("range-conflicts", { pattern: "needle", path: `${url}:1-1:conflicts` });
+		expect(getResultText(outside)).not.toContain("needle");
+		const inside = await tool.execute("range-conflicts-hit", { pattern: "needle", path: `${url}:2-2:conflicts` });
+		expect(getResultText(inside)).toContain("needle");
 	});
 
 	it("fetches an archive-named URL with :raw instead of opening it as a local archive member", async () => {
