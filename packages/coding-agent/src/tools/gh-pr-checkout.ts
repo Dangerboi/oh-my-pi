@@ -447,8 +447,8 @@ export async function checkoutPullRequest(
 		async () => {
 			const repository = await vcs.discoverGit(repoRoot, signal);
 			if (!repository) throw new ToolError("Current git repository is unavailable.");
-			const existingWorktrees = await repository.worktrees(signal);
-			const existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
+			let existingWorktrees = await repository.worktrees(signal);
+			let existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
 			const setupOwner = existingWorktree?.setupOwner;
 			if (existingWorktree && setupOwner) {
 				// Another omp process is still creating it or running its hook, and discards it if that fails.
@@ -457,8 +457,29 @@ export async function checkoutPullRequest(
 						`the worktree of ${localBranch} at ${existingWorktree.path} is still being set up by another omp process; retry once it is done (if none is, delete \`omp-setup\` in its git dir: \`git -C ${existingWorktree.path} rev-parse --git-dir\`)`,
 					);
 				}
-				// That omp exited mid-setup: the worktree is taken over as it is, as before setups were marked.
-				await repository.worktreeEndSetup(existingWorktree.path, signal);
+				const staleDir = existingWorktree.path;
+				const checkoutExists = await untilAborted(signal, () =>
+					fs.stat(staleDir).then(
+						() => true,
+						error => {
+							if (isEnoent(error) || (error as NodeJS.ErrnoException).code === "ENOTDIR") return false;
+							throw error;
+						},
+					),
+				);
+				await repository.worktreeEndSetup(staleDir, signal);
+				if (!checkoutExists) {
+					// That omp's rollback removed the checkout but left the registration: drop it and create the worktree afresh.
+					await repository.worktreePrune(signal);
+					existingWorktrees = await repository.worktrees(signal);
+					existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
+					if (existingWorktree) {
+						throw new ToolError(
+							`the registration of the worktree of ${localBranch} at ${existingWorktree.path} is stale but git keeps it (locked?); run \`git worktree unlock ${existingWorktree.path}\` if so, then \`git worktree prune\`, and retry`,
+						);
+					}
+				}
+				// Otherwise that omp exited mid-setup: the worktree is taken over as it is, as before setups were marked.
 			}
 
 			const remote = await ensurePrRemoteWithRepo(repoRoot, data, repository, signal);

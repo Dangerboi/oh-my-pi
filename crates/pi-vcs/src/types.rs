@@ -99,6 +99,10 @@ pub struct LinkedWorktree {
 pub struct WorktreeEntry {
 	/// Checkout root of the worktree.
 	pub path:        PathBuf,
+	/// The worktree's git directory: `<common dir>/worktrees/<id>` for a linked
+	/// worktree, unchanged by `git worktree move`; the common git dir for the
+	/// main one.
+	pub git_dir:     PathBuf,
 	/// HEAD commit, when known.
 	pub head:        Option<String>,
 	/// Checked-out branch ref, when not detached.

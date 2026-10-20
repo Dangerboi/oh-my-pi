@@ -456,7 +456,7 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 				mode: string,
 				...rest: []
 			) =>
-				mode === "w" && path.basename(path.dirname(String(file))).startsWith("omp-post-checkout-")
+				["w", "a"].includes(mode) && path.basename(path.dirname(String(file))).startsWith("omp-post-checkout-")
 					? Promise.reject(Object.assign(new Error("no space left on device"), { code: "ENOSPC" }))
 					: realOpen(file, mode, ...rest)) as typeof realOpen);
 			try {
@@ -587,6 +587,23 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 
 			expect(worktreePaths(repo)).toEqual([repo]);
 			expect(branchSha(repo, branch)).toBeNull();
+		});
+
+		it("an abort after the hook renamed its branch and moved its worktree discards it at the new path", async () => {
+			const signalPipe = path.join(root, "hook-renamed");
+			const origin = path.join(root, "hook-origin");
+			expect(Bun.spawnSync(["mkfifo", signalPipe]).exitCode).toBe(0);
+			await hook(
+				`unset GIT_DIR GIT_WORK_TREE\necho "$PWD" > "${origin}"\ngit -C "${repo}" branch -m "${branch}" "${branch}-renamed"\ngit -C "${repo}" worktree move "$PWD" "$PWD-moved"\necho moved > "${signalPipe}"\nsleep 600`,
+			);
+			const controller = new AbortController();
+			const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+			await Bun.file(signalPipe).text();
+			controller.abort();
+			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+
+			expect(worktreePaths(repo)).toEqual([repo]);
+			expect(await exists(`${(await Bun.file(origin).text()).trim()}-moved`)).toBe(false);
 		});
 
 		it("keeps the setup mark on a cut-short worktree that could not be removed, so other processes refuse it", async () => {
@@ -809,6 +826,77 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(new TextDecoder().decode(output).trimEnd().endsWith("LAST-LINE")).toBe(true);
 		});
 
+		it.skipIf(process.platform === "win32")(
+			"stops a probe's lingering writer by closing its output instead of capturing it in a file",
+			async () => {
+				const wt = await create();
+				await hook("touch .post-checkout-ran");
+				const bin = path.join(root, "noisy-probe-bin");
+				const writerPid = path.join(root, "probe-writer-pid");
+				// The wrapper answers, then leaves a child that keeps writing to the stdout it inherited.
+				await Bun.write(
+					path.join(bin, "git"),
+					`#!/bin/sh\n"${Bun.which("git")}" "$@" || exit $?\nif [ "$1" = version ]; then\n(while :; do echo noise; sleep 0.01; done) &\necho $! > "${writerPid}"\nfi\n`,
+				);
+				await fs.chmod(path.join(bin, "git"), 0o755);
+				const env = { ...filterChildShellEnv(process.env), PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+				const alive = (pid: number) => {
+					try {
+						process.kill(pid, 0);
+						return true;
+					} catch {
+						return false;
+					}
+				};
+				let pid = 0;
+				try {
+					const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, { env });
+					pid = Number((await fs.readFile(writerPid, "utf8")).trim());
+					expect(result.exitCode).toBe(0);
+					// Real wait: the writer dies on its own schedule, visible only as its pid vanishing.
+					for (let i = 0; i < 60 && alive(pid); i++) await Bun.sleep(50);
+					// Its next write hits the closed pipe (SIGPIPE).
+					expect(alive(pid)).toBe(false);
+				} finally {
+					if (pid) {
+						try {
+							process.kill(pid, "SIGKILL");
+						} catch {
+							// Already gone.
+						}
+					}
+				}
+			},
+		);
+
+		it("runs the hook when a slow filesystem opens its capture files after the first trim poll", async () => {
+			const wt = await create();
+			await hook("sleep 0.6");
+			const realOpen = nodeFs.promises.open;
+			const open = spyOn(nodeFs.promises, "open").mockImplementation((async (
+				file: nodeFs.PathLike,
+				...rest: [string]
+			) => {
+				const target = String(file);
+				if (
+					["stdout", "stderr"].includes(path.basename(target)) &&
+					path.basename(path.dirname(target)).startsWith("omp-post-checkout-")
+				) {
+					// Real wait, longer than the trim's real poll timer, which a fake clock would not reproduce.
+					await Bun.sleep(400);
+				}
+				return realOpen(file, ...rest);
+			}) as typeof realOpen);
+			try {
+				const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
+					env: filterChildShellEnv(process.env),
+				});
+				expect(result.exitCode).toBe(0);
+			} finally {
+				open.mockRestore();
+			}
+		});
+
 		it("runs the hook away from the terminal of the agent that started it", async () => {
 			await hook("ps -o pgid= -p $$ > .post-checkout-group");
 			const wt = await create();
@@ -919,7 +1007,6 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 		});
 
 		it.each([
-			["reading the hook-path probe's output", "rev-parse", "r"],
 			["reading the hook's output", "stdout", "r"],
 			["creating the hook's output file", "stdout", "a"],
 		])("abort is not held up by a stalled filesystem when %s", async (_name, capture, flags) => {

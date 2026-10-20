@@ -1359,6 +1359,28 @@ describe("github tool", () => {
 					runGit(fixture.repoRoot, ["worktree", "remove", "--force", dir]);
 				}
 			});
+			it("recreates a worktree whose dead owner's rollback removed the checkout but left its registration", async () => {
+				mockPrView(134);
+				const primaryRoot = vcs.requireGit(fixture.repoRoot).primaryRoot() ?? fixture.repoRoot;
+				const dir = path.join(tempHome.home, ".omp", "wt", `134-${hashPath(primaryRoot)}`);
+				const branch = "pr-134";
+				runGit(fixture.repoRoot, ["worktree", "add", "-q", "-b", branch, dir, fixture.headRefOid]);
+				const owner = vcs
+					.worktreeSetupOwner()
+					.replace(/-\d+(-\d+)?$/, `-${Bun.spawnSync(["sh", "-c", "exit 0"]).pid}`);
+				await Bun.write(path.join(runGit(dir, ["rev-parse", "--absolute-git-dir"]), "omp-setup"), `${owner}\n`);
+				await fs.rm(dir, { recursive: true, force: true });
+
+				const outcome = await checkout(134, new AbortController().signal);
+
+				try {
+					expect(runGit(outcome.worktreePath, ["rev-parse", "HEAD"])).toBe(fixture.headRefOid);
+					expect(runGit(outcome.worktreePath, ["branch", "--show-current"])).toBe(branch);
+					expect(await setupOwnerOf(fixture.repoRoot, branch)).toBeUndefined();
+				} finally {
+					runGit(fixture.repoRoot, ["worktree", "remove", "--force", outcome.worktreePath]);
+				}
+			});
 			it.skipIf(!/^[^-]+-\d+-\d+$/.test(vcs.worktreeSetupOwner()))(
 				"counts an owner whose pid now belongs to a process that started at another time as gone",
 				() => {

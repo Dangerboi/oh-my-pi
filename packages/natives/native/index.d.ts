@@ -3996,6 +3996,15 @@ export declare function vcsDiscoverAsync(dir: string, signal?: unknown | undefin
  */
 export declare function vcsDiscoverForDisplay(dir: string): VcsRepo | null
 
+/**
+ * Deallocate the head of a capture file another process is still writing,
+ * so it stops taking disk space.
+ *
+ * The size and the last `keep_bytes` bytes are unchanged. Windows only:
+ * resolves `false` elsewhere, and on a filesystem without sparse files.
+ */
+export declare function vcsDropCaptureHead(path: string, keepBytes: number, signal?: unknown | undefined | null): Promise<boolean>
+
 /** Clone a Git repository. */
 export declare function vcsGitClone(url: string, target: string, options: VcsCloneOptions, signal?: unknown | undefined | null): Promise<void>
 
@@ -4164,6 +4173,12 @@ export interface VcsWorktreeEntry {
    * added); unset once it is done.
    */
   setupOwner?: string
+  /**
+   * The worktree's git directory: `<common dir>/worktrees/<id>` for a linked
+   * worktree, which stays the same when `git worktree move` moves it; the
+   * common git dir for the main one.
+   */
+  gitDir: string
 }
 
 /**

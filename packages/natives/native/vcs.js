@@ -165,8 +165,9 @@ const HOOK_OUTPUT_TAIL_BYTES = 64 * 1024;
 /** Size of a running hook's capture file above which it is cut down to its tail. */
 const HOOK_CAPTURE_CAP_BYTES = 1024 * 1024;
 const HOOK_CAPTURE_POLL_MS = 250;
-// Windows: a child can't write to an append-mode handle, and without append mode truncating doesn't free space.
-const CAP_HOOK_CAPTURE = process.platform !== "win32";
+// POSIX: truncating an append-mode file frees its space while the child keeps writing at the end. Windows: a child
+// can't write to an append-mode handle, and truncating without append frees nothing, so the head is deallocated instead.
+const TRUNCATE_HOOK_CAPTURE = process.platform !== "win32";
 const HOOK_CAPTURE_PREFIX = "omp-post-checkout-";
 /**
  * Where pids mean the same: hostname, plus on Linux the boot and pid namespace, so containers
@@ -323,14 +324,15 @@ function readCapture(file, maxBytes, { fromEnd = false, signal } = {}) {
 
 /**
  * Run `git <args>` with output to the files `stdout`/`stderr` (paths, or "ignore") and resolve with
- * its exit code. Aborting `signal` kills its process tree, descendants that left its process group
+ * its exit code. `readStdout(stream, exited)` instead pipes stdout to it and is awaited alongside
+ * the exit. Aborting `signal` kills its process tree, descendants that left its process group
  * included (see the shortcut below), and rejects with the reason. Throws `ENOENT` when no git is on
  * `env`'s PATH. `detached` runs it in its own session even without a signal (POSIX), away from the
  * caller's terminal.
  */
 async function runGitToFiles(
 	args,
-	{ cwd, env, stdout = "ignore", stderr = "ignore", signal, detached = false, append = false },
+	{ cwd, env, stdout = "ignore", stderr = "ignore", signal, detached = false, append = false, readStdout },
 ) {
 	const posix = process.platform !== "win32";
 	const handles = [];
@@ -342,7 +344,7 @@ async function runGitToFiles(
 		return handle.fd;
 	};
 	try {
-		const out = await sink(stdout);
+		const out = readStdout ? "pipe" : await sink(stdout);
 		const err = await sink(stderr);
 		// No await between this check and the abort listener below, so no abort can be missed.
 		signal?.throwIfAborted();
@@ -381,7 +383,8 @@ async function runGitToFiles(
 		signal?.addEventListener("abort", onAbort, { once: true });
 		let exitCode;
 		try {
-			exitCode = await child.exited;
+			const reading = readStdout?.(child.stdout, child.exited);
+			[exitCode] = await Promise.all([child.exited, reading]);
 		} finally {
 			signal?.removeEventListener("abort", onAbort);
 		}
@@ -398,30 +401,84 @@ const GIT_CANNOT_START = new Set(["ENOENT", "ENOEXEC", "EACCES"]);
 
 /** Bytes read from a probe's output: enough for a version line or a path, bounded for noisy wrappers. */
 const PROBE_OUTPUT_BYTES = 4096;
+/** How long a probe keeps reading after git exited without having ended a line. */
+const PROBE_EXIT_GRACE_MS = 100;
 
 /**
- * Run `git <args>` for its output: written to a file in `captureDir`, so a wrapper's lingering
- * child cannot hold it back, and read up to {@link PROBE_OUTPUT_BYTES}. Null when no git starts
- * or the command fails.
+ * Read up to {@link PROBE_OUTPUT_BYTES} of `stream`, stopping at EOF, the cap, git's exit with a
+ * finished line read, or {@link PROBE_EXIT_GRACE_MS} after its exit. Then the read end is closed,
+ * so a lingering writer gets EPIPE instead of holding the probe up or growing a file.
  */
-async function gitProbe(args, captureDir, cwd, { env, signal, detached }) {
-	const outPath = path.join(captureDir, args[0]);
+async function readProbeOutput(stream, exited) {
+	const reader = stream.getReader();
+	const bytes = new Uint8Array(PROBE_OUTPUT_BYTES);
+	let length = 0;
+	let exitSeen = false;
+	const endsLine = () => length > 0 && bytes[length - 1] === 0x0a;
+	let wake = exited.then(
+		() => "exit",
+		() => "exit",
+	);
+	const grace = wake.then(() => Bun.sleep(PROBE_EXIT_GRACE_MS)).then(() => "grace");
+	const readNext = () => {
+		const read = reader.read();
+		read.catch(() => {});
+		return read;
+	};
+	let pending = readNext();
 	try {
-		const exitCode = await runGitToFiles(args, { cwd, env, stdout: outPath, signal, detached });
+		for (;;) {
+			const next = await Promise.race([pending, wake]);
+			if (next === "exit") {
+				exitSeen = true;
+				wake = grace;
+				if (endsLine()) break;
+				continue;
+			}
+			if (next === "grace") break;
+			if (next.done) break;
+			const chunk = next.value.subarray(0, PROBE_OUTPUT_BYTES - length);
+			bytes.set(chunk, length);
+			length += chunk.length;
+			if (length >= PROBE_OUTPUT_BYTES || (exitSeen && endsLine())) break;
+			pending = readNext();
+		}
+	} finally {
+		void reader.cancel().catch(() => {});
+	}
+	return new TextDecoder().decode(bytes.subarray(0, length));
+}
+
+/**
+ * Run `git <args>` for its output, read from a pipe by {@link readProbeOutput}: never a file, which
+ * a wrapper's lingering child could keep growing. Null when no git starts or the command fails.
+ */
+async function gitProbe(args, cwd, { env, signal, detached }) {
+	let output = "";
+	try {
+		const exitCode = await runGitToFiles(args, {
+			cwd,
+			env,
+			signal,
+			detached,
+			readStdout: async (stream, exited) => {
+				output = await readProbeOutput(stream, exited);
+			},
+		});
 		if (exitCode !== 0) return null;
 	} catch (error) {
 		if (GIT_CANNOT_START.has(error?.code)) return null;
 		throw error;
 	}
-	return new TextDecoder().decode(await readCapture(outPath, PROBE_OUTPUT_BYTES, { signal }));
+	return output;
 }
 
 /**
  * Whether the git on `env`'s PATH can run hooks: "no-git" when none starts or `git version`
  * fails, "old-git" when it predates `git hook run`, else undefined.
  */
-async function hookRunnerProblem(captureDir, cwd, gitOptions) {
-	const version = await gitProbe(["version"], captureDir, cwd, gitOptions);
+async function hookRunnerProblem(cwd, gitOptions) {
+	const version = await gitProbe(["version"], cwd, gitOptions);
 	if (version === null) return "no-git";
 	const match = /^git version (\d+)\.(\d+)/.exec(version);
 	// An unrecognised version string gets the benefit of the doubt.
@@ -437,8 +494,8 @@ async function hookRunnerProblem(captureDir, cwd, gitOptions) {
  * environment overrides). Without a git that starts and answers, the in-process lookup (`find_hook`
  * rules) stands, so a hook it finds is reported as not run rather than treated as missing.
  */
-async function postCheckoutHookPath(captureDir, worktreeRoot, gitOptions) {
-	const answer = await gitProbe(["rev-parse", "--git-path", "hooks/post-checkout"], captureDir, worktreeRoot, gitOptions);
+async function postCheckoutHookPath(worktreeRoot, gitOptions) {
+	const answer = await gitProbe(["rev-parse", "--git-path", "hooks/post-checkout"], worktreeRoot, gitOptions);
 	// Only the line break git ends it with: a relative `core.hooksPath` may start or end with spaces.
 	const reported = answer?.replace(/\r?\n$/, "");
 	// Nothing usable (no answer, empty, or an MSYS/Cygwin `/c/…` path on Windows; `//server/share` UNC paths are fine).
@@ -490,8 +547,8 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		dir = await makeCaptureDir(path.join(os.tmpdir(), `${HOOK_CAPTURE_PREFIX}${PID_SCOPE}-${process.pid}-`), signal);
 	} catch (error) {
 		if (signal?.aborted) throw error;
-		// TMPDIR missing, read-only or full: the new worktree's git directory, just written, holds the output instead, so
-		// the git on PATH still locates and runs the hook. Removed with the worktree should this process die first.
+		// TMPDIR missing, read-only or full: the new worktree's git directory, just written, holds the hook's output
+		// instead. Removed with the worktree should this process die first.
 		try {
 			const gitDir = (await discoverGit(worktreeRoot, signal))?.info().gitDir;
 			if (!gitDir) throw error;
@@ -503,7 +560,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	}
 	const gitOptions = { env, signal, detached };
 	try {
-		const foundAt = await postCheckoutHookPath(dir, worktreeRoot, gitOptions);
+		const foundAt = await postCheckoutHookPath(worktreeRoot, gitOptions);
 		if (!foundAt) return notRun;
 		// Only a missing path means no hook; any other failure (EACCES, EIO) is reported, not mistaken for one.
 		const missing = error => error?.code === "ENOENT" || error?.code === "ENOTDIR";
@@ -532,7 +589,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 				return { ...notRun, skipped: { path: hookPath, reason: "not-executable" } };
 			}
 		}
-		const reason = await hookRunnerProblem(dir, worktreeRoot, gitOptions);
+		const reason = await hookRunnerProblem(worktreeRoot, gitOptions);
 		if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
 		const outPath = path.join(dir, "stdout");
 		const errPath = path.join(dir, "stderr");
@@ -544,15 +601,35 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 			[errPath, new Uint8Array()],
 		]);
 		const stopped = Promise.withResolvers();
+		// Windows: the logical size keeps growing, so drop only once it is a cap past the last drop; bytes at the end stay intact.
+		const droppedAt = new Map([
+			[outPath, 0],
+			[errPath, 0],
+		]);
 		const trim = async file => {
-			const { size } = await untilAborted(fs.promises.stat(file), signal);
+			let size;
+			try {
+				({ size } = await untilAborted(fs.promises.stat(file), signal));
+			} catch (error) {
+				// Not opened yet.
+				if (error?.code === "ENOENT") return;
+				throw error;
+			}
+			if (!TRUNCATE_HOOK_CAPTURE) {
+				const last = droppedAt.get(file);
+				// No sparse support (last is null): nothing to free.
+				if (last === null || size - last <= HOOK_CAPTURE_CAP_BYTES) return;
+				const dropped = await untilAborted(api().vcsDropCaptureHead(file, HOOK_OUTPUT_TAIL_BYTES, signal), signal);
+				droppedAt.set(file, dropped ? size : null);
+				return;
+			}
 			if (size <= HOOK_CAPTURE_CAP_BYTES) return;
 			saved.set(file, await readCapture(file, HOOK_OUTPUT_TAIL_BYTES, { fromEnd: true, signal }));
 			await untilAborted(fs.promises.truncate(file, 0), signal);
 		};
 		let running = true;
 		const poll = (async () => {
-			while (running && CAP_HOOK_CAPTURE) {
+			while (running) {
 				await Promise.race([Bun.sleep(HOOK_CAPTURE_POLL_MS), stopped.promise]);
 				if (running) await Promise.all([trim(outPath), trim(errPath)]);
 			}
@@ -568,7 +645,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 				stderr: errPath,
 				signal,
 				detached,
-				append: CAP_HOOK_CAPTURE,
+				append: TRUNCATE_HOOK_CAPTURE,
 			});
 		} finally {
 			running = false;

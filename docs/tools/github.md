@@ -157,7 +157,7 @@ Worktree and metadata behavior:
   - `branch.pr-<number>.ompPrIsCrossRepository`
   - `branch.pr-<number>.ompPrMaintainerCanModify`
 - When no matching worktree exists, an existing `refs/heads/pr-<number>` at a different commit fails unless `force=true`, which resets the branch to the fetched head.
-- An existing matching worktree is reused with `reused: true`; the remote is fetched and push metadata refreshed, but its local branch is not reset, even with `force=true`. One another omp process is still setting up (its `setupOwner` is alive, or in another host or container) is refused with a `ToolError` before anything changes, since that process discards it if its setup fails; one whose setting-up omp is gone is reused, and its mark cleared. A setup mark that can't be read fails the checkout before anything changes, rather than counting as a finished setup.
+- An existing matching worktree is reused with `reused: true`; the remote is fetched and push metadata refreshed, but its local branch is not reset, even with `force=true`. One another omp process is still setting up (its `setupOwner` is alive, or in another host or container) is refused with a `ToolError` before anything changes, since that process discards it if its setup fails; one whose setting-up omp is gone is reused, and its mark cleared, or, if that omp's rollback already removed its checkout, its registration is pruned and the worktree created afresh (a registration git keeps, e.g. locked, fails with a `ToolError`). A setup mark that can't be read fails the checkout before anything changes, rather than counting as a finished setup.
 
 ### `pr_push`
 

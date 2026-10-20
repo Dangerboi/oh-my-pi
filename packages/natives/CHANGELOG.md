@@ -8,15 +8,16 @@
 - Added a `setupOwner` option for `worktreeAdd` that marks the new worktree as still being set up until `VcsGitRepo.worktreeEndSetup(path, signal?)`, `setupOwner` on `worktrees()` entries, and `vcs.worktreeSetupOwner()`/`vcs.isWorktreeSetupOwnerAlive(owner)` ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Added `vcs.discoverGit(dir, signal?)` and `vcs.discoverRepo(dir, signal?)`, which find the repository off the JS thread and reject as soon as `signal` aborts ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Added `vcs.releaseWorktreeAddClaims()`, exit cleanup for the claim file `worktreeAdd` uses where the filesystem has no file locks ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- Added `gitDir` to `worktrees()` entries, the worktree's git directory, which stays the same when `git worktree move` moves it ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ### Changed
 
-- `vcs.runPostCheckoutHook` takes `{ signal, env, detached }`, reports a hook that exists but didn't run as `skipped`, keeps the hook's output in the worktree's git directory when TMPDIR has no room for it, returns once `git hook run` exits even if the hook left a background process running, and returns at most the last 64 KiB of each output stream, whose capture files stay bounded while the hook runs (except on Windows) ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- `vcs.runPostCheckoutHook` takes `{ signal, env, detached }`, reports a hook that exists but didn't run as `skipped`, keeps the hook's output in the worktree's git directory when TMPDIR has no room for it, returns once `git hook run` exits even if the hook left a background process running, and returns at most the last 64 KiB of each output stream, whose capture files stay bounded while the hook runs ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - `worktreeAdd` locks a new worktree as `initializing` while creating it and removes a half-written registration on failure, as git does, and serializes adds into one repository across processes (waiting up to 10 s for another), so two adding the same path can't share one checkout ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ### Fixed
 
-- `worktreePrune` keeps locked worktrees, as git does, instead of dropping the registration of one on an offline volume ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- `worktreePrune` keeps locked worktrees, as git does, and ones another omp process is still setting up, instead of dropping the registration of one on an offline volume ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ## [18.12.4] - 2026-10-20
 

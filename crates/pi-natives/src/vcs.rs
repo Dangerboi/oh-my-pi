@@ -125,6 +125,10 @@ pub struct VcsWorktreeEntry {
 	/// Owner of a setup that is not finished yet (`setupOwner` when it was
 	/// added); unset once it is done.
 	pub setup_owner: Option<String>,
+	/// The worktree's git directory: `<common dir>/worktrees/<id>` for a linked
+	/// worktree, which stays the same when `git worktree move` moves it; the
+	/// common git dir for the main one.
+	pub git_dir:     String,
 }
 /// Worktree creation options.
 #[napi(object)]
@@ -306,6 +310,7 @@ impl From<core::WorktreeEntry> for VcsWorktreeEntry {
 			branch:      v.branch,
 			detached:    v.detached,
 			setup_owner: v.setup_owner,
+			git_dir:     path_string(v.git_dir),
 		}
 	}
 }
@@ -780,6 +785,90 @@ pub fn vcs_git_hook_location(
 				.map(|location| Some(path_string(location)))
 		})
 	})
+}
+
+/// Deallocate the head of a capture file another process is still writing,
+/// so it stops taking disk space.
+///
+/// The size and the last `keep_bytes` bytes are unchanged. Windows only:
+/// resolves `false` elsewhere, and on a filesystem without sparse files.
+#[napi]
+pub fn vcs_drop_capture_head(
+	path: String,
+	keep_bytes: u32,
+	signal: Option<Unknown>,
+) -> Promise<bool> {
+	let ct = task::CancelToken::new(None, signal);
+	task::blocking_mapped("vcs.dropCaptureHead", ct, rich_error, canceled_error, move |ct| {
+		if ct.heartbeat().is_err() {
+			return Err(pi_vcs::Error::Canceled);
+		}
+		catch_panic("vcs.dropCaptureHead", || {
+			drop_capture_head(Path::new(&path), u64::from(keep_bytes)).map_err(pi_vcs::Error::from)
+		})
+	})
+}
+
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn, reason = "the Windows signature")]
+#[cfg(not(windows))]
+fn drop_capture_head(_path: &Path, _keep: u64) -> std::io::Result<bool> {
+	Ok(false)
+}
+
+#[cfg(windows)]
+fn drop_capture_head(path: &Path, keep: u64) -> std::io::Result<bool> {
+	use std::{ffi::c_void, os::windows::io::AsRawHandle as _};
+
+	use windows_sys::Win32::{
+		Foundation::{ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED},
+		System::{
+			IO::DeviceIoControl,
+			Ioctl::{
+				FILE_SET_SPARSE_BUFFER, FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE,
+				FSCTL_SET_ZERO_DATA,
+			},
+		},
+	};
+
+	fn control<I>(file: &std::fs::File, code: u32, input: &I) -> std::io::Result<()> {
+		let mut returned = 0u32;
+		// SAFETY: the handle is valid for the call, `input` is a live `I` of the
+		// stated size, there is no output buffer, and the call is synchronous.
+		let ok = unsafe {
+			DeviceIoControl(
+				file.as_raw_handle() as _,
+				code,
+				std::ptr::from_ref(input).cast::<c_void>(),
+				size_of::<I>() as u32,
+				std::ptr::null_mut(),
+				0,
+				&raw mut returned,
+				std::ptr::null_mut(),
+			)
+		};
+		if ok == 0 {
+			Err(std::io::Error::last_os_error())
+		} else {
+			Ok(())
+		}
+	}
+
+	// std opens with read|write|delete sharing, so the writing child isn't
+	// disturbed.
+	let file = std::fs::OpenOptions::new().write(true).open(path)?;
+	if let Err(err) = control(&file, FSCTL_SET_SPARSE, &FILE_SET_SPARSE_BUFFER { SetSparse: true }) {
+		return match err.raw_os_error().map(|code| code as u32) {
+			Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER) => Ok(false),
+			_ => Err(err),
+		};
+	}
+	let len = file.metadata()?.len();
+	if len > keep {
+		let zero =
+			FILE_ZERO_DATA_INFORMATION { FileOffset: 0, BeyondFinalZero: (len - keep) as i64 };
+		control(&file, FSCTL_SET_ZERO_DATA, &zero)?;
+	}
+	Ok(true)
 }
 
 /// Remove the claim files of worktree adds still running in this process.

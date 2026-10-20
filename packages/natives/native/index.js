@@ -144,6 +144,7 @@ export const vcsDetachGitDir = nativeBindings.vcsDetachGitDir ?? missingNativeEx
 export const vcsDiscover = nativeBindings.vcsDiscover ?? missingNativeExport("vcsDiscover");
 export const vcsDiscoverAsync = nativeBindings.vcsDiscoverAsync ?? missingNativeExport("vcsDiscoverAsync");
 export const vcsDiscoverForDisplay = nativeBindings.vcsDiscoverForDisplay ?? missingNativeExport("vcsDiscoverForDisplay");
+export const vcsDropCaptureHead = nativeBindings.vcsDropCaptureHead ?? missingNativeExport("vcsDropCaptureHead");
 export const vcsGitClone = nativeBindings.vcsGitClone ?? missingNativeExport("vcsGitClone");
 export const vcsGitDiscover = nativeBindings.vcsGitDiscover ?? missingNativeExport("vcsGitDiscover");
 export const vcsGitDiscoverAsync = nativeBindings.vcsGitDiscoverAsync ?? missingNativeExport("vcsGitDiscoverAsync");

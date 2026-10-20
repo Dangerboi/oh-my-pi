@@ -963,8 +963,8 @@ impl GitRepo {
 	}
 
 	/// Prune linked-worktree administration entries whose back-reference
-	/// vanished. Locked entries are kept, as git keeps them (a worktree on a
-	/// volume that is offline, or one still being created).
+	/// vanished. Locked entries and entries still being set up (setup mark) are
+	/// kept: their worktree may sit on a volume that is offline.
 	pub fn worktree_prune(&self) -> Result<()> {
 		let root = self.info().common_dir.join("worktrees");
 		let Ok(entries) = fs::read_dir(&root) else {
@@ -972,7 +972,7 @@ impl GitRepo {
 		};
 		for entry in entries {
 			let entry = entry?;
-			if entry.path().join("locked").exists() {
+			if entry.path().join("locked").exists() || entry.path().join(SETUP_MARK).exists() {
 				continue;
 			}
 			let back = fs::read_to_string(entry.path().join("gitdir")).unwrap_or_default();
@@ -3508,6 +3508,25 @@ mod tests {
 		assert!(setup_owner_of(&repo, &stale).is_empty());
 		git(temp.path(), &["worktree", "unlock", offline.to_str().unwrap()]);
 		repo.worktree_prune().unwrap();
+	}
+
+	#[test]
+	fn prune_keeps_worktrees_still_being_set_up() {
+		let (temp, repo) = fixture();
+		let linked = temp.path().join("../linked-prune-setup");
+		let away = temp.path().join("../linked-prune-setup-away");
+		for dir in [&linked, &away] {
+			let _ = fs::remove_dir_all(dir);
+		}
+		add_detached(&repo, &linked, Some("owner-1"));
+		// Checkout moved away, as when its volume is offline.
+		fs::rename(&linked, &away).unwrap();
+		repo.worktree_prune().unwrap();
+		assert_eq!(setup_owner_of(&repo, &linked), [Some("owner-1".to_owned())]);
+		repo.worktree_end_setup(&linked).unwrap();
+		repo.worktree_prune().unwrap();
+		assert!(setup_owner_of(&repo, &linked).is_empty());
+		fs::remove_dir_all(&away).unwrap();
 	}
 
 	#[cfg(unix)]

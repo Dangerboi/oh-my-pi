@@ -117,12 +117,16 @@ export async function addWorktreeWithHook(
 	let head: string | null | undefined;
 	// A hook may move its worktree, as under `git worktree add`; everything after it uses the current path.
 	let current = worktreePath;
+	let gitDir: string | undefined;
 	try {
+		// The branch is still the checked-out one here; the hook may rename it or move the worktree, not the git dir.
+		const listed = await untilAborted(signal, () => repository.worktrees());
+		gitDir = listed.find(entry => entry.branch === `refs/heads/${branch}`)?.gitDir;
 		signal?.throwIfAborted();
 		head = await repository.resolveRef(`refs/heads/${branch}`, signal);
 		const hook = head ? await runWorktreeCheckoutHook(worktreePath, head, signal) : {};
 		// Raced like the path lookup below, so an abort rejects with its reason.
-		current = await currentWorktreePath(repository, branch, current, signal);
+		current = await currentWorktreePath(repository, gitDir, current, signal);
 		// The abort may also have landed as the hook finished: either way, or with a stalled `worktree.base`,
 		// the caller must not move into the worktree, so it is discarded below.
 		const resolved = await resolveWorktreePath(current, signal);
@@ -136,7 +140,7 @@ export async function addWorktreeWithHook(
 	} catch (error) {
 		// The hook may have moved the worktree before it was cut short; discard where it is now.
 		try {
-			current = await currentWorktreePath(repository, branch, current);
+			current = await currentWorktreePath(repository, gitDir, current);
 		} catch (lookupError) {
 			logger.warn("could not locate a new worktree its hook may have moved", {
 				path: current,
@@ -150,17 +154,18 @@ export async function addWorktreeWithHook(
 }
 
 /**
- * Where `branch` is checked out now, or `fallback` when it is checked out nowhere (the hook
- * switched it or deleted the worktree). A branch is checked out in one worktree at most.
+ * Where the registration `gitDir` is now, or `fallback` when it is undefined or listed nowhere (the
+ * hook deleted the worktree). The git directory survives `git worktree move` and a branch rename.
  */
 async function currentWorktreePath(
 	repository: VcsGitRepo,
-	branch: string,
+	gitDir: string | undefined,
 	fallback: string,
 	signal?: AbortSignal,
 ): Promise<string> {
+	if (gitDir === undefined) return fallback;
 	const listed = await untilAborted(signal, () => repository.worktrees());
-	return listed.find(entry => entry.branch === `refs/heads/${branch}`)?.path ?? fallback;
+	return listed.find(entry => entry.gitDir === gitDir)?.path ?? fallback;
 }
 
 /**

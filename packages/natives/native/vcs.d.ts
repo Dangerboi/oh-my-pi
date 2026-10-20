@@ -122,7 +122,7 @@ export interface SkippedPostCheckoutHook {
 
 /**
  * Run Git's checkout hook in a new linked worktree and return its exit status and the
- * last 64 KiB of each output stream (the capture files are kept bounded while the hook runs, except on Windows).
+ * last 64 KiB of each output stream (the capture files are kept bounded while the hook runs: cut down on POSIX, sparse-deallocated on Windows where the filesystem supports it).
  * The git on `env`'s PATH locates the hook
  * (`git rev-parse --git-path`), seeing every config source; without a git that starts and
  * answers, the in-process lookup (`core.hooksPath`, path expanded, or the shared hooks
