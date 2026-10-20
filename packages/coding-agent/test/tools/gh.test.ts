@@ -1381,6 +1381,70 @@ describe("github tool", () => {
 					runGit(fixture.repoRoot, ["worktree", "remove", "--force", outcome.worktreePath]);
 				}
 			});
+			it("recreates a worktree whose dead owner was killed while its add was still initializing", async () => {
+				mockPrView(135);
+				const primaryRoot = vcs.requireGit(fixture.repoRoot).primaryRoot() ?? fixture.repoRoot;
+				const dir = path.join(tempHome.home, ".omp", "wt", `135-${hashPath(primaryRoot)}`);
+				const branch = "pr-135";
+				runGit(fixture.repoRoot, ["worktree", "add", "-q", "-b", branch, dir, fixture.headRefOid]);
+				const owner = vcs
+					.worktreeSetupOwner()
+					.replace(/-\d+(-\d+)?$/, `-${Bun.spawnSync(["sh", "-c", "exit 0"]).pid}`);
+				const gitDir = runGit(dir, ["rev-parse", "--absolute-git-dir"]);
+				await Bun.write(path.join(gitDir, "omp-setup"), `${owner}\n`);
+				await Bun.write(path.join(gitDir, "locked"), "initializing\n");
+				const tracked = runGit(dir, ["ls-files"]).split("\n")[0];
+				await fs.rm(path.join(dir, tracked));
+
+				const outcome = await checkout(135, new AbortController().signal);
+
+				try {
+					expect(outcome.reused).toBe(false);
+					expect(await Bun.file(path.join(outcome.worktreePath, tracked)).exists()).toBe(true);
+					expect(await setupOwnerOf(fixture.repoRoot, branch)).toBeUndefined();
+					expect(worktreeRecord(fixture.repoRoot, branch)).not.toContain("locked");
+				} finally {
+					runGit(fixture.repoRoot, ["worktree", "remove", "--force", outcome.worktreePath]);
+				}
+			});
+			it("keeps the dead owner's mark and lock when removing its partial checkout fails, so a retry recreates it", async () => {
+				mockPrView(136);
+				const primaryRoot = vcs.requireGit(fixture.repoRoot).primaryRoot() ?? fixture.repoRoot;
+				const dir = path.join(tempHome.home, ".omp", "wt", `136-${hashPath(primaryRoot)}`);
+				const branch = "pr-136";
+				runGit(fixture.repoRoot, ["worktree", "add", "-q", "-b", branch, dir, fixture.headRefOid]);
+				const owner = vcs
+					.worktreeSetupOwner()
+					.replace(/-\d+(-\d+)?$/, `-${Bun.spawnSync(["sh", "-c", "exit 0"]).pid}`);
+				const gitDir = runGit(dir, ["rev-parse", "--absolute-git-dir"]);
+				await Bun.write(path.join(gitDir, "omp-setup"), `${owner}\n`);
+				await Bun.write(path.join(gitDir, "locked"), "initializing\n");
+				const tracked = runGit(dir, ["ls-files"]).split("\n")[0];
+				await fs.rm(path.join(dir, tracked));
+
+				const repoProto = Object.getPrototypeOf(vcs.requireGit(fixture.repoRoot));
+				const removeSpy = vi
+					.spyOn(repoProto, "worktreeRemove")
+					.mockRejectedValueOnce(Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" }));
+				try {
+					await expect(checkout(136, new AbortController().signal)).rejects.toThrow("EPERM");
+				} finally {
+					removeSpy.mockRestore();
+				}
+
+				// The failed call never asked for the head repository: drop its queued answer.
+				vi.spyOn(github, "json").mockReset();
+				mockPrView(136);
+				const outcome = await checkout(136, new AbortController().signal);
+				try {
+					expect(outcome.reused).toBe(false);
+					expect(await Bun.file(path.join(outcome.worktreePath, tracked)).exists()).toBe(true);
+					expect(await setupOwnerOf(fixture.repoRoot, branch)).toBeUndefined();
+					expect(worktreeRecord(fixture.repoRoot, branch)).not.toContain("locked");
+				} finally {
+					runGit(fixture.repoRoot, ["worktree", "remove", "--force", outcome.worktreePath]);
+				}
+			});
 			it.skipIf(!/^[^-]+-\d+-\d+$/.test(vcs.worktreeSetupOwner()))(
 				"counts an owner whose pid now belongs to a process that started at another time as gone",
 				() => {
@@ -1388,6 +1452,25 @@ describe("github tool", () => {
 					expect(vcs.isWorktreeSetupOwnerAlive(own)).toBe(true);
 					// Start times are never 1: this is the pid of a process that has since been replaced.
 					expect(vcs.isWorktreeSetupOwnerAlive(own.replace(/-\d+$/, "-1"))).toBe(false);
+				},
+			);
+			it.skipIf(process.platform !== "linux")(
+				"counts an owner from an earlier boot of this machine as gone, one in another pid namespace as alive",
+				async () => {
+					const own = vcs.worktreeSetupOwner();
+					const machineId = (
+						await Bun.file("/etc/machine-id")
+							.text()
+							.catch(() => "")
+					).trim();
+					// Same machine, earlier boot: its process ended with that boot, even if the pid is in use now.
+					const earlierBoot = own.replace(/^([^.]+)\.[^.]+\./, "$1.0.");
+					// Without a machine id another machine with this hostname looks the same, so it can't be judged.
+					expect(vcs.isWorktreeSetupOwnerAlive(earlierBoot)).toBe(machineId === "");
+					// This boot, another pid namespace (a sidecar container): its pids aren't ours to check.
+					const exited = Bun.spawnSync(["sh", "-c", "exit 0"]).pid;
+					const sidecar = own.replace(/\.[^.-]+-\d+(-\d+)?$/, `.0-${exited}`);
+					expect(vcs.isWorktreeSetupOwnerAlive(sidecar)).toBe(true);
 				},
 			);
 			it.each([

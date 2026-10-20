@@ -456,7 +456,7 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 				mode: string,
 				...rest: []
 			) =>
-				["w", "a"].includes(mode) && path.basename(path.dirname(String(file))).startsWith("omp-post-checkout-")
+				["w", "a+"].includes(mode) && path.basename(path.dirname(String(file))).startsWith("omp-post-checkout-")
 					? Promise.reject(Object.assign(new Error("no space left on device"), { code: "ENOSPC" }))
 					: realOpen(file, mode, ...rest)) as typeof realOpen);
 			try {
@@ -826,6 +826,51 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(new TextDecoder().decode(output).trimEnd().endsWith("LAST-LINE")).toBe(true);
 		});
 
+		it.skipIf(process.platform !== "linux")(
+			"keeps trimming the output files of a background process the hook left running",
+			async () => {
+				const wt = await create();
+				const writerPid = path.join(root, "hook-writer-pid");
+				const written = path.join(root, "hook-writer-done");
+				// After the hook exited, the leftover writes ~5 MB to the stdout it inherited, then idles holding it.
+				await hook(
+					`(sleep 0.5; head -c 5000000 /dev/zero | tr '\\0' x; echo done > "${written}"; sleep 6) &\necho $! > "${writerPid}"`,
+				);
+				let pid = 0;
+				try {
+					const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
+						env: filterChildShellEnv(process.env),
+						detached: true,
+					});
+					expect(result.exitCode).toBe(0);
+					pid = Number((await fs.readFile(writerPid, "utf8")).trim());
+					// Real wait: the writer runs on its own schedule, visible only as its marker file.
+					for (let i = 0; i < 100 && !(await exists(written)); i++) await Bun.sleep(50);
+					expect(await exists(written)).toBe(true);
+					// The capture file is already unlinked: its size is only visible through the writer's descriptor.
+					let size = Number.POSITIVE_INFINITY;
+					for (let i = 0; i < 60 && size > 1024 * 1024; i++) {
+						// Real wait: the writer and the trim run on their own timers.
+						await Bun.sleep(50);
+						size = await fs.stat(`/proc/${pid}/fd/1`).then(
+							s => s.size,
+							() => Number.POSITIVE_INFINITY,
+						);
+					}
+					expect(size).toBeLessThanOrEqual(1024 * 1024);
+				} finally {
+					if (pid) {
+						Bun.spawnSync(["pkill", "-KILL", "-P", String(pid)]);
+						try {
+							process.kill(pid, "SIGKILL");
+						} catch {
+							// Already gone.
+						}
+					}
+				}
+			},
+		);
+
 		it.skipIf(process.platform === "win32")(
 			"stops a probe's lingering writer by closing its output instead of capturing it in a file",
 			async () => {
@@ -1008,7 +1053,7 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 
 		it.each([
 			["reading the hook's output", "stdout", "r"],
-			["creating the hook's output file", "stdout", "a"],
+			["creating the hook's output file", "stdout", process.platform === "win32" ? "w" : "a+"],
 		])("abort is not held up by a stalled filesystem when %s", async (_name, capture, flags) => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");
@@ -1064,12 +1109,28 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 				const running = path.join(tmp, `${own}${process.pid}-running`);
 				// Another host or container sharing the TMPDIR, whose pids mean nothing here.
 				const foreign = path.join(tmp, `omp-post-checkout-otherhost-${gone}-elsewhere`);
-				for (const dir of [left, running, foreign]) await Bun.write(path.join(dir, "stdout"), "output\n");
+				// This machine before a reboot: its omp ended with that boot, though the pid is in use now.
+				const earlierBoot = path.join(
+					tmp,
+					`${own.replace(/^(omp-post-checkout-[^.]+)\.[^.]+\./, "$1.0.")}${process.pid}-before-reboot`,
+				);
+				for (const dir of [left, running, foreign, earlierBoot])
+					await Bun.write(path.join(dir, "stdout"), "output\n");
 				await run();
 
 				expect(await exists(left)).toBe(false);
 				expect(await exists(path.join(running, "stdout"))).toBe(true);
 				expect(await exists(path.join(foreign, "stdout"))).toBe(true);
+				// Only a machine id tells this machine after a reboot from another one with the same hostname (Linux reads
+				// `/etc/machine-id`; macOS and Windows always report one).
+				const machineId = (
+					await Bun.file("/etc/machine-id")
+						.text()
+						.catch(() => "")
+				).trim();
+				expect(await exists(path.join(earlierBoot, "stdout"))).toBe(
+					process.platform === "linux" && machineId === "",
+				);
 			} finally {
 				mkdtemp.mockRestore();
 				tmpdir.mockRestore();

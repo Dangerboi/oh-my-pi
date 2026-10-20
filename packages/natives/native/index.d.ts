@@ -3927,6 +3927,16 @@ export interface VcsApplyOptions {
   threeWay?: boolean
 }
 
+/**
+ * Whether another process still has the file open (Windows only; `false`
+ * elsewhere or when it can't be told), so a capture a lingering child writes
+ * to isn't deleted, which would only hide it.
+ *
+ * The open runs off the JS thread, so a stalled network `TMPDIR` can't freeze
+ * the process.
+ */
+export declare function vcsCaptureHeld(path: string, signal?: unknown | undefined | null): Promise<boolean>
+
 /** Clean options. */
 export interface VcsCleanOptions {
   ignoredOnly?: boolean
@@ -4076,6 +4086,17 @@ export interface VcsLinkedWorktree {
   root: string
   primaryRoot: string
 }
+
+/**
+ * Identifies this machine (macOS hardware UUID, Windows machine GUID), so pid
+ * scopes of two machines with the same hostname differ.
+ *
+ * The macOS id survives reboots, so a setup owner from before a restart isn't
+ * taken for another machine.
+ *
+ * `None` where the platform reports none (Linux reads `/proc` in JS).
+ */
+export declare function vcsMachineId(): string | null
 
 /** Per-file line counts. */
 export interface VcsNumstatEntry {

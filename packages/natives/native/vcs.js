@@ -169,35 +169,37 @@ const HOOK_CAPTURE_POLL_MS = 250;
 // can't write to an append-mode handle, and truncating without append frees nothing, so the head is deallocated instead.
 const TRUNCATE_HOOK_CAPTURE = process.platform !== "win32";
 const HOOK_CAPTURE_PREFIX = "omp-post-checkout-";
-/**
- * Where pids mean the same: hostname, plus on Linux the boot and pid namespace, so containers
- * sharing a hostname and the TMPDIR but not their pids (a pod's sidecars) differ too. Read from
- * /proc, which never stalls. Each part on its own: a missing one (no /proc, an AppArmor profile
- * denying `boot_id`) must not take the others with it.
- */
-function pidScope() {
-	const scope = [os.hostname()];
-	if (process.platform === "linux") {
-		for (const read of [
-			() => fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
-			() => fs.readlinkSync("/proc/self/ns/pid"),
-		]) {
-			try {
-				scope.push(read());
-			} catch {
-				scope.push("");
-			}
-		}
+/** Read `read()`, or "" when it fails: a missing part (no /proc, an AppArmor profile denying `boot_id`) must not take the others with it. */
+function scopePart(read) {
+	try {
+		return read() ?? "";
+	} catch {
+		return "";
 	}
-	return scope.join("\0");
 }
+/**
+ * Where pids mean the same, in parts: the machine (hostname plus the machine id: Linux's
+ * `/etc/machine-id`, macOS's hardware UUID, Windows' machine GUID, so two machines sharing a
+ * hostname differ), and on Linux the boot and the pid namespace, so containers sharing a hostname
+ * and the TMPDIR but not their pids (a pod's sidecars) differ too. Linux reads /proc and /etc,
+ * which never stall.
+ */
+const linux = process.platform === "linux";
+const MACHINE_ID = linux
+	? scopePart(() => fs.readFileSync("/etc/machine-id", "utf8").trim())
+	: scopePart(() => api().vcsMachineId());
+const SCOPE = {
+	machine: Bun.hash(`${os.hostname()}\0${MACHINE_ID}`).toString(36),
+	boot: Bun.hash(linux ? scopePart(() => fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim()) : "").toString(36),
+	namespace: Bun.hash(linux ? scopePart(() => fs.readlinkSync("/proc/self/ns/pid")) : "").toString(36),
+};
 /**
  * This process's pid scope as a tag. Pids only identify processes within one scope, so what
  * another host or container left behind is never judged by them.
  */
-const PID_SCOPE = Bun.hash(pidScope()).toString(36);
-/** A capture directory of this pid scope, with the pid of the omp process that created it. */
-const HOOK_CAPTURE_OWNED = new RegExp(`^${HOOK_CAPTURE_PREFIX}${PID_SCOPE}-(\\d+)-`);
+const PID_SCOPE = `${SCOPE.machine}.${SCOPE.boot}.${SCOPE.namespace}`;
+/** A capture directory with its creator as a setup owner would name it (`<pid scope>-<pid>`), judged by {@link isWorktreeSetupOwnerAlive}. */
+const HOOK_CAPTURE_OWNER = new RegExp(`^${HOOK_CAPTURE_PREFIX}([^-]+-\\d+)-`);
 
 /** Whether process `pid` still exists (EPERM: it does, under another user). */
 function processAlive(pid) {
@@ -236,11 +238,19 @@ export function releaseWorktreeAddClaims() {
 /**
  * Whether the owner of a worktree setup may still be running it: its process exists and, when the
  * owner recorded a start time and the platform reports one, started then (else the pid was reused);
- * or it is in another pid scope (another host or container), where this process can't tell.
+ * or it is in another pid scope (another host or container), where this process can't tell. An
+ * owner from an earlier boot of this machine is gone, also after a restart cut its setup short.
+ * shortcut: two machines cloned with the same machine id and hostname count as one, so a live owner on the other is
+ * taken for one from an earlier boot; regenerate the clone's machine id (`systemd-machine-id-setup`) if they share repositories.
  */
 export function isWorktreeSetupOwnerAlive(owner) {
 	const match = /^([^-]+)-(\d+)(?:-(\d+))?$/.exec(owner);
-	if (match?.[1] !== PID_SCOPE) return true;
+	if (!match) return true;
+	const [machine, boot, namespace] = match[1].split(".");
+	if (machine !== SCOPE.machine) return true;
+	// Only a machine id tells this machine after a reboot from another one with the same hostname.
+	if (boot !== SCOPE.boot) return MACHINE_ID === "";
+	if (namespace !== SCOPE.namespace) return true;
 	const pid = Number(match[2]);
 	if (!processAlive(pid)) return false;
 	const current = match[3] === undefined ? undefined : processStart(pid);
@@ -248,16 +258,17 @@ export function isWorktreeSetupOwnerAlive(owner) {
 }
 
 /**
- * Delete this host's capture directories whose omp process is gone: it crashed or was killed
- * before its own cleanup, or (Windows) a background process the hook left running kept the files
- * open then. A run in progress is never touched, however long it takes: its omp is alive.
+ * Delete capture directories whose omp process is gone (see {@link isWorktreeSetupOwnerAlive}): it
+ * crashed or was killed before its own cleanup, also before a reboot, or (Windows) a background
+ * process the hook left running kept the files open then. A run in progress is never touched,
+ * however long it takes: its omp is alive. Nor is another host's or container's.
  * shortcut: a pid reused by an unrelated process keeps its leftover until that process exits, fine for a few small directories.
  */
 async function sweepStaleHookCaptures() {
 	const tmp = os.tmpdir();
 	for (const name of await fs.promises.readdir(tmp).catch(() => [])) {
-		const pid = Number(HOOK_CAPTURE_OWNED.exec(name)?.[1]);
-		if (!(pid > 0) || processAlive(pid)) continue;
+		const owner = HOOK_CAPTURE_OWNER.exec(name)?.[1];
+		if (owner === undefined || isWorktreeSetupOwnerAlive(owner)) continue;
 		await fs.promises.rm(path.join(tmp, name), { recursive: true, force: true }).catch(() => {});
 	}
 }
@@ -297,6 +308,17 @@ async function openCapture(file, signal, flags = "w") {
 }
 
 /**
+ * Up to `maxBytes` of an open capture, from its start or (`fromEnd`) its end.
+ */
+async function readHandle(handle, maxBytes, fromEnd) {
+	const { size } = await handle.stat();
+	const length = Math.min(size, maxBytes);
+	const bytes = new Uint8Array(length);
+	const { bytesRead } = await handle.read(bytes, 0, length, fromEnd ? size - length : 0);
+	return bytes.subarray(0, bytesRead);
+}
+
+/**
  * Up to `maxBytes` of a capture file, from its start or (`fromEnd`) its end, read through a file
  * handle off the JS thread and raced against the abort. A missing file reads as empty.
  */
@@ -310,11 +332,7 @@ function readCapture(file, maxBytes, { fromEnd = false, signal } = {}) {
 			throw error;
 		}
 		try {
-			const { size } = await handle.stat();
-			const length = Math.min(size, maxBytes);
-			const bytes = new Uint8Array(length);
-			const { bytesRead } = await handle.read(bytes, 0, length, fromEnd ? size - length : 0);
-			return bytes.subarray(0, bytesRead);
+			return await readHandle(handle, maxBytes, fromEnd);
 		} finally {
 			await handle.close();
 		}
@@ -328,19 +346,23 @@ function readCapture(file, maxBytes, { fromEnd = false, signal } = {}) {
  * the exit. Aborting `signal` kills its process tree, descendants that left its process group
  * included (see the shortcut below), and rejects with the reason. Throws `ENOENT` when no git is on
  * `env`'s PATH. `detached` runs it in its own session even without a signal (POSIX), away from the
- * caller's terminal.
+ * caller's terminal. `retain` (`{ handles: Map, pgid }`) keeps our handles to the files open past a
+ * normal return, for the caller to close: `handles` maps path to handle, `pgid` is the process group
+ * the child leads, if it does.
  */
 async function runGitToFiles(
 	args,
-	{ cwd, env, stdout = "ignore", stderr = "ignore", signal, detached = false, append = false, readStdout },
+	{ cwd, env, stdout = "ignore", stderr = "ignore", signal, detached = false, append = false, readStdout, retain },
 ) {
 	const posix = process.platform !== "win32";
 	const handles = [];
+	let keep = false;
 	const sink = async file => {
 		if (file === "ignore") return file;
-		// O_APPEND: the child's writes land at the current end even after the capture is truncated.
-		const handle = await openCapture(file, signal, append ? "a" : "w");
+		// O_APPEND: the child's writes land at the current end even after the capture is truncated; readable for the trim.
+		const handle = await openCapture(file, signal, append ? "a+" : "w");
 		handles.push(handle);
+		retain?.handles.set(file, handle);
 		return handle.fd;
 	};
 	try {
@@ -348,6 +370,7 @@ async function runGitToFiles(
 		const err = await sink(stderr);
 		// No await between this check and the abort listener below, so no abort can be missed.
 		signal?.throwIfAborted();
+		const ownGroup = posix && (detached || signal !== undefined);
 		const child = Bun.spawn(["git", ...args], {
 			cwd,
 			env,
@@ -356,8 +379,10 @@ async function runGitToFiles(
 			stderr: err,
 			// Own session (setsid): an abort can stop what it spawned, e.g. `npm install`, and without a controlling
 			// terminal a prompt on /dev/tty fails instead of writing into the caller's TUI.
-			detached: posix && (detached || signal !== undefined),
+			detached: ownGroup,
 		});
+		if (retain && ownGroup) retain.pgid = child.pid;
+
 		// Pin the root now: killTree walks its descendants by parent, so it also reaches one that left the
 		// process group (setsid), and on Windows, which has no process groups, finds them at all.
 		// shortcut: a descendant that double-forks out to init escapes, as do commands MSYS `sh` starts through fork
@@ -389,10 +414,14 @@ async function runGitToFiles(
 			signal?.removeEventListener("abort", onAbort);
 		}
 		signal?.throwIfAborted();
+		keep = retain !== undefined;
 		return exitCode;
 	} finally {
 		// Our copies only; the child (and anything it left running) holds its own. Not awaited, like the capture cleanup.
-		for (const handle of handles) void handle.close().catch(() => {});
+		if (!keep) {
+			for (const handle of handles) void handle.close().catch(() => {});
+			retain?.handles.clear();
+		}
 	}
 }
 
@@ -511,6 +540,70 @@ async function postCheckoutHookPath(worktreeRoot, gitOptions) {
 /** Remove a capture directory. Failures leave it behind (a lingering child may hold its files open on Windows): a TMPDIR one is swept once this omp is gone, one in the worktree's git directory goes with the worktree. */
 const removeCapture = dir => fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
 
+/** Run `step` every {@link HOOK_CAPTURE_POLL_MS} on an unref'd timer until it resolves true or fails, then `finish`. */
+function pollInBackground(step, finish) {
+	const schedule = () => setTimeout(tick, HOOK_CAPTURE_POLL_MS).unref();
+	const tick = () =>
+		step()
+			.catch(() => true)
+			.then(done => (done ? finish?.() : schedule()));
+	schedule();
+}
+
+/** Whether a process group still has members; EPERM means it does, but not ours to signal. */
+function groupAlive(pgid) {
+	try {
+		process.kill(-pgid, 0);
+		return true;
+	} catch (error) {
+		return error?.code === "EPERM";
+	}
+}
+
+/**
+ * POSIX: after `git hook run` exited, keep trimming the captures through our handles (the names are
+ * gone) while the hook's process group still has members, then close them.
+ * shortcut: a process that left the group (setsid, double fork) or any run without its own group (the
+ * CLI) is not followed after the hook exits, and trimming stops once omp exits (a process still writing
+ * then grows the unlinked file until it ends), upgrade to ptree's Linux subreaper if those must be bounded.
+ */
+function followHookWriters(held, trimAll) {
+	const close = () => {
+		for (const handle of held.handles.values()) void handle.close().catch(() => {});
+	};
+	if (!trimAll || held.pgid === undefined || !groupAlive(held.pgid)) return close();
+	pollInBackground(async () => {
+		await trimAll(true);
+		return !groupAlive(held.pgid);
+	}, close);
+}
+
+/**
+ * Windows: deleting an open file succeeds there (POSIX semantics) and hides a lingering child's
+ * growing capture, so while one is held keep dropping heads by path and remove the directory once released.
+ * shortcut: the poll ends with omp, the folder then stays until a later run's sweep.
+ */
+async function removeCaptureOnceReleased(dir, after) {
+	const held = async () => {
+		const heldFile = async file => {
+			try {
+				return await api().vcsCaptureHeld(file);
+			} catch {
+				return false;
+			}
+		};
+		return (await Promise.all([heldFile(path.join(dir, "stdout")), heldFile(path.join(dir, "stderr"))])).some(Boolean);
+	};
+	if (!after || !(await held())) return void removeCapture(dir);
+	pollInBackground(async () => {
+		await after.trimAll(true);
+		if (after.exhausted()) return true;
+		if (await held()) return false;
+		await removeCapture(dir);
+		return true;
+	});
+}
+
 /** `mkdtemp(prefix)` raced against the abort; one created after the abort is removed once it exists. */
 async function makeCaptureDir(prefix, signal) {
 	const creating = fs.promises.mkdtemp(prefix);
@@ -559,6 +652,10 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		}
 	}
 	const gitOptions = { env, signal, detached };
+	// Our handles to the capture files and the hook's process group, kept past `git hook run` (POSIX).
+	const held = { handles: new Map(), pgid: undefined };
+	// Set once the hook ran: how to keep trimming the captures after it exited.
+	let after = null;
 	try {
 		const foundAt = await postCheckoutHookPath(worktreeRoot, gitOptions);
 		if (!foundAt) return notRun;
@@ -606,10 +703,13 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 			[outPath, 0],
 			[errPath, 0],
 		]);
-		const trim = async file => {
+		// `background`: after the hook exited, no abort signal applies.
+		const trim = async (file, background = false) => {
+			const sig = background ? undefined : signal;
+			const handle = held.handles.get(file);
 			let size;
 			try {
-				({ size } = await untilAborted(fs.promises.stat(file), signal));
+				({ size } = await untilAborted(handle ? handle.stat() : fs.promises.stat(file), sig));
 			} catch (error) {
 				// Not opened yet.
 				if (error?.code === "ENOENT") return;
@@ -619,14 +719,22 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 				const last = droppedAt.get(file);
 				// No sparse support (last is null): nothing to free.
 				if (last === null || size - last <= HOOK_CAPTURE_CAP_BYTES) return;
-				const dropped = await untilAborted(api().vcsDropCaptureHead(file, HOOK_OUTPUT_TAIL_BYTES, signal), signal);
+				const dropped = await untilAborted(api().vcsDropCaptureHead(file, HOOK_OUTPUT_TAIL_BYTES, sig), sig);
 				droppedAt.set(file, dropped ? size : null);
 				return;
 			}
 			if (size <= HOOK_CAPTURE_CAP_BYTES) return;
-			saved.set(file, await readCapture(file, HOOK_OUTPUT_TAIL_BYTES, { fromEnd: true, signal }));
-			await untilAborted(fs.promises.truncate(file, 0), signal);
+			// Through the handle once there is one: it keeps working after the names are unlinked. After the hook exited nothing reads `saved`.
+			if (!background) {
+				const tail = handle
+					? untilAborted(readHandle(handle, HOOK_OUTPUT_TAIL_BYTES, true), sig)
+					: readCapture(file, HOOK_OUTPUT_TAIL_BYTES, { fromEnd: true, signal: sig });
+				saved.set(file, await tail);
+			}
+			await untilAborted(handle ? handle.truncate(0) : fs.promises.truncate(file, 0), sig);
 		};
+		const trimAll = background => Promise.all([trim(outPath, background), trim(errPath, background)]);
+		after = { trimAll, exhausted: () => [...droppedAt.values()].every(last => last === null) };
 		let running = true;
 		const poll = (async () => {
 			while (running) {
@@ -646,6 +754,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 				signal,
 				detached,
 				append: TRUNCATE_HOOK_CAPTURE,
+				retain: posix ? held : undefined,
 			});
 		} finally {
 			running = false;
@@ -664,7 +773,12 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		return { exitCode, stdout, stderr };
 	} finally {
 		// Not awaited: a stalled filesystem must not hold up the result or an abort.
-		void removeCapture(dir);
+		if (posix) {
+			void removeCapture(dir);
+			if (after) followHookWriters(held, after.trimAll);
+		} else {
+			void removeCaptureOnceReleased(dir, after);
+		}
 	}
 }
 

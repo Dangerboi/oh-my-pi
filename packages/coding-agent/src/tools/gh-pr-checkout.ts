@@ -467,9 +467,25 @@ export async function checkoutPullRequest(
 						},
 					),
 				);
-				await repository.worktreeEndSetup(staleDir, signal);
-				if (!checkoutExists) {
-					// That omp's rollback removed the checkout but left the registration: drop it and create the worktree afresh.
+				// Still `initializing` in git's lock: that omp died inside the add, so the checkout may be partial.
+				const lockPath = path.join(existingWorktree.gitDir, "locked");
+				const initializing = await untilAborted(signal, () =>
+					fs.readFile(lockPath, "utf8").then(
+						content => content.trim() === "initializing",
+						error => {
+							if (isEnoent(error) || (error as NodeJS.ErrnoException).code === "ENOTDIR") return false;
+							throw error;
+						},
+					),
+				);
+				if (!checkoutExists || initializing) {
+					// That omp's add or rollback left a registration without a whole checkout: drop it and create the worktree afresh.
+					// The partial checkout goes first: if its removal throws, the mark and lock stay and a retry still sees it as partial.
+					if (initializing && checkoutExists && !(await repository.worktreeRemove(staleDir, true, signal))) {
+						await untilAborted(signal, () => fs.rm(staleDir, { recursive: true, force: true }));
+					}
+					await repository.worktreeEndSetup(staleDir, signal);
+					if (initializing) await untilAborted(signal, () => fs.rm(lockPath, { force: true }));
 					await repository.worktreePrune(signal);
 					existingWorktrees = await repository.worktrees(signal);
 					existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
@@ -478,8 +494,10 @@ export async function checkoutPullRequest(
 							`the registration of the worktree of ${localBranch} at ${existingWorktree.path} is stale but git keeps it (locked?); run \`git worktree unlock ${existingWorktree.path}\` if so, then \`git worktree prune\`, and retry`,
 						);
 					}
+				} else {
+					// That omp exited mid-setup: the worktree is taken over as it is, as before setups were marked.
+					await repository.worktreeEndSetup(staleDir, signal);
 				}
-				// Otherwise that omp exited mid-setup: the worktree is taken over as it is, as before setups were marked.
 			}
 
 			const remote = await ensurePrRemoteWithRepo(repoRoot, data, repository, signal);

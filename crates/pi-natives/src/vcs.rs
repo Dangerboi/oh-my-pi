@@ -809,6 +809,43 @@ pub fn vcs_drop_capture_head(
 	})
 }
 
+/// Whether another process still has the file open (Windows only; `false`
+/// elsewhere or when it can't be told), so a capture a lingering child writes
+/// to isn't deleted, which would only hide it.
+///
+/// The open runs off the JS thread, so a stalled network `TMPDIR` can't freeze
+/// the process.
+#[napi]
+pub fn vcs_capture_held(path: String, signal: Option<Unknown>) -> Promise<bool> {
+	let ct = task::CancelToken::new(None, signal);
+	task::blocking_mapped("vcs.captureHeld", ct, rich_error, canceled_error, move |ct| {
+		if ct.heartbeat().is_err() {
+			return Err(pi_vcs::Error::Canceled);
+		}
+		catch_panic("vcs.captureHeld", || Ok::<_, pi_vcs::Error>(capture_held(Path::new(&path))))
+	})
+}
+
+#[allow(clippy::missing_const_for_fn, reason = "the Windows signature")]
+#[cfg(not(windows))]
+fn capture_held(_path: &Path) -> bool {
+	false
+}
+
+#[cfg(windows)]
+fn capture_held(path: &Path) -> bool {
+	use std::os::windows::fs::OpenOptionsExt as _;
+
+	use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+	// Sharing none: the open fails while any other handle to the file exists.
+	std::fs::OpenOptions::new()
+		.read(true)
+		.share_mode(0)
+		.open(path)
+		.is_err_and(|err| err.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32))
+}
+
 #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn, reason = "the Windows signature")]
 #[cfg(not(windows))]
 fn drop_capture_head(_path: &Path, _keep: u64) -> std::io::Result<bool> {
@@ -906,6 +943,69 @@ pub fn vcs_process_start_time(pid: u32) -> Option<String> {
 	#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 	{
 		let _ = pid;
+		None
+	}
+}
+
+/// Identifies this machine (macOS hardware UUID, Windows machine GUID), so pid
+/// scopes of two machines with the same hostname differ.
+///
+/// The macOS id survives reboots, so a setup owner from before a restart isn't
+/// taken for another machine.
+///
+/// `None` where the platform reports none (Linux reads `/proc` in JS).
+#[allow(clippy::missing_const_for_fn, reason = "not const on macOS and Windows")]
+#[napi]
+pub fn vcs_machine_id() -> Option<String> {
+	#[cfg(target_os = "macos")]
+	{
+		let mut uuid = [0u8; 16];
+		let wait = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+		// SAFETY: `uuid` is the 16 writable bytes of a `uuid_t`; `wait` is a
+		// valid timespec.
+		if unsafe { libc::gethostuuid(uuid.as_mut_ptr(), &raw const wait) } != 0 {
+			return None;
+		}
+		Some(uuid.iter().map(|byte| format!("{byte:02x}")).collect())
+	}
+	#[cfg(windows)]
+	{
+		use windows_sys::Win32::System::Registry::{
+			HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
+		};
+
+		let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Cryptography"
+			.encode_utf16()
+			.chain(Some(0))
+			.collect();
+		let value: Vec<u16> = "MachineGuid".encode_utf16().chain(Some(0)).collect();
+		let mut buffer = [0u16; 128];
+		let mut bytes = std::mem::size_of_val(&buffer) as u32;
+		// SAFETY: both names are NUL-terminated; `buffer`/`bytes` describe a
+		// writable buffer of `bytes` bytes.
+		let status = unsafe {
+			RegGetValueW(
+				HKEY_LOCAL_MACHINE,
+				subkey.as_ptr(),
+				value.as_ptr(),
+				RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+				std::ptr::null_mut(),
+				buffer.as_mut_ptr().cast(),
+				&raw mut bytes,
+			)
+		};
+		if status != 0 {
+			return None;
+		}
+		let units = &buffer[..(bytes as usize / 2).min(buffer.len())];
+		let end = units
+			.iter()
+			.position(|&unit| unit == 0)
+			.unwrap_or(units.len());
+		Some(String::from_utf16_lossy(&units[..end]))
+	}
+	#[cfg(not(any(target_os = "macos", windows)))]
+	{
 		None
 	}
 }

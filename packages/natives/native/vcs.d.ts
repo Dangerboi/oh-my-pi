@@ -109,7 +109,8 @@ export declare function releaseWorktreeAddClaims(): Promise<void>;
  * Whether the owner of an unfinished worktree setup (`setupOwner` of a listed worktree) may still
  * be running it: its process exists and, where the owner recorded a start time and the platform
  * reports one, started then (else the pid was reused); or it is in another pid scope (host or
- * container), which this process can't judge.
+ * container), which this process can't judge. An owner from an earlier boot of this machine is
+ * gone (Linux, with a machine id: a restart that cut a setup short doesn't leave it refused).
  */
 export declare function isWorktreeSetupOwnerAlive(owner: string): boolean;
 
