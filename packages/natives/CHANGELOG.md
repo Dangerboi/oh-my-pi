@@ -18,6 +18,9 @@
 ### Fixed
 
 - `worktreePrune` keeps locked worktrees, as git does, and ones another omp process is still setting up, instead of dropping the registration of one on an offline volume ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+### Fixed
+
+- Fixed a macOS background action leaving its target in front of your app after you clicked another of your windows, when placing the click took longer than the click itself ([#16217](https://github.com/can1357/oh-my-pi/pull/16217))
 
 ## [18.12.4] - 2026-10-20
 
