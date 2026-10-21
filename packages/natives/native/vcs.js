@@ -213,23 +213,35 @@ function processAlive(pid) {
 
 /** Start identity of process `pid`, where the platform reports one (see `isWorktreeSetupOwnerAlive`). */
 function processStart(pid) {
-	return api().vcsProcessStartTime(pid) ?? undefined;
+	try {
+		return api().vcsProcessStartTime(pid) ?? undefined;
+	} catch {
+		// An addon older than this binding is allowed to load; it just can't tell a reused pid.
+		return undefined;
+	}
 }
 
-const OWN_START = processStart(process.pid);
+let ownStart;
+let ownStartRead = false;
 
 /**
  * This process as the owner of a worktree setup (`setupOwner` of `worktreeAdd`): scope, pid and,
  * where the platform reports it, start time.
  */
 export function worktreeSetupOwner() {
-	return OWN_START === undefined ? `${PID_SCOPE}-${process.pid}` : `${PID_SCOPE}-${process.pid}-${OWN_START}`;
+	if (!ownStartRead) {
+		ownStart = processStart(process.pid);
+		ownStartRead = true;
+	}
+	return ownStart === undefined ? `${PID_SCOPE}-${process.pid}` : `${PID_SCOPE}-${process.pid}-${ownStart}`;
 }
 
 /**
- * Remove the claim files `worktreeAdd` holds in this process where the filesystem has no file
- * locks; register it as exit cleanup, since a signal exit ends a running add without its own.
- * Waits up to 9 s for running adds to finish before removing their claims.
+ * Wait up to 9 s for the running `worktreeAdd`s of this process to finish (registered as exit
+ * cleanup; where the filesystem has no file locks they hold an `omp-worktree-add.claim`). The
+ * claims of adds still running then are left in place: removing them would let another process add
+ * the same path while this one still writes it. Such a leftover makes a later add fail naming the
+ * file.
  */
 export function releaseWorktreeAddClaims() {
 	return api().vcsReleaseWorktreeAddClaims();

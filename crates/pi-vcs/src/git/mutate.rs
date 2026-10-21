@@ -946,11 +946,17 @@ impl GitRepo {
 		Ok(hook_is_executable(&hook).then_some(hook))
 	}
 
-	/// Remove a linked worktree, returning false when dirty and not forced.
+	/// Remove a linked worktree, returning false when dirty and not forced, or
+	/// when `path` is not itself a discoverable worktree (its `.git` is gone and
+	/// an enclosing checkout would be found instead).
 	pub fn worktree_remove(&self, path: &Path, force: bool) -> Result<bool> {
 		let Some(linked) = Self::discover(path)? else {
 			return Ok(false);
 		};
+		let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| normalize_path(p));
+		if real(&linked.info().repo_root) != real(path) {
+			return Ok(false);
+		}
 		if !force && tracked_worktree_dirty(&linked)? {
 			return Ok(false);
 		}
@@ -1965,53 +1971,43 @@ fn finish_worktree_add(path: &Path, admin: &Path) -> Result<()> {
 /// an exclusively created claim file, removed when dropped.
 enum WorktreeAddLock {
 	Locked(#[allow(dead_code, reason = "held for its lock")] fs::File),
-	/// The claim file, with its id in [`HELD_CLAIMS`].
-	Claimed(u64, PathBuf),
+	/// The claim file, counted in [`RUNNING_CLAIMS`].
+	Claimed(PathBuf),
 }
 
-/// Claim files of adds running in this process, each with its own id (one
-/// path is claimed again by every later add), for
+/// How many claim files of adds in this process exist, for
 /// [`release_worktree_add_claims`]. The condvar signals a claim's end.
-static HELD_CLAIMS: std::sync::Mutex<Vec<(u64, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+static RUNNING_CLAIMS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 static CLAIM_ENDED: std::sync::Condvar = std::sync::Condvar::new();
-static NEXT_CLAIM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn held_claims() -> std::sync::MutexGuard<'static, Vec<(u64, PathBuf)>> {
-	HELD_CLAIMS
+fn running_claims() -> std::sync::MutexGuard<'static, usize> {
+	RUNNING_CLAIMS
 		.lock()
 		.unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Drop for WorktreeAddLock {
 	fn drop(&mut self) {
-		if let Self::Claimed(id, claim) = self {
-			let mut held = held_claims();
-			// Already released: the file may be another add's claim by now.
-			if let Some(index) = held.iter().position(|(held, _)| held == id) {
-				held.swap_remove(index);
-				let _ = fs::remove_file(claim);
-			}
+		if let Self::Claimed(claim) = self {
+			let mut running = running_claims();
+			let _ = fs::remove_file(claim);
+			*running -= 1;
 			CLAIM_ENDED.notify_all();
 		}
 	}
 }
 
-/// Remove the claim files of worktree adds still running in this process.
+/// Wait up to `wait` for the worktree adds running in this process to finish.
 ///
-/// For an exit that ends them without unwinding (a signal handler exiting the
-/// process), as git removes its lock files on a signal. Only filesystems
-/// without file locks use claim files. Adds are not abortable, so removing a
-/// running add's claim would let another process add concurrently: this waits
-/// up to `wait` for them to finish, and removes only the claims of adds still
-/// running then, just before the process exits.
+/// For an exit that would end them without unwinding (a signal handler exiting
+/// the process). Only filesystems without file locks use claim files. Adds are
+/// not abortable, so the claims of adds still running after `wait` stay:
+/// removing them would let another process add the same path while this one
+/// still writes it. Such a leftover makes a later add fail naming the file.
 pub fn release_worktree_add_claims(wait: std::time::Duration) {
-	let held = held_claims();
-	let (mut held, _) = CLAIM_ENDED
-		.wait_timeout_while(held, wait, |held| !held.is_empty())
+	let _ = CLAIM_ENDED
+		.wait_timeout_while(running_claims(), wait, |running| *running > 0)
 		.unwrap_or_else(std::sync::PoisonError::into_inner);
-	for (_, claim) in std::mem::take(&mut *held) {
-		let _ = fs::remove_file(claim);
-	}
 }
 
 /// How long an add waits for another one holding the lock or claim file.
@@ -2086,9 +2082,8 @@ fn claim_worktree_adds(common: &Path, wait: std::time::Duration) -> Result<Workt
 			.open(&claim)
 		{
 			Ok(_) => {
-				let id = NEXT_CLAIM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-				held_claims().push((id, claim.clone()));
-				return Ok(WorktreeAddLock::Claimed(id, claim));
+				*running_claims() += 1;
+				return Ok(WorktreeAddLock::Claimed(claim));
 			},
 			Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
 				if !back_off(deadline, &mut pause) {
@@ -3511,6 +3506,27 @@ mod tests {
 	}
 
 	#[test]
+	fn remove_without_git_file_spares_enclosing_worktree() {
+		let (temp, repo) = fixture();
+		let outer = temp.path().join("../linked-remove-outer");
+		let _ = fs::remove_dir_all(&outer);
+		add_detached(&repo, &outer, None);
+		let inner = outer.join("nested");
+		add_detached(&repo, &inner, None);
+		fs::remove_file(inner.join(".git")).unwrap();
+		let outer_admin = GitRepo::require(&outer).unwrap().info().git_dir.clone();
+
+		assert!(!repo.worktree_remove(&inner, true).unwrap());
+		assert!(outer_admin.exists());
+		assert!(outer.join(".git").exists());
+		assert_eq!(setup_owner_of(&repo, &outer).len(), 1);
+
+		fs::remove_dir_all(&inner).unwrap();
+		repo.worktree_prune().unwrap();
+		assert!(repo.worktree_remove(&outer, true).unwrap());
+	}
+
+	#[test]
 	fn prune_keeps_worktrees_still_being_set_up() {
 		let (temp, repo) = fixture();
 		let linked = temp.path().join("../linked-prune-setup");
@@ -3716,16 +3732,18 @@ mod tests {
 	}
 
 	#[test]
-	fn exit_cleanup_frees_a_held_claim_without_its_holder_deleting_a_later_one() {
+	fn exit_cleanup_leaves_the_claim_of_an_add_still_running_after_the_wait() {
 		let (_temp, repo) = fixture();
 		let common = repo.info().common_dir.clone();
 		let claim = common.join("omp-worktree-add.claim");
-		let abandoned = claim_worktree_adds(&common, std::time::Duration::ZERO).unwrap();
-		release_worktree_add_claims(std::time::Duration::ZERO);
-		let next = claim_worktree_adds(&common, std::time::Duration::ZERO).unwrap();
-		drop(abandoned);
-		assert!(claim.exists(), "a released claim's holder must not remove the next add's claim");
-		drop(next);
+		let running = claim_worktree_adds(&common, std::time::Duration::ZERO).unwrap();
+		release_worktree_add_claims(std::time::Duration::from_millis(50));
+		assert!(claim.exists(), "exit cleanup deleted the claim of an add still writing its path");
+		let refused = claim_worktree_adds(&common, std::time::Duration::ZERO)
+			.err()
+			.unwrap();
+		assert!(refused.to_string().contains("omp-worktree-add.claim"), "{refused}");
+		drop(running);
 		assert!(!claim.exists());
 	}
 

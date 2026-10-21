@@ -4121,11 +4121,14 @@ export interface VcsPushOptions {
 }
 
 /**
- * Remove the claim files of worktree adds still running in this process.
+ * Wait up to 9 s for the worktree adds still running in this process to
+ * finish.
  *
- * Only filesystems without file locks use them; this is for an exit that ends
- * those adds without their own cleanup. Waits for running adds to finish
- * first, so their claims keep serializing them.
+ * Only filesystems without file locks use claim files; this is for an exit
+ * that would end those adds without their own cleanup. The claims of adds
+ * still running then are left in place: removing them would let another
+ * process add the same path while this one still writes it. Such a leftover
+ * makes a later add fail naming the file.
  */
 export declare function vcsReleaseWorktreeAddClaims(): Promise<undefined>
 

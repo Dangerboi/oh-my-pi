@@ -7,7 +7,7 @@
 - Added `vcsGitHookLocation(dir, name, signal?)`, where git looks for a hook in the checkout containing `dir` (`core.hooksPath`, with `~/` and `%(prefix)/` expanded, or the shared hooks directory) whether or not one exists there, found entirely off the JS thread ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Added a `setupOwner` option for `worktreeAdd` that marks the new worktree as still being set up until `VcsGitRepo.worktreeEndSetup(path, signal?)`, `setupOwner` on `worktrees()` entries, and `vcs.worktreeSetupOwner()`/`vcs.isWorktreeSetupOwnerAlive(owner)` ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Added `vcs.discoverGit(dir, signal?)` and `vcs.discoverRepo(dir, signal?)`, which find the repository off the JS thread and reject as soon as `signal` aborts ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
-- Added `vcs.releaseWorktreeAddClaims()`, exit cleanup for the claim file `worktreeAdd` uses where the filesystem has no file locks ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- Added `vcs.releaseWorktreeAddClaims()`, exit cleanup that waits up to 9 s for running adds holding the claim file `worktreeAdd` uses where the filesystem has no file locks ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Added `gitDir` to `worktrees()` entries, the worktree's git directory, which stays the same when `git worktree move` moves it ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ### Changed

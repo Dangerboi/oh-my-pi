@@ -98,10 +98,11 @@ export declare function copyGitObjects(isolationRoot: string, sourceRoot: string
 export declare function worktreeSetupOwner(): string;
 
 /**
- * Remove the claim files `worktreeAdd` holds in this process where the filesystem has no file
- * locks (an exclusively created `omp-worktree-add.claim` stands in for the lock). Register it as
- * exit cleanup: a signal exit ends a running add without its own cleanup. Waits up to 9 s for
- * running adds to finish (keeping their claims) before removing the claims of those still running.
+ * Wait up to 9 s for the running `worktreeAdd`s of this process to finish (registered as exit
+ * cleanup; where the filesystem has no file locks they hold an `omp-worktree-add.claim`). The
+ * claims of adds still running then are left in place: removing them would let another process add
+ * the same path while this one still writes it. Such a leftover makes a later add fail naming the
+ * file.
  */
 export declare function releaseWorktreeAddClaims(): Promise<void>;
 
