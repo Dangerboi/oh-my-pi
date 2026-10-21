@@ -1225,6 +1225,22 @@ impl VcsGitRepo {
 		})
 	}
 
+	/// Compare-and-swap of a setup mark: replaces (or, with no replacement,
+	/// clears) it only while it is still `expected`'s, under the worktree-add
+	/// lock. `false` when the mark is missing or another owner's.
+	#[napi]
+	pub fn worktree_replace_setup_owner(
+		&self,
+		git_dir: String,
+		expected: String,
+		replacement: Option<String>,
+		signal: Option<Unknown>,
+	) -> Promise<bool> {
+		blocking("vcs.worktreeReplaceSetupOwner", self.inner.clone(), signal, move |r| {
+			r.worktree_replace_setup_owner(Path::new(&git_dir), &expected, replacement.as_deref())
+		})
+	}
+
 	/// Recent subjects.
 	#[napi]
 	pub fn log_subjects(&self, count: u32, signal: Option<Unknown>) -> Promise<Vec<String>> {

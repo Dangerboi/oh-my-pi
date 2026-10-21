@@ -17,6 +17,7 @@ use super::{
 	normalize_path,
 	open::{load_index_or_empty, load_index_or_head, status_with_fresh_index, status_with_index},
 	read::literal_pathspec,
+	read_setup_mark,
 };
 use crate::{
 	error::{Error, Result},
@@ -996,6 +997,50 @@ impl GitRepo {
 			Some(admin) => end_setup_admin(&admin),
 			None => Ok(()),
 		}
+	}
+
+	/// Compare-and-swap of the setup mark in the administration directory
+	/// `git_dir`, atomic against worktree adds and other swaps, so two processes
+	/// recovering one stale setup can't both act on it, and a mark is cleared
+	/// only while it is still the expected owner's. `replacement` `None` removes
+	/// it. Returns false, changing nothing, when the mark is missing or another
+	/// owner's.
+	pub fn worktree_replace_setup_owner(
+		&self,
+		git_dir: &Path,
+		expected: &str,
+		replacement: Option<&str>,
+	) -> Result<bool> {
+		let common = &self.info().common_dir;
+		let _add_lock = lock_worktree_adds(common)?;
+		let worktrees = fs::canonicalize(common.join("worktrees"))?;
+		// Already gone (removed with its worktree): nothing to swap.
+		let admin = match fs::canonicalize(git_dir) {
+			Ok(admin) => admin,
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+			Err(err) => return Err(err.into()),
+		};
+		if admin.parent() != Some(worktrees.as_path()) {
+			return Err(Error::backend(
+				"git worktree setup",
+				format!("{} is not a worktree administration directory", git_dir.display()),
+			));
+		}
+		if read_setup_mark(&admin)?.as_deref() != Some(expected) {
+			return Ok(false);
+		}
+		match replacement {
+			Some(owner) => {
+				let temp = admin.join(format!("{SETUP_MARK}.tmp-{}", std::process::id()));
+				fs::write(&temp, format!("{owner}\n"))?;
+				if let Err(err) = fs::rename(&temp, admin.join(SETUP_MARK)) {
+					let _ = fs::remove_file(&temp);
+					return Err(err.into());
+				}
+			},
+			None => remove_if_present(&admin.join(SETUP_MARK))?,
+		}
+		Ok(true)
 	}
 
 	/// Administration directory of the linked worktree at `path`: the one its
@@ -3441,6 +3486,46 @@ mod tests {
 		assert!(git(temp.path(), &["worktree", "list", "--porcelain"]).contains("locked by-hook"));
 		git(temp.path(), &["worktree", "unlock", linked.to_str().unwrap()]);
 		assert!(repo.worktree_remove(&linked, true).unwrap());
+	}
+
+	#[test]
+	fn replace_setup_owner_swaps_only_the_expected_owner() {
+		let (temp, repo) = fixture();
+		let linked = temp.path().join("../linked-setup-swap");
+		let _ = fs::remove_dir_all(&linked);
+		add_detached(&repo, &linked, Some("a"));
+		let admin = repo.worktree_admin(&linked).unwrap().unwrap();
+
+		assert!(
+			repo
+				.worktree_replace_setup_owner(&admin, "a", Some("b"))
+				.unwrap()
+		);
+		assert_eq!(setup_owner_of(&repo, &linked), [Some("b".to_owned())]);
+		assert!(
+			!repo
+				.worktree_replace_setup_owner(&admin, "a", None)
+				.unwrap()
+		);
+		assert_eq!(setup_owner_of(&repo, &linked), [Some("b".to_owned())]);
+		assert!(
+			repo
+				.worktree_replace_setup_owner(&admin, "b", None)
+				.unwrap()
+		);
+		assert_eq!(setup_owner_of(&repo, &linked), [None]);
+		assert!(repo.worktree_remove(&linked, true).unwrap());
+	}
+
+	#[test]
+	fn replace_setup_owner_refuses_a_directory_outside_worktrees() {
+		let (_temp, repo) = fixture();
+		let common = repo.info().common_dir.clone();
+		assert!(
+			repo
+				.worktree_replace_setup_owner(&common, "a", None)
+				.is_err()
+		);
 	}
 
 	#[test]

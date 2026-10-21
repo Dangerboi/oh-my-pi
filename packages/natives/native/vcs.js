@@ -358,9 +358,9 @@ function readCapture(file, maxBytes, { fromEnd = false, signal } = {}) {
  * the exit. Aborting `signal` kills its process tree, descendants that left its process group
  * included (see the shortcut below), and rejects with the reason. Throws `ENOENT` when no git is on
  * `env`'s PATH. `detached` runs it in its own session even without a signal (POSIX), away from the
- * caller's terminal. `retain` (`{ handles: Map, pgid }`) keeps our handles to the files open past a
+ * caller's terminal. `stdout`/`stderr` may also be "inherit". `retain` (`{ handles: Map, pgid, start }`) keeps our handles to the files open past a
  * normal return, for the caller to close: `handles` maps path to handle, `pgid` is the process group
- * the child leads, if it does.
+ * the child leads, if it does, `start` the child's start identity, if known.
  */
 async function runGitToFiles(
 	args,
@@ -370,7 +370,7 @@ async function runGitToFiles(
 	const handles = [];
 	let keep = false;
 	const sink = async file => {
-		if (file === "ignore") return file;
+		if (file === "ignore" || file === "inherit") return file;
 		// O_APPEND: the child's writes land at the current end even after the capture is truncated; readable for the trim.
 		const handle = await openCapture(file, signal, append ? "a+" : "w");
 		handles.push(handle);
@@ -393,7 +393,10 @@ async function runGitToFiles(
 			// terminal a prompt on /dev/tty fails instead of writing into the caller's TUI.
 			detached: ownGroup,
 		});
-		if (retain && ownGroup) retain.pgid = child.pid;
+		if (retain) {
+			retain.start = processStart(child.pid);
+			if (ownGroup) retain.pgid = child.pid;
+		}
 
 		// Pin the root now: killTree walks its descendants by parent, so it also reaches one that left the
 		// process group (setsid), and on Windows, which has no process groups, finds them at all.
@@ -573,21 +576,70 @@ function groupAlive(pgid) {
 }
 
 /**
+ * Linux: processes (other than us) with a descriptor on one of the hook's capture files, found via /proc; none
+ * elsewhere or on any failure. Matches by readlink, which never touches the target filesystem, so a process
+ * holding a file on a dead network mount can't hang a threadpool thread (stat would). Only processes started
+ * at or after the hook root (`held.start`, when known) are read: older ones can't have inherited the files.
+ */
+async function captureHolders(held) {
+	if (process.platform !== "linux") return [];
+	try {
+		// An unlinked capture reads back with this suffix.
+		const targets = new Set(held.realPaths.flatMap(file => [file, `${file} (deleted)`]));
+		const since = held.start === undefined ? undefined : BigInt(held.start);
+		const holders = [];
+		for (const name of await fs.promises.readdir("/proc")) {
+			const pid = Number(name);
+			if (!(pid > 0) || pid === process.pid) continue;
+			const start = processStart(pid);
+			try {
+				if (since !== undefined && start !== undefined && BigInt(start) < since) continue;
+			} catch {
+				continue;
+			}
+			const fds = await fs.promises.readdir(`/proc/${pid}/fd`).catch(() => []);
+			for (const fd of fds) {
+				const link = await fs.promises.readlink(`/proc/${pid}/fd/${fd}`).catch(() => undefined);
+				if (link !== undefined && targets.has(link)) {
+					holders.push({ pid, start });
+					break;
+				}
+			}
+		}
+		return holders;
+	} catch {
+		return [];
+	}
+}
+
+/**
  * POSIX: after `git hook run` exited, keep trimming the captures through our handles (the names are
- * gone) while the hook's process group still has members, then close them.
- * shortcut: a process that left the group (setsid, double fork) or any run without its own group (the
- * CLI) is not followed after the hook exits, and trimming stops once omp exits (a process still writing
- * then grows the unlinked file until it ends), upgrade to ptree's Linux subreaper if those must be bounded.
+ * gone) while the hook's process group still has members, then, on Linux, while any process still
+ * holding them lives (found once, via /proc), then close them.
+ * shortcut: only Linux follows a writer that left the group (setsid, double fork) or runs without one
+ * (the CLI); elsewhere trimming stops with the group. Trimming also stops once omp exits (a process
+ * still writing then grows the unlinked file until it ends), upgrade to ptree's Linux subreaper
+ * (or a per-OS holder lookup) if those must be bounded.
  */
 function followHookWriters(held, trimAll) {
 	const close = () => {
 		for (const handle of held.handles.values()) void handle.close().catch(() => {});
 	};
-	if (!trimAll || held.pgid === undefined || !groupAlive(held.pgid)) return close();
+	if (!trimAll) return close();
+	const followHolders = async () => {
+		const holders = await captureHolders(held);
+		const alive = ({ pid, start }) => processAlive(pid) && (start === undefined || processStart(pid) === start);
+		if (!holders.length) return close();
+		pollInBackground(async () => {
+			await trimAll(true);
+			return !holders.some(alive);
+		}, close);
+	};
+	if (held.pgid === undefined || !groupAlive(held.pgid)) return void followHolders();
 	pollInBackground(async () => {
 		await trimAll(true);
 		return !groupAlive(held.pgid);
-	}, close);
+	}, followHolders);
 }
 
 /**
@@ -637,9 +689,11 @@ async function makeCaptureDir(prefix, signal) {
  * `options.signal` kills the hook's process tree and rejects with the reason, also while a
  * lookup, a file check or a read is stalled (starting git still happens on this thread). The output
  * goes to files under TMPDIR, or, when none can be created there, under the worktree's git directory.
+ * With `options.inheritOutput` the hook writes to this process's stdout/stderr instead, nothing is
+ * captured and the result's `stdout`/`stderr` are empty.
  */
 export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
-	const { signal, env, detached } = options;
+	const { signal, env, detached, inheritOutput } = options;
 	signal?.throwIfAborted();
 	const notRun = { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
 	const posix = process.platform !== "win32";
@@ -647,25 +701,32 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	await untilAborted(sweepStaleHookCaptures(), signal);
 	// Files, not pipes: a background process git or the hook starts inherits them, and pipes would stay open until it exits.
 	let dir;
-	try {
-		// Host and pid let a later run tell this directory from one whose omp process is gone.
-		dir = await makeCaptureDir(path.join(os.tmpdir(), `${HOOK_CAPTURE_PREFIX}${PID_SCOPE}-${process.pid}-`), signal);
-	} catch (error) {
-		if (signal?.aborted) throw error;
-		// TMPDIR missing, read-only or full: the new worktree's git directory, just written, holds the hook's output
-		// instead. Removed with the worktree should this process die first.
+	// Inherited output is captured nowhere, so there is no directory.
+	if (!inheritOutput) {
 		try {
-			const gitDir = (await discoverGit(worktreeRoot, signal))?.info().gitDir;
-			if (!gitDir) throw error;
-			dir = await makeCaptureDir(path.join(gitDir, HOOK_CAPTURE_PREFIX), signal);
-		} catch (fallbackError) {
-			if (signal?.aborted) throw fallbackError;
-			throw error;
+			// Host and pid let a later run tell this directory from one whose omp process is gone.
+			dir = await makeCaptureDir(path.join(os.tmpdir(), `${HOOK_CAPTURE_PREFIX}${PID_SCOPE}-${process.pid}-`), signal);
+		} catch (error) {
+			if (signal?.aborted) throw error;
+			// TMPDIR missing, read-only or full: the new worktree's git directory, just written, holds the hook's output
+			// instead. Removed with the worktree should this process die first.
+			try {
+				const gitDir = (await discoverGit(worktreeRoot, signal))?.info().gitDir;
+				if (!gitDir) throw error;
+				dir = await makeCaptureDir(path.join(gitDir, HOOK_CAPTURE_PREFIX), signal);
+			} catch (fallbackError) {
+				if (signal?.aborted) throw fallbackError;
+				throw error;
+			}
 		}
 	}
 	const gitOptions = { env, signal, detached };
-	// Our handles to the capture files and the hook's process group, kept past `git hook run` (POSIX).
-	const held = { handles: new Map(), pgid: undefined };
+	// Our handles to the capture files, their resolved paths (what /proc reports), and the hook's process group and start identity, kept past `git hook run` (POSIX).
+	const held = { handles: new Map(), pgid: undefined, start: undefined, realPaths: [] };
+	if (dir) {
+		const dirReal = await untilAborted(fs.promises.realpath(dir), signal).catch(() => dir);
+		held.realPaths = [path.join(dirReal, "stdout"), path.join(dirReal, "stderr")];
+	}
 	// Set once the hook ran: how to keep trimming the captures after it exited.
 	let after = null;
 	try {
@@ -700,6 +761,17 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		}
 		const reason = await hookRunnerProblem(worktreeRoot, gitOptions);
 		if (reason) return { ...notRun, skipped: { path: hookPath, reason } };
+		if (inheritOutput) {
+			const exitCode = await runGitToFiles(["hook", "run", "--ignore-missing", "post-checkout", "--", "0".repeat(head.length), head, "1"], {
+				cwd: worktreeRoot,
+				env,
+				stdout: "inherit",
+				stderr: "inherit",
+				signal,
+				detached,
+			});
+			return { ...notRun, exitCode };
+		}
 		const outPath = path.join(dir, "stdout");
 		const errPath = path.join(dir, "stderr");
 		const nullOid = "0".repeat(head.length);
@@ -785,10 +857,10 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 		return { exitCode, stdout, stderr };
 	} finally {
 		// Not awaited: a stalled filesystem must not hold up the result or an abort.
-		if (posix) {
+		if (dir && posix) {
 			void removeCapture(dir);
 			if (after) followHookWriters(held, after.trimAll);
-		} else {
+		} else if (dir) {
 			void removeCaptureOnceReleased(dir, after);
 		}
 	}

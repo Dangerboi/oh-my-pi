@@ -144,12 +144,14 @@ export interface SkippedPostCheckoutHook {
  * session included (one that double-forks out to init escapes, and on Windows so do commands
  * MSYS `sh` started through its fork stubs), and rejects with the abort reason, also while a
  * lookup, a file check or a read is stalled; starting git (finding it on PATH, entering the
- * worktree) still happens on the calling thread. A `signal` implies `detached`.
+ * worktree) still happens on the calling thread. A `signal` implies `detached`. `inheritOutput`:
+ * the hook writes to this process's stdout/stderr, as under `git worktree add`, and `stdout`/`stderr`
+ * of the result are empty; nothing is captured.
  */
 export declare function runPostCheckoutHook(
 	worktreeRoot: string,
 	head: string,
-	options?: { signal?: AbortSignal; env?: Record<string, string>; detached?: boolean },
+	options?: { signal?: AbortSignal; env?: Record<string, string>; detached?: boolean; inheritOutput?: boolean },
 ): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array; skipped?: SkippedPostCheckoutHook }>;
 
 /** Join patch fragments, preserving each part's trailing newline. */

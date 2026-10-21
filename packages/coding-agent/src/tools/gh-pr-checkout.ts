@@ -451,12 +451,11 @@ export async function checkoutPullRequest(
 			let existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
 			const setupOwner = existingWorktree?.setupOwner;
 			if (existingWorktree && setupOwner) {
-				// Another omp process is still creating it or running its hook, and discards it if that fails.
-				if (vcs.isWorktreeSetupOwnerAlive(setupOwner)) {
-					throw new ToolError(
-						`the worktree of ${localBranch} at ${existingWorktree.path} is still being set up by another omp process; retry once it is done (if none is, delete \`omp-setup\` in its git dir: \`git -C ${existingWorktree.path} rev-parse --git-dir\`)`,
+				const stillSettingUp = () =>
+					new ToolError(
+						`the worktree of ${localBranch} at ${existingWorktree?.path} is still being set up by another omp process; retry once it is done (if none is, delete \`omp-setup\` in its git dir: \`git -C ${existingWorktree?.path} rev-parse --git-dir\`)`,
 					);
-				}
+				const ownOwner = vcs.worktreeSetupOwner();
 				const staleDir = existingWorktree.path;
 				const checkoutExists = await untilAborted(signal, () =>
 					fs.stat(staleDir).then(
@@ -478,13 +477,27 @@ export async function checkoutPullRequest(
 						},
 					),
 				);
-				if (!checkoutExists || initializing) {
+				const stale = !checkoutExists || initializing;
+				// Another omp process still creating it or running its hook discards it if that fails. Our own mark is an
+				// earlier attempt of this process: recovered only when its checkout is missing or still initializing, else
+				// refused like a live owner's, since its hook never finished.
+				if (setupOwner === ownOwner ? !stale : vcs.isWorktreeSetupOwnerAlive(setupOwner)) throw stillSettingUp();
+				// Compare-and-swap against the listing: a process that recovered or recreated it since owns it now.
+				const claimed = await repository.worktreeReplaceSetupOwner(
+					existingWorktree.gitDir,
+					setupOwner,
+					stale ? ownOwner : null,
+					signal,
+				);
+				if (!claimed) throw stillSettingUp();
+				if (stale) {
 					// That omp's add or rollback left a registration without a whole checkout: drop it and create the worktree afresh.
 					// The partial checkout goes first: if its removal throws, the mark and lock stay and a retry still sees it as partial.
 					if (initializing && checkoutExists && !(await repository.worktreeRemove(staleDir, true, signal))) {
 						await untilAborted(signal, () => fs.rm(staleDir, { recursive: true, force: true }));
 					}
-					await repository.worktreeEndSetup(staleDir, signal);
+					// Our own mark; false when git's removal already deleted the admin dir with it.
+					await repository.worktreeReplaceSetupOwner(existingWorktree.gitDir, ownOwner, null, signal);
 					if (initializing) await untilAborted(signal, () => fs.rm(lockPath, { force: true }));
 					await repository.worktreePrune(signal);
 					existingWorktrees = await repository.worktrees(signal);
@@ -494,9 +507,6 @@ export async function checkoutPullRequest(
 							`the registration of the worktree of ${localBranch} at ${existingWorktree.path} is stale but git keeps it (locked?); run \`git worktree unlock ${existingWorktree.path}\` if so, then \`git worktree prune\`, and retry`,
 						);
 					}
-				} else {
-					// That omp exited mid-setup: the worktree is taken over as it is, as before setups were marked.
-					await repository.worktreeEndSetup(staleDir, signal);
 				}
 			}
 

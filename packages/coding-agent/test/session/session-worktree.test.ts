@@ -631,6 +631,45 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			}
 		});
 
+		it("a discard leaves the mark of a worktree another process added at the freed path", async () => {
+			const repoProto = Object.getPrototypeOf(vcs.requireGit(repo));
+			const realRemove = repoProto.worktreeRemove;
+			const otherOwner = "other-live-owner";
+			let replacement: string | undefined;
+			const remove = spyOn(repoProto, "worktreeRemove").mockImplementation(async function (
+				this: unknown,
+				removePath: string,
+				force?: boolean,
+			) {
+				const result = await realRemove.call(this, removePath, force);
+				// Another process takes the path the moment it is free; without hooks, as the test's would block on its pipe.
+				git(repo, "-c", "core.hooksPath=/dev/null", "worktree", "add", "-b", `${branch}-other`, removePath);
+				replacement = removePath;
+				const entry = (await vcs.requireGit(repo).worktrees()).find(e => e.path === removePath);
+				await Bun.write(path.join(entry!.gitDir, "omp-setup"), `${otherOwner}\n`);
+				return result;
+			});
+			try {
+				const signalPipe = path.join(root, "hook-started");
+				expect(Bun.spawnSync(["mkfifo", signalPipe]).exitCode).toBe(0);
+				await hook(`echo started > "${signalPipe}"\nsleep 600`);
+				const controller = new AbortController();
+				const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+				await Bun.file(signalPipe).text();
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+			} finally {
+				remove.mockRestore();
+			}
+
+			try {
+				const entry = (await vcs.requireGit(repo).worktrees()).find(e => e.branch === `refs/heads/${branch}-other`);
+				expect(entry?.setupOwner).toBe(otherOwner);
+			} finally {
+				if (replacement) git(repo, "worktree", "remove", "--force", replacement);
+			}
+		});
+
 		it("reports a hook as not run when the git on PATH cannot start", async () => {
 			const wt = await create();
 			await hook("touch .post-checkout-ran");
@@ -856,6 +895,53 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 							s => s.size,
 							() => Number.POSITIVE_INFINITY,
 						);
+					}
+					expect(size).toBeLessThanOrEqual(1024 * 1024);
+				} finally {
+					if (pid) {
+						Bun.spawnSync(["pkill", "-KILL", "-P", String(pid)]);
+						try {
+							process.kill(pid, "SIGKILL");
+						} catch {
+							// Already gone.
+						}
+					}
+				}
+			},
+		);
+
+		it.skipIf(process.platform !== "linux")(
+			"keeps trimming the output files of a background process that left the hook's process group",
+			async () => {
+				const wt = await create();
+				const writerPid = path.join(root, "hook-setsid-pid");
+				const written = path.join(root, "hook-setsid-done");
+				// The leftover starts its own session, so the hook's group is empty while it still holds the captures.
+				await hook(
+					`setsid sh -c 'echo $$ > "${writerPid}"; sleep 0.5; head -c 5000000 /dev/zero | tr "\\0" x; echo done > "${written}"; sleep 6' &`,
+				);
+				let pid = 0;
+				try {
+					const result = await vcs.runPostCheckoutHook(wt.path, wt.baseCommit, {
+						env: filterChildShellEnv(process.env),
+						detached: true,
+					});
+					expect(result.exitCode).toBe(0);
+					// Real wait: the detached shell records its pid on its own schedule.
+					for (let i = 0; i < 100 && !(await exists(writerPid)); i++) await Bun.sleep(50);
+					pid = Number((await fs.readFile(writerPid, "utf8")).trim());
+					for (let i = 0; i < 100 && !(await exists(written)); i++) await Bun.sleep(50);
+					expect(await exists(written)).toBe(true);
+					const sizeOf = () =>
+						fs.stat(`/proc/${pid}/fd/1`).then(
+							s => s.size,
+							() => Number.POSITIVE_INFINITY,
+						);
+					let size = Number.POSITIVE_INFINITY;
+					for (let i = 0; i < 60 && size > 1024 * 1024; i++) {
+						// Real wait: the writer and the trim run on their own timers.
+						await Bun.sleep(50);
+						size = await sizeOf();
 					}
 					expect(size).toBeLessThanOrEqual(1024 * 1024);
 				} finally {

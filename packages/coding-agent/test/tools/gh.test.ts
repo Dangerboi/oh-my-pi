@@ -1445,6 +1445,62 @@ describe("github tool", () => {
 					runGit(fixture.repoRoot, ["worktree", "remove", "--force", outcome.worktreePath]);
 				}
 			});
+			it("refuses this process's own mark on a complete checkout, whose hook never finished", async () => {
+				mockPrView(138);
+				const primaryRoot = vcs.requireGit(fixture.repoRoot).primaryRoot() ?? fixture.repoRoot;
+				const dir = path.join(tempHome.home, ".omp", "wt", `138-${hashPath(primaryRoot)}`);
+				const branch = "pr-138";
+				runGit(fixture.repoRoot, ["worktree", "add", "-q", "-b", branch, dir, fixture.headRefOid]);
+				const gitDir = runGit(dir, ["rev-parse", "--absolute-git-dir"]);
+				await Bun.write(path.join(gitDir, "omp-setup"), `${vcs.worktreeSetupOwner()}\n`);
+				try {
+					await expect(checkout(138, new AbortController().signal)).rejects.toThrow("still being set up");
+					expect(await Bun.file(path.join(dir, runGit(dir, ["ls-files"]).split("\n")[0])).exists()).toBe(true);
+					expect(await setupOwnerOf(fixture.repoRoot, branch)).toBe(vcs.worktreeSetupOwner());
+				} finally {
+					runGit(fixture.repoRoot, ["worktree", "remove", "--force", dir]);
+				}
+			});
+			it("refuses a dead owner's worktree that another process claimed after the listing, leaving its checkout alone", async () => {
+				mockPrView(137);
+				const primaryRoot = vcs.requireGit(fixture.repoRoot).primaryRoot() ?? fixture.repoRoot;
+				const dir = path.join(tempHome.home, ".omp", "wt", `137-${hashPath(primaryRoot)}`);
+				const branch = "pr-137";
+				runGit(fixture.repoRoot, ["worktree", "add", "-q", "-b", branch, dir, fixture.headRefOid]);
+				const owner = vcs
+					.worktreeSetupOwner()
+					.replace(/-\d+(-\d+)?$/, `-${Bun.spawnSync(["sh", "-c", "exit 0"]).pid}`);
+				const gitDir = runGit(dir, ["rev-parse", "--absolute-git-dir"]);
+				await Bun.write(path.join(gitDir, "omp-setup"), `${owner}\n`);
+				await Bun.write(path.join(gitDir, "locked"), "initializing\n");
+				const tracked = runGit(dir, ["ls-files"]).split("\n")[0];
+
+				const repoProto = Object.getPrototypeOf(vcs.requireGit(fixture.repoRoot));
+				const realWorktrees = repoProto.worktrees;
+				const worktreesSpy = vi.spyOn(repoProto, "worktrees").mockImplementationOnce(async function (
+					this: unknown,
+					...args: unknown[]
+				) {
+					const listing = await realWorktrees.apply(this, args);
+					// Another process takes the setup over after this listing was read.
+					await Bun.write(path.join(gitDir, "omp-setup"), `${vcs.worktreeSetupOwner()}\n`);
+					return listing;
+				});
+				try {
+					await expect(checkout(137, new AbortController().signal)).rejects.toThrow(
+						"still being set up by another omp process",
+					);
+				} finally {
+					worktreesSpy.mockRestore();
+				}
+
+				try {
+					expect(await Bun.file(path.join(dir, tracked)).exists()).toBe(true);
+					expect(await setupOwnerOf(fixture.repoRoot, branch)).toBe(vcs.worktreeSetupOwner());
+				} finally {
+					runGit(fixture.repoRoot, ["worktree", "remove", "--force", "--force", dir]);
+				}
+			});
 			it.skipIf(!/^[^-]+-\d+-\d+$/.test(vcs.worktreeSetupOwner()))(
 				"counts an owner whose pid now belongs to a process that started at another time as gone",
 				() => {

@@ -730,6 +730,12 @@ export declare class VcsGitRepo {
    * once its `.git` is gone.
    */
   worktreeEndSetup(path: string, signal?: unknown | undefined | null): Promise<undefined>
+  /**
+   * Compare-and-swap of a setup mark: replaces (or, with no replacement,
+   * clears) it only while it is still `expected`'s, under the worktree-add
+   * lock. `false` when the mark is missing or another owner's.
+   */
+  worktreeReplaceSetupOwner(gitDir: string, expected: string, replacement?: string | undefined | null, signal?: unknown | undefined | null): Promise<boolean>
   /** Recent subjects. */
   logSubjects(count: number, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Recent one-line commits. */

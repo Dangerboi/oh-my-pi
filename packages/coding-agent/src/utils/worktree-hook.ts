@@ -110,10 +110,8 @@ export async function addWorktreeWithHook(
 	signal?.throwIfAborted();
 	// No signal: the native checkout runs to completion regardless, and an abort-rejected call would
 	// not say whether this attempt created the worktree.
-	const added = await repository.worktreeAdd(worktreePath, branch, {
-		...options,
-		setupOwner: vcs.worktreeSetupOwner(),
-	});
+	const setupOwner = vcs.worktreeSetupOwner();
+	const added = await repository.worktreeAdd(worktreePath, branch, { ...options, setupOwner });
 	let head: string | null | undefined;
 	// A hook may move its worktree, as under `git worktree add`; everything after it uses the current path.
 	let current = worktreePath;
@@ -147,7 +145,7 @@ export async function addWorktreeWithHook(
 				error: String(lookupError),
 			});
 		}
-		await discardNewWorktree(repository, current);
+		await discardNewWorktree(repository, current, gitDir, setupOwner);
 		if (head) await restoreBranch(repository, branch, head);
 		throw error;
 	}
@@ -170,29 +168,37 @@ async function currentWorktreePath(
 
 /**
  * Remove a worktree this attempt's own `worktreeAdd` created, or, when it is no longer
- * discoverable (its `.git` file is gone), delete its directory. Once it is gone its registration
- * loses the setup mark and, pointing nowhere, is pruned. If it could not be removed, it keeps
- * the mark: it stays owned by this live process, so other omp processes do not reuse the
- * half-set-up checkout. Takes no signal, as the caller's may already be aborted; failures are
- * logged, not thrown, so the original error reaches the caller.
+ * discoverable (its `.git` file is gone), delete its directory. A native removal deletes the
+ * registration with its setup mark; after the directory fallback the mark is cleared by
+ * compare-and-swap on `gitDir` and `owner`, never by path, which another process may have reused
+ * by then. If it could not be removed, it keeps the mark: it stays owned by this live process, so
+ * other omp processes do not reuse the half-set-up checkout. Takes no signal, as the caller's may
+ * already be aborted; failures are logged, not thrown, so the original error reaches the caller.
  */
-async function discardNewWorktree(repository: VcsGitRepo, worktreePath: string): Promise<void> {
+async function discardNewWorktree(
+	repository: VcsGitRepo,
+	worktreePath: string,
+	gitDir: string | undefined,
+	owner: string,
+): Promise<void> {
 	const warn = (error: unknown) =>
 		logger.warn("could not remove a worktree whose setup was cut short", {
 			path: worktreePath,
 			error: String(error),
 		});
+	let removed: boolean;
 	try {
-		if (!(await repository.worktreeRemove(worktreePath, true))) {
-			await fs.rm(worktreePath, { recursive: true, force: true });
-		}
+		removed = await repository.worktreeRemove(worktreePath, true);
+		if (!removed) await fs.rm(worktreePath, { recursive: true, force: true });
 	} catch (error) {
 		warn(error);
 		return;
 	}
-	// Also after a removal: with the `.git` gone, it may have been another checkout around it that was found.
 	try {
-		await repository.worktreeEndSetup(worktreePath);
+		if (!removed) {
+			if (gitDir === undefined) await repository.worktreeEndSetup(worktreePath);
+			else await repository.worktreeReplaceSetupOwner(gitDir, owner, null);
+		}
 		await repository.worktreePrune();
 	} catch (error) {
 		warn(error);

@@ -45,7 +45,24 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 
 		expect(result.exitCode).toBe(0);
 		expect(marker).toEqual([worktree, "0".repeat(head.length), head, "1"]);
+		// Git runs hooks with their stdout on its stderr, as under `git worktree add`.
 		expect(result.stderr.toString()).toContain("hook-output");
+	});
+
+	it("gives the hook the terminal, capturing nothing on disk, even for a writer that outlives it", async () => {
+		const tmp = path.join(root, "tmp");
+		await fs.mkdir(tmp);
+		await hook("(sleep 1; echo late-output) &");
+		const worktree = path.join(root, "late");
+		const result = await $`bun ${cli} worktree add --detach ${worktree} HEAD`
+			.cwd(repo)
+			.env({ ...process.env, TMPDIR: tmp })
+			.quiet()
+			.nothrow();
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr.toString()).toContain("late-output");
+		expect((await fs.readdir(tmp)).filter(name => name.startsWith("omp-post-checkout-"))).toEqual([]);
 	});
 
 	it("preserves a refusing hook's failure status and stderr", async () => {

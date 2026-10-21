@@ -164,10 +164,11 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	if (result.cloneError) {
 		console.error(chalk.dim(`warning: worktree clone fell back to plain checkout: ${result.cloneError}`));
 	}
-	// Not `detached`: like `git worktree add`, the CLI leaves the hook on the user's terminal, where it may prompt.
-	const hook = await vcs.runPostCheckoutHook(worktreePath, commit.sha, { env: filterChildShellEnv(process.env) });
-	process.stderr.write(hook.stdout);
-	process.stderr.write(hook.stderr);
+	// Like `git worktree add`, the hook gets the terminal (it may prompt) and nothing is captured: a background process it leaves writes there, not to a file.
+	const hook = await vcs.runPostCheckoutHook(worktreePath, commit.sha, {
+		env: filterChildShellEnv(process.env),
+		inheritOutput: true,
+	});
 	if (hook.skipped) console.error(chalk.dim(`warning: ${describeSkippedHook(hook.skipped)}`));
 	if (hook.exitCode !== 0) process.exitCode = hook.exitCode;
 }
