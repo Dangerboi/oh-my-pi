@@ -9,6 +9,10 @@
 - Git hooks in a `core.hooksPath` written with `~/` are now found for commits and the bash `git worktree add` rewrite, as git finds them ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - `github` `pr_checkout` no longer takes over a PR worktree another omp process is still setting up, so a failed setup there can't delete its work ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - `omp worktree clear` no longer drops the registration of a worktree git has locked, e.g. one on an offline drive ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- Fixed the advisor prompt forbidding all repeated advice, including real escalations: advisors may now re-raise a prior nit or concern as a blocker once new evidence makes it one ([#13887](https://github.com/can1357/oh-my-pi/issues/13887), [#16484](https://github.com/can1357/oh-my-pi/pull/16484) by [@pjh890321](https://github.com/pjh890321))
+### Changed
+
+- Idle compaction no longer runs on logged-in OpenAI Codex accounts, whose prompt cache never expires; compacting while idle only threw away a warm cache
 
 ## [18.12.5] - 2026-10-21
 

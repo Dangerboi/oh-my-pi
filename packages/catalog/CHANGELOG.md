@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `prompt-cache-persistent` catalog axis (`isPromptCachePersistent`) for providers whose own endpoint never expires prompt caches; logged-in OpenAI Codex declares it
+
 ## [18.12.5] - 2026-10-21
 
 ### Fixed
