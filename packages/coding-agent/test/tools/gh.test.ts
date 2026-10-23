@@ -1585,6 +1585,31 @@ describe("github tool", () => {
 					expect(runGit(fixture.repoRoot, ["rev-parse", "refs/heads/pr-128"])).toBe(fixture.headRefOid);
 				},
 			);
+			it("an abort after the hook renamed the PR branch leaves neither the renamed branch nor its config", async () => {
+				mockPrView(140);
+				try {
+					await withBlockingHook("pr-140", "git branch -m pr-140 renamed-140", async started => {
+						const controller = new AbortController();
+						const pending = checkout(140, controller.signal);
+						await fs.readFile(started, "utf8");
+						controller.abort();
+						await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+					});
+
+					await expectDiscarded(140);
+					const renamedRef = Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", "refs/heads/renamed-140"], {
+						cwd: fixture.repoRoot,
+					});
+					expect(renamedRef.exitCode).not.toBe(0);
+					const renamedConfig = Bun.spawnSync(["git", "config", "--get", "branch.renamed-140.ompPrUrl"], {
+						cwd: fixture.repoRoot,
+					});
+					expect(renamedConfig.stdout.toString().trim()).toBe("");
+				} finally {
+					Bun.spawnSync(["git", "branch", "-D", "renamed-140"], { cwd: fixture.repoRoot });
+					Bun.spawnSync(["git", "config", "--remove-section", "branch.renamed-140"], { cwd: fixture.repoRoot });
+				}
+			});
 
 			it("is removed when the checkout is aborted after the worktree exists but before its hook starts", async () => {
 				mockPrView(126);

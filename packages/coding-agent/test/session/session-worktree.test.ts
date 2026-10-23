@@ -618,6 +618,45 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(await exists(`${(await Bun.file(origin).text()).trim()}-moved`)).toBe(false);
 		});
 
+		it("an abort after the hook renamed its branch leaves neither the renamed nor the original branch", async () => {
+			const renamed = `${branch}-hook-renamed`;
+			const signalPipe = path.join(root, "hook-rename-started");
+			expect(Bun.spawnSync(["mkfifo", signalPipe]).exitCode).toBe(0);
+			await hook(
+				`unset GIT_DIR GIT_WORK_TREE\ngit -C "$PWD" branch -m "${renamed}"\necho started > "${signalPipe}"\nsleep 600`,
+			);
+			const controller = new AbortController();
+			const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+			await Bun.file(signalPipe).text();
+			controller.abort();
+			await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+
+			expect(branchSha(repo, renamed)).toBeNull();
+			expect(branchSha(repo, branch)).toBeNull();
+			expect(worktreePaths(repo)).toEqual([repo]);
+		});
+
+		it("an abort keeps a branch the hook left its worktree on when its reflog shows no rename from the original", async () => {
+			const other = `${branch}-other`;
+			const signalPipe = path.join(root, "hook-other-started");
+			expect(Bun.spawnSync(["mkfifo", signalPipe]).exitCode).toBe(0);
+			await hook(
+				`unset GIT_DIR GIT_WORK_TREE\ngit -C "$PWD" branch "${other}"\ngit -C "$PWD" -c core.hooksPath=/dev/null checkout "${other}"\ngit -C "$PWD" branch -D "${branch}"\necho started > "${signalPipe}"\nsleep 600`,
+			);
+			try {
+				const controller = new AbortController();
+				const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+				await Bun.file(signalPipe).text();
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+
+				expect(branchSha(repo, other)).not.toBeNull();
+				expect(worktreePaths(repo)).toEqual([repo]);
+			} finally {
+				Bun.spawnSync(["git", "branch", "-D", other], { cwd: repo });
+			}
+		});
+
 		it("keeps the setup mark on a cut-short worktree that could not be removed, so other processes refuse it", async () => {
 			const repoProto = Object.getPrototypeOf(vcs.requireGit(repo));
 			const remove = spyOn(repoProto, "worktreeRemove").mockRejectedValue(new Error("busy"));

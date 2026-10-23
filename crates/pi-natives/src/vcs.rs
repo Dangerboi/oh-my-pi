@@ -1085,6 +1085,22 @@ impl VcsGitRepo {
 		blocking("vcs.refExists", self.inner.clone(), signal, move |r| r.ref_exists(&name))
 	}
 
+	/// Whether the reflog of `refs/heads/<name>` holds the entry
+	/// `Branch: renamed refs/heads/<from> to refs/heads/<name>` that
+	/// `git branch -m` writes, proving the branch was renamed from `from`.
+	/// False when the branch, its reflog, or a matching entry is absent.
+	#[napi]
+	pub fn branch_renamed_from(
+		&self,
+		name: String,
+		from: String,
+		signal: Option<Unknown>,
+	) -> Promise<bool> {
+		blocking("vcs.branchRenamedFrom", self.inner.clone(), signal, move |r| {
+			r.branch_renamed_from(&name, &from)
+		})
+	}
+
 	/// Tags pointing at a revision.
 	#[napi]
 	pub fn tags_at(&self, rev: String, signal: Option<Unknown>) -> Promise<Vec<String>> {

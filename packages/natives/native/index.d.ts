@@ -694,6 +694,13 @@ export declare class VcsGitRepo {
   resolveRef(name: string, signal?: unknown | undefined | null): Promise<string | undefined | null>
   /** Test revision existence. */
   refExists(name: string, signal?: unknown | undefined | null): Promise<boolean>
+  /**
+   * Whether the reflog of `refs/heads/<name>` holds the entry
+   * `Branch: renamed refs/heads/<from> to refs/heads/<name>` that
+   * `git branch -m` writes, proving the branch was renamed from `from`.
+   * False when the branch, its reflog, or a matching entry is absent.
+   */
+  branchRenamedFrom(name: string, from: string, signal?: unknown | undefined | null): Promise<boolean>
   /** Tags pointing at a revision. */
   tagsAt(rev: string, signal?: unknown | undefined | null): Promise<Array<string>>
   /** List branches. */

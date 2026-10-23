@@ -110,7 +110,8 @@ export class WorktreeRemovedByHookError extends Error {
  * included, see it as `git worktree add` leaves it. If the hook stage fails or `signal` aborts
  * before the setup mark is removed, the worktree is discarded and `branch` put back where the
  * checkout left it, so a retry starts over instead of reusing a half-set-up checkout or finding
- * the branch diverged. The discard itself takes no signal and runs to completion. A failed
+ * the branch diverged. A branch the hook renamed the new branch to is deleted and the original
+ * put back, but only when its reflog shows that rename and it did not exist before the hook. The discard itself takes no signal and runs to completion. A failed
  * `worktreeAdd` discards nothing: another process may own the path by then. If the hook removed
  * the worktree, the call fails with {@link WorktreeRemovedByHookError} and touches neither the path
  * nor the branch, which another process may have taken since.
@@ -128,6 +129,8 @@ export async function addWorktreeWithHook(
 	const setupOwner = vcs.worktreeSetupOwner();
 	const added = await repository.worktreeAdd(worktreePath, branch, { ...options, setupOwner });
 	let head: string | null | undefined;
+	// Local branches before the hook ran: a branch absent from it was created by the hook.
+	let branchesBefore: Set<string> | undefined;
 	// A hook may move its worktree, as under `git worktree add`; everything after it uses the current path.
 	let current = worktreePath;
 	let gitDir: string | undefined;
@@ -139,6 +142,7 @@ export async function addWorktreeWithHook(
 		gitDir = listed.find(entry => entry.branch === `refs/heads/${branch}`)?.gitDir;
 		signal?.throwIfAborted();
 		head = await repository.resolveRef(`refs/heads/${branch}`, signal);
+		branchesBefore = new Set(await untilAborted(signal, () => repository.listBranches(false)));
 		const hook = head ? await runWorktreeCheckoutHook(worktreePath, head, signal) : {};
 		// Raced like the path lookup below, so an abort rejects with its reason.
 		const located = await currentWorktreeEntry(repository, gitDir, signal);
@@ -171,12 +175,18 @@ export async function addWorktreeWithHook(
 		}
 		return { added, path: resolved, hook, branch: setUpBranch };
 	} catch (error) {
+		let hookBranch: string | undefined;
 		if (!gone) {
 			// The hook may have moved the worktree before it was cut short; discard where it is now.
 			try {
 				const located = await currentWorktreeEntry(repository, gitDir);
 				if (located === undefined) gone = true;
-				else current = located?.path ?? current;
+				else {
+					current = located?.path ?? current;
+					if (located && !located.detached && located.branch?.startsWith("refs/heads/")) {
+						hookBranch = located.branch.slice("refs/heads/".length);
+					}
+				}
 			} catch (lookupError) {
 				logger.warn("could not locate a new worktree its hook may have moved", {
 					path: current,
@@ -191,6 +201,9 @@ export async function addWorktreeWithHook(
 			});
 		} else {
 			await discardNewWorktree(repository, current, gitDir, setupOwner);
+			if (gitDir !== undefined && branchesBefore && hookBranch !== undefined) {
+				await deleteRenamedBranch(repository, branch, hookBranch, branchesBefore);
+			}
 			if (head) await restoreBranch(repository, branch, head);
 		}
 		throw error;
@@ -276,6 +289,39 @@ async function restoreBranch(repository: VcsGitRepo, branch: string, head: strin
 	} catch (error) {
 		logger.warn("could not restore a branch moved by a cut-short post-checkout hook", {
 			branch,
+			error: String(error),
+		});
+	}
+}
+
+/**
+ * Delete `renamed`, the branch a cut-short hook renamed `branch` to, once its worktree is gone. Only
+ * when `branch` no longer exists, `renamed` is not in `before` (the hook created it), and the reflog
+ * of `renamed` shows the hook renamed `branch` to it, so a branch that existed earlier or that
+ * another process created is never deleted. Failures are logged.
+ */
+async function deleteRenamedBranch(
+	repository: VcsGitRepo,
+	branch: string,
+	renamed: string,
+	before: ReadonlySet<string>,
+): Promise<void> {
+	if (renamed === branch || before.has(renamed)) return;
+	try {
+		if (await repository.refExists(`refs/heads/${branch}`)) return;
+		if (!(await repository.branchRenamedFrom(renamed, branch))) {
+			logger.warn(
+				"a branch the cut-short hook left the worktree on is kept: no rename from the original in its reflog",
+				{ branch: renamed, original: branch },
+			);
+			return;
+		}
+		if (!(await repository.deleteBranch(renamed, true))) {
+			logger.warn("could not delete a branch a cut-short post-checkout hook renamed", { branch: renamed });
+		}
+	} catch (error) {
+		logger.warn("could not delete a branch a cut-short post-checkout hook renamed", {
+			branch: renamed,
 			error: String(error),
 		});
 	}

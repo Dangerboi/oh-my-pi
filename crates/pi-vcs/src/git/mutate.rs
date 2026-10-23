@@ -389,6 +389,12 @@ impl GitRepo {
 	}
 
 	/// Delete a local branch, returning false for missing or unsafe deletion.
+	///
+	/// Once the ref is deleted, every `[branch "<name>"]` section is removed
+	/// from the shared config (as `git branch -D` does); a missing,
+	/// checked-out or unmerged (without `force`) branch leaves the config
+	/// untouched. A failure to rewrite the config does not undo or fail the
+	/// deletion.
 	pub fn delete_branch(&self, name: &str, force: bool) -> Result<bool> {
 		let repo = self.gix()?;
 		let full = format!("refs/heads/{name}");
@@ -425,7 +431,13 @@ impl GitRepo {
 				.map_err(|err| Error::backend("git branch", err))?,
 			deref:  false,
 		};
-		Ok(repo.edit_reference(edit).is_ok())
+		if repo.edit_reference(edit).is_err() {
+			return Ok(false);
+		}
+		// `git branch -D` also drops the branch's config; the ref is already
+		// gone, so a config failure must not report the deletion as failed.
+		let _ = remove_config_sections(&self.info().common_dir.join("config"), "branch", name);
+		Ok(true)
 	}
 
 	/// Create a branch at HEAD and switch to it without touching files.
@@ -1831,6 +1843,29 @@ fn path_matches(path: &str, wanted: &str) -> bool {
 		|| path
 			.strip_prefix(wanted)
 			.is_some_and(|r| r.starts_with('/'))
+}
+
+/// Drop every `[<section> "<subsection>"]` section from a config file; the rest
+/// is written back as gix serializes it (mostly lossless). Returns without
+/// writing when none match.
+fn remove_config_sections(path: &Path, section: &str, subsection: &str) -> Result<()> {
+	let mut config =
+		gix::config::File::from_path_no_includes(path.to_owned(), gix::config::Source::Local)
+			.map_err(|e| Error::backend("git config", e))?;
+	let mut removed = false;
+	while config
+		.remove_section(section, Some(subsection.into()))
+		.is_some()
+	{
+		removed = true;
+	}
+	if !removed {
+		return Ok(());
+	}
+	let mut bytes = Vec::new();
+	config.write_to(&mut bytes)?;
+	fs::write(path, bytes)?;
+	Ok(())
 }
 
 fn set_config_file(path: &Path, key: &str, value: &str) -> Result<()> {
@@ -3400,6 +3435,33 @@ mod tests {
 			);
 			let _ = repo.worktree_remove(&linked, true);
 		}
+	}
+
+	#[test]
+	fn delete_branch_drops_only_that_branchs_config_section() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["branch", "feature"]);
+		git(temp.path(), &["branch", "keep"]);
+		for (branch, key, value) in [
+			("feature", "remote", "origin"),
+			("feature", "merge", "refs/heads/feature"),
+			("feature", "ompCustom", "yes"),
+			("keep", "remote", "origin"),
+		] {
+			repo
+				.config_set(&format!("branch.{branch}.{key}"), value)
+				.unwrap();
+		}
+		repo.config_set("custom.unrelated", "stay").unwrap();
+
+		assert!(repo.delete_branch("feature", true).unwrap());
+
+		let config = fs::read_to_string(temp.path().join(".git/config")).unwrap();
+		assert!(!config.contains("[branch \"feature\"]"), "{config}");
+		assert!(!config.contains("ompCustom"), "{config}");
+		assert!(config.contains("[branch \"keep\"]"), "{config}");
+		assert!(config.contains("unrelated = stay"), "{config}");
+		assert_eq!(git(temp.path(), &["config", "--get", "branch.keep.remote"]), "origin");
 	}
 
 	#[test]
