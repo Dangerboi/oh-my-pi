@@ -1927,43 +1927,113 @@ fn path_matches(path: &str, wanted: &str) -> bool {
 			.is_some_and(|r| r.starts_with('/'))
 }
 
-/// Drop every `[<section> "<subsection>"]` section from a config file; the rest
-/// is written back as gix serializes it (mostly lossless). Returns without
-/// writing when none match.
+/// Edit a config file the way git does, under its lockfile protocol: take
+/// `<config>.lock` with `create_new` (retrying for ~100 ms while another writer
+/// holds it, then erroring), read the config only once the lock is held so a
+/// concurrent writer's committed change is seen, let `edit` change it, write
+/// the result into the lock with the old file's permissions, sync, and rename
+/// it over the config. A symlinked config is edited at its target. When `edit`
+/// returns false the lock is released without rewriting. A missing config
+/// starts empty. The rest of the file is written back as gix serializes it
+/// (mostly lossless). Only a lock this call created is ever removed.
+fn edit_config_locked(
+	path: &Path,
+	edit: impl FnOnce(&mut gix::config::File<'static>) -> Result<bool>,
+) -> Result<()> {
+	use std::{
+		io::Write,
+		thread,
+		time::{Duration, Instant},
+	};
+
+	// As git's lockfile does: a symlinked config, even one whose target does not
+	// exist yet, is edited at its target with the lock beside it, so the link
+	// stays. Up to five levels, as git follows.
+	let mut resolved = path.to_path_buf();
+	for _ in 0..5 {
+		let Ok(target) = fs::read_link(&resolved) else {
+			break;
+		};
+		resolved = match resolved.parent() {
+			Some(dir) if target.is_relative() => dir.join(target),
+			_ => target,
+		};
+	}
+	let path = resolved.as_path();
+	let mut lock_name = path.as_os_str().to_owned();
+	lock_name.push(".lock");
+	let lock_path = PathBuf::from(lock_name);
+
+	let deadline = Instant::now() + Duration::from_millis(100);
+	let mut lock = loop {
+		match fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&lock_path)
+		{
+			Ok(file) => break file,
+			Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+				if Instant::now() >= deadline {
+					return Err(e.into());
+				}
+				thread::sleep(Duration::from_millis(5));
+			},
+			Err(e) => return Err(e.into()),
+		}
+	};
+
+	let published = (|| -> Result<bool> {
+		let existing = fs::metadata(path).ok();
+		let mut config = if existing.is_some() {
+			gix::config::File::from_path_no_includes(path.to_owned(), gix::config::Source::Local)
+				.map_err(|e| Error::backend("git config", e))?
+		} else {
+			gix::config::File::default()
+		};
+		if !edit(&mut config)? {
+			return Ok(false);
+		}
+		// As git does: the lock takes the old file's mode before any content is
+		// written, so a 0600 config holding credentials is never readable through
+		// it, and the published file keeps that mode.
+		if let Some(existing) = &existing {
+			lock.set_permissions(existing.permissions())?;
+		}
+		let mut bytes = Vec::new();
+		config.write_to(&mut bytes)?;
+		lock.write_all(&bytes)?;
+		lock.sync_all()?;
+		fs::rename(&lock_path, path)?;
+		Ok(true)
+	})();
+	if !matches!(published, Ok(true)) {
+		let _ = fs::remove_file(&lock_path);
+	}
+	published.map(|_| ())
+}
+
+/// Drop every `[<section> "<subsection>"]` section from a config file, under
+/// [`edit_config_locked`]; nothing is rewritten when none matches.
 fn remove_config_sections(path: &Path, section: &str, subsection: &str) -> Result<()> {
-	let mut config =
-		gix::config::File::from_path_no_includes(path.to_owned(), gix::config::Source::Local)
-			.map_err(|e| Error::backend("git config", e))?;
-	let mut removed = false;
-	while config
-		.remove_section(section, Some(subsection.into()))
-		.is_some()
-	{
-		removed = true;
-	}
-	if !removed {
-		return Ok(());
-	}
-	let mut bytes = Vec::new();
-	config.write_to(&mut bytes)?;
-	fs::write(path, bytes)?;
-	Ok(())
+	edit_config_locked(path, |config| {
+		let mut removed = false;
+		while config
+			.remove_section(section, Some(subsection.into()))
+			.is_some()
+		{
+			removed = true;
+		}
+		Ok(removed)
+	})
 }
 
 fn set_config_file(path: &Path, key: &str, value: &str) -> Result<()> {
-	let mut config = if path.exists() {
-		gix::config::File::from_path_no_includes(path.to_owned(), gix::config::Source::Local)
-			.map_err(|e| Error::backend("git config", e))?
-	} else {
-		gix::config::File::default()
-	};
-	config
-		.set_raw_value(key, value)
-		.map_err(|e| Error::backend("git config", e))?;
-	let mut bytes = Vec::new();
-	config.write_to(&mut bytes)?;
-	fs::write(path, bytes)?;
-	Ok(())
+	edit_config_locked(path, |config| {
+		config
+			.set_raw_value(key, value)
+			.map_err(|e| Error::backend("git config", e))?;
+		Ok(true)
+	})
 }
 
 /// Paths whose entry differs between `left` and `right` (blob id or mode), or
@@ -3544,6 +3614,76 @@ mod tests {
 		assert!(config.contains("[branch \"keep\"]"), "{config}");
 		assert!(config.contains("unrelated = stay"), "{config}");
 		assert_eq!(git(temp.path(), &["config", "--get", "branch.keep.remote"]), "origin");
+		assert!(!temp.path().join(".git/config.lock").exists(), "the config lock is released");
+	}
+
+	#[test]
+	fn delete_branch_leaves_branch_config_alone_while_another_writer_holds_config_lock() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["branch", "feature"]);
+		repo.config_set("branch.feature.remote", "origin").unwrap();
+		let lock = temp.path().join(".git/config.lock");
+		fs::write(&lock, "[other]\n\twriter = busy\n").unwrap();
+
+		assert!(repo.delete_branch("feature", true).unwrap());
+
+		assert!(
+			git(temp.path(), &["for-each-ref", "refs/heads/feature"]).is_empty(),
+			"the branch ref is gone"
+		);
+		let config = fs::read_to_string(temp.path().join(".git/config")).unwrap();
+		assert!(config.contains("[branch \"feature\"]"), "{config}");
+		assert_eq!(fs::read_to_string(&lock).unwrap(), "[other]\n\twriter = busy\n");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn delete_branch_keeps_the_config_files_permissions() {
+		use std::os::unix::fs::PermissionsExt;
+		let (temp, repo) = fixture();
+		git(temp.path(), &["branch", "feature"]);
+		repo.config_set("branch.feature.remote", "origin").unwrap();
+		let config = temp.path().join(".git/config");
+		// A config holding credentials kept private by its owner.
+		fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+
+		assert!(repo.delete_branch("feature", true).unwrap());
+
+		assert!(
+			!fs::read_to_string(&config)
+				.unwrap()
+				.contains("[branch \"feature\"]")
+		);
+		assert_eq!(fs::metadata(&config).unwrap().permissions().mode() & 0o777, 0o600);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn delete_branch_edits_the_target_of_a_symlinked_config() {
+		let (temp, repo) = fixture();
+		let outside = tempfile::tempdir().unwrap();
+		let link = temp.path().join(".git/config");
+		let target = outside.path().join("config");
+		fs::rename(&link, &target).unwrap();
+		std::os::unix::fs::symlink(&target, &link).unwrap();
+		git(temp.path(), &["branch", "feature"]);
+		repo.config_set("branch.feature.remote", "origin").unwrap();
+
+		assert!(repo.delete_branch("feature", true).unwrap());
+
+		assert!(
+			fs::symlink_metadata(&link)
+				.unwrap()
+				.file_type()
+				.is_symlink(),
+			"the link is kept"
+		);
+		let config = fs::read_to_string(&target).unwrap();
+		assert!(!config.contains("[branch \"feature\"]"), "{config}");
+		assert!(
+			!outside.path().join("config.lock").exists()
+				&& !temp.path().join(".git/config.lock").exists()
+		);
 	}
 
 	#[test]

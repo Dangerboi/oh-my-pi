@@ -636,6 +636,57 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(worktreePaths(repo)).toEqual([repo]);
 		});
 
+		it("an abort keeps a renamed branch another process advanced after the worktree was freed", async () => {
+			const renamed = `${branch}-moved`;
+			const signalPipe = path.join(root, "hook-advanced-started");
+			expect(Bun.spawnSync(["mkfifo", signalPipe]).exitCode).toBe(0);
+			await hook(
+				`unset GIT_DIR GIT_WORK_TREE\ngit -C "$PWD" branch -m "${renamed}"\necho started > "${signalPipe}"\nsleep 600`,
+			);
+			const repoProto = Object.getPrototypeOf(vcs.requireGit(repo));
+			const realRemove = repoProto.worktreeRemove;
+			let advanced: string | undefined;
+			const remove = spyOn(repoProto, "worktreeRemove").mockImplementation(async function (
+				this: unknown,
+				removePath: string,
+				force?: boolean,
+			) {
+				const result = await realRemove.call(this, removePath, force);
+				// Another process advances the renamed branch the moment the discard has freed it.
+				const tip = branchSha(repo, renamed)!;
+				advanced = git(
+					repo,
+					"-c",
+					"user.name=t",
+					"-c",
+					"user.email=t@t",
+					"-c",
+					"commit.gpgsign=false",
+					"commit-tree",
+					`${tip}^{tree}`,
+					"-p",
+					tip,
+					"-m",
+					"advanced",
+				);
+				git(repo, "update-ref", `refs/heads/${renamed}`, advanced);
+				return result;
+			});
+			try {
+				const controller = new AbortController();
+				const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+				await Bun.file(signalPipe).text();
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+
+				expect(advanced).toMatch(/^[0-9a-f]{40}$/);
+				expect(branchSha(repo, renamed)).toBe(advanced!);
+			} finally {
+				remove.mockRestore();
+				Bun.spawnSync(["git", "branch", "-D", renamed], { cwd: repo });
+			}
+		});
+
 		it("an abort keeps a branch another process created under the name the hook renamed away", async () => {
 			const renamed = `${branch}-moved`;
 			const signalPipe = path.join(root, "hook-recreated-started");

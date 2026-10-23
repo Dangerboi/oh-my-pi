@@ -9,6 +9,7 @@ import { github } from "../utils/github";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 import {
 	addWorktreeWithHook,
+	linkLeadsTo,
 	resolveWorktreePath,
 	type WorktreeCheckoutHookResult,
 	worktreeHookWarnings,
@@ -496,10 +497,13 @@ export async function checkoutPullRequest(
 						},
 					),
 				);
-				const stale = !checkoutExists || initializing;
+				// A hook may have removed or redirected the checkout's `.git` before its owner died: such a directory is not ours to reuse.
+				const linkOk =
+					checkoutExists && (await linkLeadsTo(existingWorktree.path, existingWorktree.gitDir, signal));
+				const stale = !checkoutExists || initializing || !linkOk;
 				// Another omp process still creating it or running its hook discards it if that fails. Our own mark is an
-				// earlier attempt of this process: recovered only when its checkout is missing or still initializing, else
-				// refused like a live owner's, since its hook never finished.
+				// earlier attempt of this process: recovered only when its checkout is missing, still initializing, or its
+				// `.git` no longer leads to its git dir, else refused like a live owner's, since its hook never finished.
 				if (setupOwner === ownOwner ? !stale : vcs.isWorktreeSetupOwnerAlive(setupOwner)) throw stillSettingUp();
 				// Compare-and-swap against the listing: a process that recovered or recreated it since owns it now.
 				const claimed = await repository.worktreeReplaceSetupOwner(
@@ -512,13 +516,20 @@ export async function checkoutPullRequest(
 				if (stale) {
 					// That omp's add or rollback left a registration without a whole checkout: drop it and create the worktree afresh.
 					// The partial checkout goes first: if its removal throws, the mark and lock stay and a retry still sees it as partial.
-					if (initializing && checkoutExists && !(await repository.worktreeRemove(staleDir, true, signal))) {
-						await untilAborted(signal, () => fs.rm(staleDir, { recursive: true, force: true }));
+					if (checkoutExists && (initializing || !linkOk)) {
+						// A redirected `.git` must never reach native removal: it would delete another worktree's registration.
+						if (!linkOk || !(await repository.worktreeRemove(staleDir, true, signal))) {
+							await untilAborted(signal, () => fs.rm(staleDir, { recursive: true, force: true }));
+						}
 					}
+					// The tail runs without the signal: an abort or error between clearing the mark and removing the lock would
+					// leave an unmarked registration still `initializing` with no checkout, which every later call would reuse and fail on.
+					// The mark therefore stays until the lock is gone, and only then is cleared.
+					if (initializing) await fs.rm(lockPath, { force: true });
 					// Our own mark; false when git's removal already deleted the admin dir with it.
-					await repository.worktreeReplaceSetupOwner(existingWorktree.gitDir, ownOwner, null, signal);
-					if (initializing) await untilAborted(signal, () => fs.rm(lockPath, { force: true }));
-					await repository.worktreePrune(signal);
+					await repository.worktreeReplaceSetupOwner(existingWorktree.gitDir, ownOwner, null);
+					await repository.worktreePrune();
+					signal?.throwIfAborted();
 					existingWorktrees = await repository.worktrees(signal);
 					existingWorktree = await findPrWorktree(existingWorktrees);
 					if (existingWorktree) {

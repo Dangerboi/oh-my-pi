@@ -17,7 +17,8 @@
 
 - `vcs.runPostCheckoutHook` takes `{ signal, env, detached, inheritOutput }`, reports a hook that exists but didn't run as `skipped`, keeps the hook's output in the worktree's git directory when TMPDIR has no room for it, returns once `git hook run` exits even if the hook left a background process running, and returns at most the last 64 KiB of each output stream, whose capture files stay bounded while the hook, or a background process it left running, writes to them (on Windows, where that volume has no sparse files, the output is read through pipes instead, nothing on disk); `inheritOutput` gives the hook this process's stdout and stderr instead ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - `worktreeAdd` locks a new worktree as `initializing` while creating it and removes a half-written registration on failure, as git does, and serializes adds into one repository across processes (waiting up to 10 s for another), so two adding the same path can't share one checkout ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
-- `deleteBranch` also removes the deleted branch's `branch.<name>` config section, as `git branch -D` does ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- `deleteBranch` also removes the deleted branch's `branch.<name>` config section, as `git branch -D` does, under git's `config.lock` ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- `configSet` writes under git's `config.lock` like `git config` (failing while another writer holds it instead of overwriting its change), keeps the config file's permissions, and edits a symlinked config at its target ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ### Fixed
 

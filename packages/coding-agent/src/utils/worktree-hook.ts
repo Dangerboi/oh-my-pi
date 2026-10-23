@@ -220,9 +220,22 @@ export async function addWorktreeWithHook(
 				branch,
 			});
 		} else {
+			// Read while our worktree still has the renamed branch checked out: nobody else can move it
+			// through a checkout, so this is the tip the hook left and the only one safe to delete.
+			let renamedTip: string | undefined;
+			if (gitDir !== undefined && branchesBefore && hookBranch !== undefined && hookBranch !== branch) {
+				try {
+					renamedTip = (await repository.resolveRef(`refs/heads/${hookBranch}`)) ?? undefined;
+				} catch (tipError) {
+					logger.warn("could not read the tip of a branch a cut-short post-checkout hook renamed", {
+						branch: hookBranch,
+						error: String(tipError),
+					});
+				}
+			}
 			await discardNewWorktree(repository, current, gitDir, setupOwner);
 			if (gitDir !== undefined && branchesBefore && hookBranch !== undefined) {
-				await deleteRenamedBranch(repository, branch, hookBranch, branchesBefore);
+				await deleteRenamedBranch(repository, branch, hookBranch, branchesBefore, renamedTip);
 			}
 			if (head) await restoreBranch(repository, branch, head, hookBranch === branch);
 		}
@@ -251,9 +264,9 @@ async function currentWorktreeEntry(
  * repository discovered at the path has `gitDir` as its git directory and the path as its root
  * (symlinks resolved). Any failure (no repository, an unresolvable path) means it does not. The
  * native worktree removal deletes the registration a `.git` points to, so only a link that passes
- * may reach it.
+ * may reach it. Also used by `pr_checkout`'s stale-worktree recovery.
  */
-async function linkLeadsTo(worktreePath: string, gitDir: string, signal?: AbortSignal): Promise<boolean> {
+export async function linkLeadsTo(worktreePath: string, gitDir: string, signal?: AbortSignal): Promise<boolean> {
 	try {
 		const found = await untilAborted(signal, () => vcs.discoverGit(worktreePath, signal));
 		if (!found) return false;
@@ -393,13 +406,16 @@ async function restoreBranch(
  * Delete `renamed`, the branch a cut-short hook renamed `branch` to, once its worktree is gone. Only
  * when `branch` no longer exists, `renamed` is not in `before` (the hook created it), and the reflog
  * of `renamed` shows the hook renamed `branch` to it, so a branch that existed earlier or that
- * another process created is never deleted. Failures are logged.
+ * another process created is never deleted. The deletion is a compare-and-swap against `tip`, the
+ * tip read while the worktree still had `renamed` checked out, so a commit another process added
+ * after the discard freed the branch keeps it. Failures are logged.
  */
 async function deleteRenamedBranch(
 	repository: VcsGitRepo,
 	branch: string,
 	renamed: string,
 	before: ReadonlySet<string>,
+	tip: string | undefined,
 ): Promise<void> {
 	if (renamed === branch || before.has(renamed)) return;
 	try {
@@ -411,8 +427,16 @@ async function deleteRenamedBranch(
 			);
 			return;
 		}
-		if (!(await repository.deleteBranch(renamed, true))) {
-			logger.warn("could not delete a branch a cut-short post-checkout hook renamed", { branch: renamed });
+		if (tip === undefined) {
+			logger.warn("a branch a cut-short post-checkout hook renamed is kept: its tip could not be read", {
+				branch: renamed,
+			});
+			return;
+		}
+		if (!(await repository.swapBranch(renamed, tip, null))) {
+			logger.warn("a branch a cut-short post-checkout hook renamed changed since the rollback began; keeping it", {
+				branch: renamed,
+			});
 		}
 	} catch (error) {
 		logger.warn("could not delete a branch a cut-short post-checkout hook renamed", {
