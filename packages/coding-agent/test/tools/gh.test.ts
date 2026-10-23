@@ -1535,6 +1535,39 @@ describe("github tool", () => {
 					if (first) runGit(fixture.repoRoot, ["worktree", "remove", "--force", "--force", first.worktreePath]);
 				}
 			});
+			it("refuses a PR worktree whose hook switched it to another branch, leaving the PR branch at its head", async () => {
+				const hooks = path.join(fixture.baseDir, "hooks-switch-141");
+				await Bun.write(
+					path.join(hooks, "post-checkout"),
+					"#!/bin/sh\ngit -c core.hooksPath=/dev/null switch other-141\n",
+				);
+				await fs.chmod(path.join(hooks, "post-checkout"), 0o755);
+				const previous = Bun.spawnSync(["git", "config", "--get", "core.hooksPath"], { cwd: fixture.repoRoot })
+					.stdout.toString()
+					.trim();
+				runGit(fixture.repoRoot, ["branch", "other-141"]);
+				runGit(fixture.repoRoot, ["config", "core.hooksPath", hooks]);
+				try {
+					mockPrView(141);
+					await expect(checkout(141, new AbortController().signal)).rejects.toThrow(
+						/switched the new worktree at .* from pr-141 to other-141/,
+					);
+
+					const listed = runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"]);
+					expect(listed).not.toContain("branch refs/heads/pr-141");
+					expect(listed).not.toContain("branch refs/heads/other-141");
+					expect(runGit(fixture.repoRoot, ["rev-parse", "refs/heads/pr-141"])).toBe(fixture.headRefOid);
+					expect(
+						Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", "refs/heads/other-141"], {
+							cwd: fixture.repoRoot,
+						}).exitCode,
+					).toBe(0);
+				} finally {
+					if (previous) runGit(fixture.repoRoot, ["config", "core.hooksPath", previous]);
+					else runGit(fixture.repoRoot, ["config", "--unset", "core.hooksPath"]);
+					Bun.spawnSync(["git", "branch", "-D", "other-141"], { cwd: fixture.repoRoot });
+				}
+			});
 			it.skipIf(!/^[^-]+-\d+-\d+$/.test(vcs.worktreeSetupOwner()))(
 				"counts an owner whose pid now belongs to a process that started at another time as gone",
 				() => {

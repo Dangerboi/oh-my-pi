@@ -657,6 +657,84 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			}
 		});
 
+		it("a hook that deletes the new worktree's .git fails /wt and removes the worktree", async () => {
+			const origin = path.join(root, "hook-origin-nogit");
+			await hook(`echo "$PWD" > "${origin}"\nrm -f .git`);
+			await expect(create()).rejects.toThrow(/no longer leads to the worktree's git directory/);
+
+			expect(worktreePaths(repo)).toEqual([repo]);
+			expect(await exists((await Bun.file(origin).text()).trim())).toBe(false);
+			expect(branchSha(repo, branch)).toBeNull();
+		});
+
+		it("a hook that points the new .git at another worktree fails /wt and leaves that worktree alone", async () => {
+			const victim = path.join(root, "victim-worktree");
+			git(repo, "-c", "core.hooksPath=/dev/null", "worktree", "add", "-b", `${branch}-victim`, victim);
+			try {
+				const victimGitDir = git(victim, "rev-parse", "--absolute-git-dir").trim();
+				await hook(`unset GIT_DIR GIT_WORK_TREE\necho "gitdir: ${victimGitDir}" > .git`);
+				await expect(create()).rejects.toThrow(/no longer leads to the worktree's git directory/);
+
+				const listed = await Promise.all(worktreePaths(repo).map(p => fs.realpath(p)));
+				expect(listed).toContain(await fs.realpath(victim));
+				expect(await exists(victim)).toBe(true);
+				expect(await exists(victimGitDir)).toBe(true);
+				expect(branchSha(repo, branch)).toBeNull();
+			} finally {
+				Bun.spawnSync(["git", "worktree", "remove", "--force", victim], { cwd: repo });
+				Bun.spawnSync(["git", "worktree", "prune"], { cwd: repo });
+				Bun.spawnSync(["git", "branch", "-D", `${branch}-victim`], { cwd: repo });
+			}
+		});
+
+		it("a hook that switches the new worktree to another existing branch fails /wt", async () => {
+			const existing = `${branch}-existing`;
+			git(repo, "branch", existing);
+			const existingSha = branchSha(repo, existing);
+			try {
+				await hook(`unset GIT_DIR GIT_WORK_TREE\ngit -c core.hooksPath=/dev/null switch "${existing}"`);
+				await expect(create()).rejects.toThrow(/switched the new worktree at .* from .* to /);
+
+				expect(branchSha(repo, existing)).toBe(existingSha);
+				expect(worktreePaths(repo)).toEqual([repo]);
+				expect(branchSha(repo, branch)).toBeNull();
+			} finally {
+				Bun.spawnSync(["git", "branch", "-D", existing], { cwd: repo });
+			}
+		});
+
+		it("a hook that detaches HEAD in the new worktree fails /wt", async () => {
+			await hook("unset GIT_DIR GIT_WORK_TREE\ngit -c core.hooksPath=/dev/null checkout --detach");
+			await expect(create()).rejects.toThrow(/detached HEAD in the new worktree/);
+
+			expect(worktreePaths(repo)).toEqual([repo]);
+			expect(branchSha(repo, branch)).toBeNull();
+		});
+
+		it("a hook that detaches HEAD and then fails keeps the worktree with its warning, as any failed hook", async () => {
+			await hook("unset GIT_DIR GIT_WORK_TREE\ngit -c core.hooksPath=/dev/null checkout --detach\nexit 17");
+			const wt = await create();
+
+			expect(wt.hook?.error).toMatch(/exited with 17/);
+			expect(wt.branch).toBe(branch);
+			expect(worktreePaths(repo)).toContain(wt.path);
+			expect(branchSha(repo, branch)).not.toBeNull();
+		});
+
+		it("a hook that deletes the branch and switches to one it created is refused, not adopted as a rename", async () => {
+			const made = `${branch}-made`;
+			try {
+				await hook(
+					`unset GIT_DIR GIT_WORK_TREE\ngit -c core.hooksPath=/dev/null switch -c "${made}" && git branch -D "${branch}"`,
+				);
+				await expect(create()).rejects.toThrow(/switched the new worktree/);
+
+				expect(worktreePaths(repo)).toEqual([repo]);
+			} finally {
+				Bun.spawnSync(["git", "branch", "-D", made], { cwd: repo });
+			}
+		});
+
 		it("keeps the setup mark on a cut-short worktree that could not be removed, so other processes refuse it", async () => {
 			const repoProto = Object.getPrototypeOf(vcs.requireGit(repo));
 			const remove = spyOn(repoProto, "worktreeRemove").mockRejectedValue(new Error("busy"));

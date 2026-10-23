@@ -111,7 +111,12 @@ export class WorktreeRemovedByHookError extends Error {
  * before the setup mark is removed, the worktree is discarded and `branch` put back where the
  * checkout left it, so a retry starts over instead of reusing a half-set-up checkout or finding
  * the branch diverged. A branch the hook renamed the new branch to is deleted and the original
- * put back, but only when its reflog shows that rename and it did not exist before the hook. The discard itself takes no signal and runs to completion. A failed
+ * put back, but only when its reflog shows that rename and it did not exist before the hook. After
+ * a successful hook (and only then: a hook that failed keeps its worktree, with a warning, whatever
+ * state it left) the worktree is still refused (and discarded likewise) when its `.git` no longer
+ * leads to its git directory, when HEAD is detached, or when it is on another branch than `branch`
+ * (a proven rename is kept: the returned branch is its new name). All of these are checked before
+ * the setup mark is cleared. The discard itself takes no signal and runs to completion. A failed
  * `worktreeAdd` discards nothing: another process may own the path by then. If the hook removed
  * the worktree, the call fails with {@link WorktreeRemovedByHookError} and touches neither the path
  * nor the branch, which another process may have taken since.
@@ -150,8 +155,18 @@ export async function addWorktreeWithHook(
 			gone = true;
 			throw new WorktreeRemovedByHookError(worktreePath);
 		}
+		// Ownership first: a replacement at our git dir is another process's, so its state is no hook outcome of ours.
+		if (located !== null && located.setupOwner !== setupOwner) {
+			gone = true;
+			throw new WorktreeRemovedByHookError(worktreePath);
+		}
 		current = located?.path ?? current;
-		const setUpBranch = located ? await adoptedBranch(repository, branch, located, signal) : branch;
+		// A hook that failed keeps its worktree with a warning, whatever state it left behind, so only a
+		// successful hook is held to the link and branch checks.
+		const setUpBranch =
+			located && gitDir !== undefined && hook.error === undefined
+				? await checkedBranch(repository, branch, gitDir, located, branchesBefore, signal)
+				: branch;
 		// The abort may also have landed as the hook finished: either way, or with a stalled `worktree.base`,
 		// the caller must not move into the worktree, so it is discarded below.
 		const resolved = await resolveWorktreePath(current, signal);
@@ -227,24 +242,73 @@ async function currentWorktreeEntry(
 }
 
 /**
- * The branch a set-up worktree is on: `branch`, unless a hook renamed it (`refs/heads/<branch>` is
- * gone and the worktree is on another branch), in which case the new short name.
+ * Whether the `.git` of the directory `worktreePath` leads back to the registration `gitDir`: a
+ * repository discovered at the path has `gitDir` as its git directory and the path as its root
+ * (symlinks resolved). Any failure (no repository, an unresolvable path) means it does not. The
+ * native worktree removal deletes the registration a `.git` points to, so only a link that passes
+ * may reach it.
  */
-async function adoptedBranch(
+async function linkLeadsTo(worktreePath: string, gitDir: string, signal?: AbortSignal): Promise<boolean> {
+	try {
+		const found = await untilAborted(signal, () => vcs.discoverGit(worktreePath, signal));
+		if (!found) return false;
+		const info = found.info();
+		const [foundGitDir, expectedGitDir, foundRoot, expectedRoot] = await untilAborted(signal, () =>
+			Promise.all([
+				fs.realpath(info.gitDir),
+				fs.realpath(gitDir),
+				fs.realpath(info.repoRoot),
+				fs.realpath(worktreePath),
+			]),
+		);
+		return foundGitDir === expectedGitDir && foundRoot === expectedRoot;
+	} catch (error) {
+		signal?.throwIfAborted();
+		logger.debug("a new worktree's .git could not be followed", { path: worktreePath, error: String(error) });
+		return false;
+	}
+}
+
+/**
+ * Refuse a worktree a successful hook left unusable, and name the branch it is on. Throws when its
+ * `.git` no longer leads to `gitDir`, when HEAD is detached, or when it is on a branch other than
+ * `branch` without proof of a rename. A rename is adopted (its new short name returned) only when
+ * the new name is not in `before`, `refs/heads/<branch>` is gone, and the reflog of the new name
+ * shows the rename from `branch`: the same proof the rollback needs to delete it.
+ */
+async function checkedBranch(
 	repository: VcsGitRepo,
 	branch: string,
+	gitDir: string,
 	entry: VcsWorktreeEntry,
+	before: ReadonlySet<string>,
 	signal?: AbortSignal,
 ): Promise<string> {
+	if (!(await linkLeadsTo(entry.path, gitDir, signal))) {
+		throw new Error(
+			`The post-checkout hook broke the new worktree at ${entry.path}: its .git no longer leads to the worktree's git directory`,
+		);
+	}
 	const prefix = "refs/heads/";
-	if (entry.detached || !entry.branch?.startsWith(prefix) || entry.branch === `${prefix}${branch}`) return branch;
-	if (await repository.refExists(`${prefix}${branch}`, signal)) return branch;
-	return entry.branch.slice(prefix.length);
+	if (entry.detached || !entry.branch?.startsWith(prefix)) {
+		throw new Error(`The post-checkout hook detached HEAD in the new worktree at ${entry.path}`);
+	}
+	const other = entry.branch.slice(prefix.length);
+	if (other === branch) return branch;
+	const renamed =
+		!before.has(other) &&
+		!(await repository.refExists(`${prefix}${branch}`, signal)) &&
+		(await repository.branchRenamedFrom(other, branch, signal));
+	if (!renamed) {
+		throw new Error(`The post-checkout hook switched the new worktree at ${entry.path} from ${branch} to ${other}`);
+	}
+	return other;
 }
 
 /**
  * Remove a worktree this attempt's own `worktreeAdd` created, or, when it is no longer
- * discoverable (its `.git` file is gone), delete its directory. A native removal deletes the
+ * discoverable (its `.git` file is gone) or its `.git` no longer leads to `gitDir` (the native
+ * removal would delete whichever registration the link names), delete its directory. A native removal deletes the
  * registration with its setup mark; after the directory fallback the mark is cleared by
  * compare-and-swap on `gitDir` and `owner`, never by path, which another process may have reused
  * by then. If it could not be removed, it keeps the mark: it stays owned by this live process, so
@@ -264,7 +328,8 @@ async function discardNewWorktree(
 		});
 	let removed: boolean;
 	try {
-		removed = await repository.worktreeRemove(worktreePath, true);
+		const nativeSafe = gitDir === undefined || (await linkLeadsTo(worktreePath, gitDir));
+		removed = nativeSafe && (await repository.worktreeRemove(worktreePath, true));
 		if (!removed) await fs.rm(worktreePath, { recursive: true, force: true });
 	} catch (error) {
 		warn(error);
