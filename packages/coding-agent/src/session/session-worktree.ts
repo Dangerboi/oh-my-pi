@@ -20,6 +20,7 @@ import { resolveAvailableWorktreePath } from "../tools/gh-pr-checkout";
 import {
 	addWorktreeWithHook,
 	type WorktreeCheckoutHookResult,
+	WorktreeRemovedByHookError,
 	type WorktreeSetup,
 	worktreeHookWarnings,
 } from "../utils/worktree-hook";
@@ -193,6 +194,11 @@ export async function createSessionWorktree(
 			options.signal,
 		);
 	} catch (error) {
+		if (error instanceof WorktreeRemovedByHookError) {
+			// The hook freed the path and branch, so another process may own them now; deleting would take its branch.
+			logger.warn("the post-checkout hook removed a /wt worktree; leaving its branch alone", { branch });
+			throw error;
+		}
 		// Created just above (it did not exist), so it is this attempt's to delete when setup fails.
 		await repository.deleteBranch(branch, true).catch(deleteError => {
 			logger.warn("could not delete the branch of a /wt worktree whose setup was cut short", {
@@ -204,7 +210,7 @@ export async function createSessionWorktree(
 	}
 	return {
 		path: setUp.path,
-		branch,
+		branch: setUp.branch,
 		clonedWith: setUp.added.clonedWith ?? undefined,
 		cloneError: setUp.added.cloneError ?? undefined,
 		hook: setUp.hook,

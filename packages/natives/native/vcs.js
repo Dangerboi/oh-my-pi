@@ -354,8 +354,9 @@ function readCapture(file, maxBytes, { fromEnd = false, signal } = {}) {
 
 /**
  * Run `git <args>` with output to the files `stdout`/`stderr` (paths, or "ignore") and resolve with
- * its exit code. `readStdout(stream, exited)` instead pipes stdout to it and is awaited alongside
- * the exit. Aborting `signal` kills its process tree, descendants that left its process group
+ * its exit code. `readStdout(stream, exited)` / `readStderr(stream, exited)` instead pipe that stream to
+ * the function, awaited alongside the exit; they may return before EOF, closing the stream.
+ * Aborting `signal` kills its process tree, descendants that left its process group
  * included (see the shortcut below), and rejects with the reason. Throws `ENOENT` when no git is on
  * `env`'s PATH. `detached` runs it in its own session even without a signal (POSIX), away from the
  * caller's terminal. `stdout`/`stderr` may also be "inherit". `retain` (`{ handles: Map, pgid, start }`) keeps our handles to the files open past a
@@ -364,7 +365,7 @@ function readCapture(file, maxBytes, { fromEnd = false, signal } = {}) {
  */
 async function runGitToFiles(
 	args,
-	{ cwd, env, stdout = "ignore", stderr = "ignore", signal, detached = false, append = false, readStdout, retain },
+	{ cwd, env, stdout = "ignore", stderr = "ignore", signal, detached = false, append = false, readStdout, readStderr, retain },
 ) {
 	const posix = process.platform !== "win32";
 	const handles = [];
@@ -379,7 +380,7 @@ async function runGitToFiles(
 	};
 	try {
 		const out = readStdout ? "pipe" : await sink(stdout);
-		const err = await sink(stderr);
+		const err = readStderr ? "pipe" : await sink(stderr);
 		// No await between this check and the abort listener below, so no abort can be missed.
 		signal?.throwIfAborted();
 		const ownGroup = posix && (detached || signal !== undefined);
@@ -424,7 +425,8 @@ async function runGitToFiles(
 		let exitCode;
 		try {
 			const reading = readStdout?.(child.stdout, child.exited);
-			[exitCode] = await Promise.all([child.exited, reading]);
+			const readingErr = readStderr?.(child.stderr, child.exited);
+			[exitCode] = await Promise.all([child.exited, reading, readingErr]);
 		} finally {
 			signal?.removeEventListener("abort", onAbort);
 		}
@@ -445,12 +447,12 @@ const GIT_CANNOT_START = new Set(["ENOENT", "ENOEXEC", "EACCES"]);
 
 /** Bytes read from a probe's output: enough for a version line or a path, bounded for noisy wrappers. */
 const PROBE_OUTPUT_BYTES = 4096;
-/** How long a probe keeps reading after git exited without having ended a line. */
-const PROBE_EXIT_GRACE_MS = 100;
+/** How long a pipe is still read after git exited: output git wrote just before exiting, not a writer it left behind. */
+const EXIT_GRACE_MS = 100;
 
 /**
  * Read up to {@link PROBE_OUTPUT_BYTES} of `stream`, stopping at EOF, the cap, git's exit with a
- * finished line read, or {@link PROBE_EXIT_GRACE_MS} after its exit. Then the read end is closed,
+ * finished line read, or {@link EXIT_GRACE_MS} after its exit. Then the read end is closed,
  * so a lingering writer gets EPIPE instead of holding the probe up or growing a file.
  */
 async function readProbeOutput(stream, exited) {
@@ -463,7 +465,7 @@ async function readProbeOutput(stream, exited) {
 		() => "exit",
 		() => "exit",
 	);
-	const grace = wake.then(() => Bun.sleep(PROBE_EXIT_GRACE_MS)).then(() => "grace");
+	const grace = wake.then(() => Bun.sleep(EXIT_GRACE_MS)).then(() => "grace");
 	const readNext = () => {
 		const read = reader.read();
 		read.catch(() => {});
@@ -680,6 +682,60 @@ async function makeCaptureDir(prefix, signal) {
 }
 
 /**
+ * Whether the volume of the capture file `file` supports sparse files (Windows), so the head of a
+ * growing capture can be dropped. Creates `file` empty and tries to mark it sparse; any failure but
+ * an abort counts as unsupported.
+ */
+async function captureVolumeIsSparse(file, signal) {
+	try {
+		await untilAborted(fs.promises.writeFile(file, ""), signal);
+		return (await untilAborted(api().vcsDropCaptureHead(file, HOOK_OUTPUT_TAIL_BYTES, signal), signal)) === true;
+	} catch (error) {
+		if (signal?.aborted) throw error;
+		return false;
+	}
+}
+
+/**
+ * Read `stream`, keeping only its last {@link HOOK_OUTPUT_TAIL_BYTES} in memory. Resolves with that
+ * tail at EOF or {@link EXIT_GRACE_MS} after `exited`, whichever is first, then closes the read end,
+ * as the git probes do: a background process the hook left keeps the pipe open, and a pending read
+ * would keep this process alive until it ends. That process gets a broken pipe at its next write.
+ */
+async function readPipeTail(stream, exited) {
+	const reader = stream.getReader();
+	let chunks = [];
+	let kept = 0;
+	let collecting = true;
+	const pump = (async () => {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) return;
+			if (!collecting) continue;
+			chunks.push(value);
+			kept += value.length;
+			// Drop from the front while the rest still covers the tail.
+			while (chunks.length > 1 && kept - chunks[0].length >= HOOK_OUTPUT_TAIL_BYTES) kept -= chunks.shift().length;
+		}
+	})().catch(() => {});
+	const grace = exited.then(
+		() => Bun.sleep(EXIT_GRACE_MS),
+		() => Bun.sleep(EXIT_GRACE_MS),
+	);
+	await Promise.race([pump, grace]);
+	collecting = false;
+	void reader.cancel().catch(() => {});
+	const joined = new Uint8Array(kept);
+	let at = 0;
+	for (const chunk of chunks) {
+		joined.set(chunk, at);
+		at += chunk.length;
+	}
+	chunks = [];
+	return joined.subarray(Math.max(0, joined.length - HOOK_OUTPUT_TAIL_BYTES));
+}
+
+/**
  * Run Git's checkout hook in a newly created linked worktree, using the same
  * null old HEAD and branch-switch flag as `git worktree add`. Git locates the
  * hook; without a usable git the in-process lookup does, so no git binary is
@@ -688,7 +744,9 @@ async function makeCaptureDir(prefix, signal) {
  * stream; `skipped` says why an existing hook did not run. Aborting
  * `options.signal` kills the hook's process tree and rejects with the reason, also while a
  * lookup, a file check or a read is stalled (starting git still happens on this thread). The output
- * goes to files under TMPDIR, or, when none can be created there, under the worktree's git directory.
+ * goes to files under TMPDIR, or, when none can be created there, under the worktree's git directory;
+ * on Windows, where that volume has no sparse files, it goes through pipes kept to their tail in memory
+ * and nothing is written to disk.
  * With `options.inheritOutput` the hook writes to this process's stdout/stderr instead, nothing is
  * captured and the result's `stdout`/`stderr` are empty.
  */
@@ -700,6 +758,7 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 	// Awaited, raced against the abort: a stalled TMPDIR holds the run up until then, as `mkdtemp` would.
 	await untilAborted(sweepStaleHookCaptures(), signal);
 	// Files, not pipes: a background process git or the hook starts inherits them, and pipes would stay open until it exits.
+	// The exception is a Windows volume without sparse files (see below), where the output is read from pipes.
 	let dir;
 	// Inherited output is captured nowhere, so there is no directory.
 	if (!inheritOutput) {
@@ -771,6 +830,29 @@ export async function runPostCheckoutHook(worktreeRoot, head, options = {}) {
 				detached,
 			});
 			return { ...notRun, exitCode };
+		}
+		// Windows: a volume without sparse files cannot shed a capture's head, so a chatty hook would grow it without bound.
+		// Its output goes through pipes kept to their tail in memory instead, with nothing on disk.
+		if (!posix && !(await captureVolumeIsSparse(path.join(dir, "stdout"), signal))) {
+			await untilAborted(removeCapture(dir), signal);
+			dir = undefined;
+			let stdout = new Uint8Array();
+			let stderr = new Uint8Array();
+			// shortcut: the pipes close once git exited, so a writer the hook left running gets a broken pipe at its next
+			// write, where a file would outlive it; reading on would keep this process alive until the writer ends.
+			const exitCode = await runGitToFiles(["hook", "run", "--ignore-missing", "post-checkout", "--", "0".repeat(head.length), head, "1"], {
+				cwd: worktreeRoot,
+				env,
+				signal,
+				detached,
+				readStdout: async (stream, exited) => {
+					stdout = await readPipeTail(stream, exited);
+				},
+				readStderr: async (stream, exited) => {
+					stderr = await readPipeTail(stream, exited);
+				},
+			});
+			return { exitCode, stdout, stderr };
 		}
 		const outPath = path.join(dir, "stdout");
 		const errPath = path.join(dir, "stderr");

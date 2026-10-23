@@ -4,7 +4,7 @@
  * and discarding a new worktree whose setup was cut short.
  */
 import * as fs from "node:fs/promises";
-import type { VcsGitRepo, VcsWorktreeAddOptions, VcsWorktreeAddResult } from "@oh-my-pi/pi-natives";
+import type { VcsGitRepo, VcsWorktreeAddOptions, VcsWorktreeAddResult, VcsWorktreeEntry } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { filterChildShellEnvAsync, logger, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import { sanitizeDisplayWarning, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -78,6 +78,11 @@ export interface WorktreeSetup {
 	/** `worktreePath` with symlinks resolved. */
 	path: string;
 	hook: WorktreeCheckoutHookResult;
+	/**
+	 * Short name (no `refs/heads/`) of the branch the worktree is on once set up: the requested
+	 * `branch`, or the one a hook renamed it to with `git branch -m`.
+	 */
+	branch: string;
 }
 
 /**
@@ -89,6 +94,14 @@ export function resolveWorktreePath(worktreePath: string, signal?: AbortSignal):
 	return untilAborted(signal, () => fs.realpath(worktreePath));
 }
 
+/** The post-checkout hook removed the new worktree; its path and branch may be another process's by now. */
+export class WorktreeRemovedByHookError extends Error {
+	constructor(worktreePath: string) {
+		super(`The post-checkout hook removed the new worktree at ${worktreePath}; it was not set up`);
+		this.name = "WorktreeRemovedByHookError";
+	}
+}
+
 /**
  * Add a linked worktree of `branch` at the unused `worktreePath` (the hook may move it; the
  * returned path is where it ended up), then run its `post-checkout`
@@ -98,7 +111,9 @@ export function resolveWorktreePath(worktreePath: string, signal?: AbortSignal):
  * before the setup mark is removed, the worktree is discarded and `branch` put back where the
  * checkout left it, so a retry starts over instead of reusing a half-set-up checkout or finding
  * the branch diverged. The discard itself takes no signal and runs to completion. A failed
- * `worktreeAdd` discards nothing: another process may own the path by then.
+ * `worktreeAdd` discards nothing: another process may own the path by then. If the hook removed
+ * the worktree, the call fails with {@link WorktreeRemovedByHookError} and touches neither the path
+ * nor the branch, which another process may have taken since.
  */
 export async function addWorktreeWithHook(
 	repository: VcsGitRepo,
@@ -116,6 +131,8 @@ export async function addWorktreeWithHook(
 	// A hook may move its worktree, as under `git worktree add`; everything after it uses the current path.
 	let current = worktreePath;
 	let gitDir: string | undefined;
+	// Set once the hook is known to have removed the worktree: its path and branch may be another process's by now.
+	let gone = false;
 	try {
 		// The branch is still the checked-out one here; the hook may rename it or move the worktree, not the git dir.
 		const listed = await untilAborted(signal, () => repository.worktrees());
@@ -124,46 +141,92 @@ export async function addWorktreeWithHook(
 		head = await repository.resolveRef(`refs/heads/${branch}`, signal);
 		const hook = head ? await runWorktreeCheckoutHook(worktreePath, head, signal) : {};
 		// Raced like the path lookup below, so an abort rejects with its reason.
-		current = await currentWorktreePath(repository, gitDir, current, signal);
+		const located = await currentWorktreeEntry(repository, gitDir, signal);
+		if (located === undefined) {
+			gone = true;
+			throw new WorktreeRemovedByHookError(worktreePath);
+		}
+		current = located?.path ?? current;
+		const setUpBranch = located ? await adoptedBranch(repository, branch, located, signal) : branch;
 		// The abort may also have landed as the hook finished: either way, or with a stalled `worktree.base`,
 		// the caller must not move into the worktree, so it is discarded below.
 		const resolved = await resolveWorktreePath(current, signal);
 		// The commit point: with the mark gone another omp process may reuse the worktree, so an abort from
 		// here on is too late to discard it, as one just after the return would be.
-		await repository.worktreeEndSetup(current).catch(error => {
-			// Set up all the same; other omp processes only wait for it until this one exits.
-			logger.warn("could not mark a new worktree as set up", { path: current, error: String(error) });
-		});
-		return { added, path: resolved, hook };
-	} catch (error) {
-		// The hook may have moved the worktree before it was cut short; discard where it is now.
-		try {
-			current = await currentWorktreePath(repository, gitDir, current);
-		} catch (lookupError) {
-			logger.warn("could not locate a new worktree its hook may have moved", {
-				path: current,
-				error: String(lookupError),
+		if (gitDir === undefined) {
+			await repository.worktreeEndSetup(current).catch(error => {
+				// Set up all the same; other omp processes only wait for it until this one exits.
+				logger.warn("could not mark a new worktree as set up", { path: current, error: String(error) });
 			});
+		} else {
+			// By saved identity, never by path: a replacement at this path carries another process's mark.
+			const cleared = await repository.worktreeReplaceSetupOwner(gitDir, setupOwner, null).catch(error => {
+				logger.warn("could not mark a new worktree as set up", { path: current, error: String(error) });
+				return true;
+			});
+			if (!cleared) {
+				gone = true;
+				throw new WorktreeRemovedByHookError(worktreePath);
+			}
 		}
-		await discardNewWorktree(repository, current, gitDir, setupOwner);
-		if (head) await restoreBranch(repository, branch, head);
+		return { added, path: resolved, hook, branch: setUpBranch };
+	} catch (error) {
+		if (!gone) {
+			// The hook may have moved the worktree before it was cut short; discard where it is now.
+			try {
+				const located = await currentWorktreeEntry(repository, gitDir);
+				if (located === undefined) gone = true;
+				else current = located?.path ?? current;
+			} catch (lookupError) {
+				logger.warn("could not locate a new worktree its hook may have moved", {
+					path: current,
+					error: String(lookupError),
+				});
+			}
+		}
+		if (gone) {
+			logger.warn("a new worktree was removed by its post-checkout hook; leaving its path and branch alone", {
+				path: worktreePath,
+				branch,
+			});
+		} else {
+			await discardNewWorktree(repository, current, gitDir, setupOwner);
+			if (head) await restoreBranch(repository, branch, head);
+		}
 		throw error;
 	}
 }
 
 /**
- * Where the registration `gitDir` is now, or `fallback` when it is undefined or listed nowhere (the
- * hook deleted the worktree). The git directory survives `git worktree move` and a branch rename.
+ * The listing entry of the registration `gitDir`, or `null` when `gitDir` is undefined (nothing to
+ * look up). When `gitDir` is listed nowhere the worktree is gone (the hook deleted it) and the
+ * result is `undefined`: its path may by now belong to another process. The git directory survives
+ * `git worktree move` and a branch rename.
  */
-async function currentWorktreePath(
+async function currentWorktreeEntry(
 	repository: VcsGitRepo,
 	gitDir: string | undefined,
-	fallback: string,
+	signal?: AbortSignal,
+): Promise<VcsWorktreeEntry | null | undefined> {
+	if (gitDir === undefined) return null;
+	const listed = await untilAborted(signal, () => repository.worktrees());
+	return listed.find(entry => entry.gitDir === gitDir);
+}
+
+/**
+ * The branch a set-up worktree is on: `branch`, unless a hook renamed it (`refs/heads/<branch>` is
+ * gone and the worktree is on another branch), in which case the new short name.
+ */
+async function adoptedBranch(
+	repository: VcsGitRepo,
+	branch: string,
+	entry: VcsWorktreeEntry,
 	signal?: AbortSignal,
 ): Promise<string> {
-	if (gitDir === undefined) return fallback;
-	const listed = await untilAborted(signal, () => repository.worktrees());
-	return listed.find(entry => entry.gitDir === gitDir)?.path ?? fallback;
+	const prefix = "refs/heads/";
+	if (entry.detached || !entry.branch?.startsWith(prefix) || entry.branch === `${prefix}${branch}`) return branch;
+	if (await repository.refExists(`${prefix}${branch}`, signal)) return branch;
+	return entry.branch.slice(prefix.length);
 }
 
 /**

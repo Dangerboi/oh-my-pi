@@ -15,7 +15,11 @@ import {
 	resolveDefaultRepoMemoized,
 } from "@oh-my-pi/pi-coding-agent/tools/gh";
 import { parseIssueUrl, parsePullRequestUrl } from "@oh-my-pi/pi-coding-agent/tools/gh-common";
-import { checkoutPullRequest, sanitizeRemoteName } from "@oh-my-pi/pi-coding-agent/tools/gh-pr-checkout";
+import {
+	checkoutPullRequest,
+	type PrCheckoutOutcome,
+	sanitizeRemoteName,
+} from "@oh-my-pi/pi-coding-agent/tools/gh-pr-checkout";
 import { github } from "@oh-my-pi/pi-coding-agent/utils/github";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { withRepoLock } from "@oh-my-pi/pi-coding-agent/utils/repo-lock";
@@ -1499,6 +1503,36 @@ describe("github tool", () => {
 					expect(await setupOwnerOf(fixture.repoRoot, branch)).toBe(vcs.worktreeSetupOwner());
 				} finally {
 					runGit(fixture.repoRoot, ["worktree", "remove", "--force", "--force", dir]);
+				}
+			});
+			it("reuses the worktree of a PR whose hook renamed the local branch instead of adding a second one", async () => {
+				const hooks = path.join(fixture.baseDir, "hooks-rename-139");
+				await Bun.write(path.join(hooks, "post-checkout"), "#!/bin/sh\ngit branch -m pr-139 renamed-139\n");
+				await fs.chmod(path.join(hooks, "post-checkout"), 0o755);
+				const previous = Bun.spawnSync(["git", "config", "--get", "core.hooksPath"], { cwd: fixture.repoRoot })
+					.stdout.toString()
+					.trim();
+				runGit(fixture.repoRoot, ["config", "core.hooksPath", hooks]);
+				let first: PrCheckoutOutcome | undefined;
+				try {
+					mockPrView(139);
+					first = await checkout(139, new AbortController().signal);
+					vi.spyOn(github, "json").mockReset();
+					mockPrView(139);
+					const second = await checkout(139, new AbortController().signal);
+
+					expect(first.localBranch).toBe("renamed-139");
+					expect(first.reused).toBe(false);
+					expect(second.reused).toBe(true);
+					expect(second.localBranch).toBe("renamed-139");
+					expect(second.worktreePath).toBe(first.worktreePath);
+					const listed = runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"]);
+					expect(listed.split("\n").filter(line => line === "branch refs/heads/renamed-139")).toHaveLength(1);
+					expect(listed).not.toContain("branch refs/heads/pr-139");
+				} finally {
+					if (previous) runGit(fixture.repoRoot, ["config", "core.hooksPath", previous]);
+					else runGit(fixture.repoRoot, ["config", "--unset", "core.hooksPath"]);
+					if (first) runGit(fixture.repoRoot, ["worktree", "remove", "--force", "--force", first.worktreePath]);
 				}
 			});
 			it.skipIf(!/^[^-]+-\d+-\d+$/.test(vcs.worktreeSetupOwner()))(

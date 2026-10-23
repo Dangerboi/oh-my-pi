@@ -431,7 +431,7 @@ export async function checkoutPullRequest(
 	const headRefOid = requireNonEmpty(data.headRefOid, "head commit");
 	const repoRoot = await requireGitRepoRoot(session.cwd, signal);
 	const primaryRepoRoot = await requirePrimaryGitRepoRoot(repoRoot, signal);
-	const localBranch = `pr-${prNumber}`;
+	const defaultBranch = `pr-${prNumber}`;
 	const worktreePath = getWorktreeDir(`${prNumber}-${hashPath(primaryRepoRoot)}`);
 
 	// Every git mutation against `repoRoot` from here on must run under the
@@ -447,8 +447,27 @@ export async function checkoutPullRequest(
 		async () => {
 			const repository = await vcs.discoverGit(repoRoot, signal);
 			if (!repository) throw new ToolError("Current git repository is unavailable.");
+			// A hook may have renamed the branch after the add; `localBranch` follows the worktree found.
+			let localBranch = defaultBranch;
+			const findPrWorktree = async (listed: VcsWorktreeEntry[]): Promise<VcsWorktreeEntry | undefined> => {
+				localBranch = defaultBranch;
+				const byName = listed.find(entry => entry.branch === toLocalBranchRef(defaultBranch));
+				if (byName) return byName;
+				// `branch.<name>.ompPrUrl` moves with `git branch -m`, so it still names this PR's worktree.
+				if (!data.url) return undefined;
+				const prefix = "refs/heads/";
+				for (const entry of listed) {
+					if (!entry.branch?.startsWith(prefix)) continue;
+					const name = entry.branch.slice(prefix.length);
+					if ((await repository.configGet(`branch.${name}.ompPrUrl`, signal)) === data.url) {
+						localBranch = name;
+						return entry;
+					}
+				}
+				return undefined;
+			};
 			let existingWorktrees = await repository.worktrees(signal);
-			let existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
+			let existingWorktree = await findPrWorktree(existingWorktrees);
 			const setupOwner = existingWorktree?.setupOwner;
 			if (existingWorktree && setupOwner) {
 				const stillSettingUp = () =>
@@ -501,7 +520,7 @@ export async function checkoutPullRequest(
 					if (initializing) await untilAborted(signal, () => fs.rm(lockPath, { force: true }));
 					await repository.worktreePrune(signal);
 					existingWorktrees = await repository.worktrees(signal);
-					existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
+					existingWorktree = await findPrWorktree(existingWorktrees);
 					if (existingWorktree) {
 						throw new ToolError(
 							`the registration of the worktree of ${localBranch} at ${existingWorktree.path} is stale but git keeps it (locked?); run \`git worktree unlock ${existingWorktree.path}\` if so, then \`git worktree prune\`, and retry`,
@@ -591,6 +610,7 @@ export async function checkoutPullRequest(
 					});
 				}
 				hook = setUp.hook;
+				localBranch = setUp.branch;
 			}
 			// A reused worktree has nothing to discard, but a stalled path lookup must not keep the repo lock after an abort.
 			resolvedWorktreePath ??= await resolveWorktreePath(finalWorktreePath, signal);

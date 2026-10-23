@@ -315,6 +315,14 @@ describe("session worktree helpers (real git)", () => {
 			expect(wt.hook?.error).toBeUndefined();
 		});
 
+		it("returns the branch a hook renamed the worktree to", async () => {
+			await hook("git branch -m renamed-by-hook");
+			const wt = await create();
+
+			expect(wt.branch).toBe("renamed-by-hook");
+			expect(git(wt.path, "branch", "--show-current")).toBe("renamed-by-hook");
+		});
+
 		it("hides the agent's own GIT_DIR from the hook", async () => {
 			const wt = await create();
 			await hook("git rev-parse --absolute-git-dir > .git-dir-seen");
@@ -535,19 +543,23 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 		it("an abort while the new worktree's setup mark is being removed comes too late: /wt keeps the finished worktree", async () => {
 			await hook("touch .post-checkout-ran");
 			const repoProto = Object.getPrototypeOf(vcs.requireGit(repo));
-			const worktreeEndSetup = repoProto.worktreeEndSetup;
+			const worktreeReplaceSetupOwner = repoProto.worktreeReplaceSetupOwner;
 			const controller = new AbortController();
 			// Once the mark is gone another omp process may reuse the worktree, so discarding it then could delete its work.
-			const endSetup = spyOn(repoProto, "worktreeEndSetup").mockImplementation(function (
+			let calls = 0;
+			const replaceSetupOwner = spyOn(repoProto, "worktreeReplaceSetupOwner").mockImplementation(function (
 				this: unknown,
 				...args: unknown[]
 			) {
+				calls++;
 				controller.abort();
-				return worktreeEndSetup.apply(this, args);
+				return worktreeReplaceSetupOwner.apply(this, args);
 			});
 			const wt = await createSessionWorktree(repo, Settings.isolated(), branch, {
 				signal: controller.signal,
-			}).finally(() => endSetup.mockRestore());
+			}).finally(() => replaceSetupOwner.mockRestore());
+
+			expect(calls).toBe(1);
 
 			expect(worktreePaths(repo)).toContain(wt.path);
 			expect(await exists(path.join(wt.path, ".post-checkout-ran"))).toBe(true);
@@ -666,6 +678,67 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 				const entry = (await vcs.requireGit(repo).worktrees()).find(e => e.branch === `refs/heads/${branch}-other`);
 				expect(entry?.setupOwner).toBe(otherOwner);
 			} finally {
+				if (replacement) git(repo, "worktree", "remove", "--force", replacement);
+			}
+		});
+
+		it("a hook that removes its worktree, replaced by another process, fails /wt without clearing the replacement's mark", async () => {
+			const otherOwner = "other-live-owner";
+			// The hook is the "second process": it frees the path and branch, then re-adds both (hooks off, so this does not recurse) with its own mark.
+			await hook(
+				[
+					'P="$PWD"',
+					"unset GIT_DIR GIT_WORK_TREE",
+					`cd "${repo}"`,
+					'git worktree remove --force "$P"',
+					`git -c core.hooksPath=/dev/null worktree add "$P" "${branch}"`,
+					`echo "${otherOwner}" > "$(git -C "$P" rev-parse --absolute-git-dir)/omp-setup"`,
+				].join("\n"),
+			);
+
+			await expect(create()).rejects.toThrow(/removed the new worktree/);
+
+			const entry = (await vcs.requireGit(repo).worktrees()).find(e => e.branch === `refs/heads/${branch}`);
+			try {
+				expect(entry).toBeDefined();
+				expect(entry?.setupOwner).toBe(otherOwner);
+				expect(await exists(path.join(entry!.path, "tracked.txt"))).toBe(true);
+				expect(branchSha(repo, branch)).not.toBeNull();
+			} finally {
+				if (entry) git(repo, "worktree", "remove", "--force", entry.path);
+			}
+		});
+
+		it("a hook that removes its worktree, replaced by another process that committed and detached, fails /wt without deleting the branch", async () => {
+			const headFile = path.join(root, "replacement-head");
+			const pathFile = path.join(root, "replacement-path");
+			// The "second process" re-adds the branch with hooks off, commits on it, then detaches, leaving the branch checked out nowhere.
+			await hook(
+				[
+					'P="$PWD"',
+					"unset GIT_DIR GIT_WORK_TREE",
+					`cd "${repo}"`,
+					'git worktree remove --force "$P"',
+					`git -c core.hooksPath=/dev/null worktree add "$P" "${branch}"`,
+					'git -C "$P" -c core.hooksPath=/dev/null -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit --allow-empty -m replacement',
+					`git -C "$P" rev-parse HEAD > "${headFile}"`,
+					`echo "$P" > "${pathFile}"`,
+					'git -C "$P" -c core.hooksPath=/dev/null checkout --detach',
+				].join("\n"),
+			);
+
+			try {
+				await expect(create()).rejects.toThrow(/removed the new worktree/);
+
+				const replacementHead = (await Bun.file(headFile).text()).trim();
+				expect(replacementHead).toMatch(/^[0-9a-f]{40}/);
+				expect(branchSha(repo, branch)).toBe(replacementHead);
+			} finally {
+				const replacement = (
+					await Bun.file(pathFile)
+						.text()
+						.catch(() => "")
+				).trim();
 				if (replacement) git(repo, "worktree", "remove", "--force", replacement);
 			}
 		});
