@@ -199,13 +199,22 @@ export async function createSessionWorktree(
 			logger.warn("the post-checkout hook removed a /wt worktree; leaving its branch alone", { branch });
 			throw error;
 		}
-		// Created just above (it did not exist), so it is this attempt's to delete when setup fails.
-		await repository.deleteBranch(branch, true).catch(deleteError => {
-			logger.warn("could not delete the branch of a /wt worktree whose setup was cut short", {
-				branch,
-				error: String(deleteError),
+		// Created at `baseCommit` just above and never moved by the add (`worktreeAdd` only creates a missing
+		// branch, and `keepChanges` requires `baseCommit` to be the source HEAD), so it is deleted only while
+		// still there: another process's branch of that name is kept.
+		await repository
+			.swapBranch(branch, baseCommit, null)
+			.then(deleted => {
+				if (!deleted) {
+					logger.warn("a /wt worktree's branch moved since its setup began; keeping it", { branch });
+				}
+			})
+			.catch(deleteError => {
+				logger.warn("could not delete the branch of a /wt worktree whose setup was cut short", {
+					branch,
+					error: String(deleteError),
+				});
 			});
-		});
 		throw error;
 	}
 	return {

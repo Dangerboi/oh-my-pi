@@ -1548,6 +1548,28 @@ impl VcsGitRepo {
 		})
 	}
 
+	/// Compare-and-swap a local branch through `git update-ref`, which checks
+	/// the old value under the ref lock (git must be on `PATH`).
+	///
+	/// `expected` of `null`/absent requires the branch not to exist;
+	/// otherwise it must resolve to exactly that full object id. `target`
+	/// sets the branch to that commit, or deletes it (and its
+	/// `[branch "<name>"]` config) when `null`/absent. Resolves `false`,
+	/// changing nothing, when `expected` does not hold or when `expected` is
+	/// set and the branch is checked out in any worktree.
+	#[napi]
+	pub fn swap_branch(
+		&self,
+		name: String,
+		expected: Option<String>,
+		target: Option<String>,
+		signal: Option<Unknown>,
+	) -> Promise<bool> {
+		blocking("vcs.swapBranch", self.inner.clone(), signal, move |r| {
+			r.swap_branch(&name, expected.as_deref(), target.as_deref())
+		})
+	}
+
 	/// Create and checkout branch.
 	#[napi]
 	pub fn checkout_new_branch(&self, name: String, signal: Option<Unknown>) -> Promise<()> {

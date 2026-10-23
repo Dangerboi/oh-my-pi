@@ -440,6 +440,88 @@ impl GitRepo {
 		Ok(true)
 	}
 
+	/// Compare-and-swap `refs/heads/<name>`, performed by `git update-ref`.
+	///
+	/// `expected: None` requires the branch to be absent; `Some(oid)` requires
+	/// it to resolve to exactly that full object id. `target: Some(rev)` sets
+	/// the branch to that commit (reflog entry `omp: restore branch`);
+	/// `None` deletes it and, once deleted, removes its `[branch "<name>"]`
+	/// config sections like [`Self::delete_branch`]. Returns `Ok(false)`,
+	/// changing nothing, when `expected` does not hold or when `expected` is
+	/// `Some` and the branch is checked out in any worktree. Both `None` is
+	/// the no-op "make it absent": `Ok(true)` when already absent, else
+	/// `Ok(false)`. An unparsable `expected` or unresolvable `target` is an
+	/// error.
+	///
+	/// The git binary is required: `update-ref` takes the ref lock first and
+	/// verifies the old value under it, so a concurrent git writer is never
+	/// overwritten, and it handles packed refs and reftable. The checked-out
+	/// check and the update run under the cross-process worktree-add lock, so
+	/// a native [`Self::worktree_add`] cannot register a worktree on the
+	/// branch in between; a plain `git worktree add` does not take that lock.
+	pub fn swap_branch(
+		&self,
+		name: &str,
+		expected: Option<&str>,
+		target: Option<&str>,
+	) -> Result<bool> {
+		let full = format!("refs/heads/{name}");
+		if expected.is_none() && target.is_none() {
+			return Ok(self.resolve_ref(&full)?.is_none());
+		}
+		let repo = self.gix()?;
+		let expected_id = expected
+			.map(|oid| {
+				gix::hash::ObjectId::from_hex(oid.as_bytes())
+					.map_err(|err| Error::backend("git branch", err))
+			})
+			.transpose()?;
+		let new = target.map(|rev| resolve_commit(&repo, rev)).transpose()?;
+		let _add_lock = if expected_id.is_some() {
+			Some(lock_worktree_adds(&self.info().common_dir)?)
+		} else {
+			None
+		};
+		if expected_id.is_some() && branch_is_checked_out(&self.info().common_dir, &full) {
+			return Ok(false);
+		}
+		let old = expected_id
+			.unwrap_or_else(|| gix::hash::ObjectId::null(repo.object_hash()))
+			.to_hex()
+			.to_string();
+		let args: Vec<String> = match new {
+			Some(id) => vec![
+				"update-ref".to_owned(),
+				"-m".to_owned(),
+				"omp: restore branch".to_owned(),
+				full.clone(),
+				id.to_hex().to_string(),
+				old,
+			],
+			None => vec!["update-ref".to_owned(), "-d".to_owned(), full.clone(), old],
+		};
+		let output = super::cli::run_sync_write(
+			self.root(),
+			&args,
+			super::cli::SYNC_TIMEOUT,
+			&super::cli::SyncWrite { stdin: &[], env: &[] },
+		)?;
+		if output.exit_code != 0 {
+			// A rejected old value and a real failure both exit non-zero; the
+			// ref's current value tells them apart without parsing stderr.
+			let current = self.resolve_ref(&full)?;
+			let expected_hex = expected_id.map(|id| id.to_hex().to_string());
+			if current != expected_hex {
+				return Ok(false);
+			}
+			output.into_checked(&args)?;
+		}
+		if new.is_none() {
+			let _ = remove_config_sections(&self.info().common_dir.join("config"), "branch", name);
+		}
+		Ok(true)
+	}
+
 	/// Create a branch at HEAD and switch to it without touching files.
 	pub fn checkout_new_branch(&self, name: &str) -> Result<()> {
 		self.create_branch(name, "HEAD", false)?;
@@ -3462,6 +3544,145 @@ mod tests {
 		assert!(config.contains("[branch \"keep\"]"), "{config}");
 		assert!(config.contains("unrelated = stay"), "{config}");
 		assert_eq!(git(temp.path(), &["config", "--get", "branch.keep.remote"]), "origin");
+	}
+
+	#[test]
+	fn swap_branch_only_changes_the_branch_when_expected_holds() {
+		let (temp, repo) = fixture();
+		let first = git(temp.path(), &["rev-parse", "HEAD"]);
+		fs::write(temp.path().join("swap"), "x\n").unwrap();
+		git(temp.path(), &["add", "swap"]);
+		git(temp.path(), &["commit", "-qm", "second"]);
+		let second = git(temp.path(), &["rev-parse", "HEAD"]);
+		let head_of = |branch: &str| git(temp.path(), &["rev-parse", "--verify", branch]);
+
+		// Create only while absent.
+		assert!(repo.swap_branch("swap", None, Some(&first)).unwrap());
+		assert_eq!(head_of("swap"), first);
+		assert!(!repo.swap_branch("swap", None, Some(&second)).unwrap());
+		assert_eq!(head_of("swap"), first);
+
+		// Update only from the expected value.
+		assert!(
+			!repo
+				.swap_branch("swap", Some(&second), Some(&second))
+				.unwrap()
+		);
+		assert_eq!(head_of("swap"), first);
+		assert!(
+			repo
+				.swap_branch("swap", Some(&first), Some(&second))
+				.unwrap()
+		);
+		assert_eq!(head_of("swap"), second);
+		assert!(
+			git(temp.path(), &["reflog", "show", "refs/heads/swap"]).contains("omp: restore branch")
+		);
+
+		// Delete only from the expected value, dropping the branch config.
+		repo.config_set("branch.swap.remote", "origin").unwrap();
+		repo.config_set("branch.other.remote", "origin").unwrap();
+		assert!(!repo.swap_branch("swap", Some(&first), None).unwrap());
+		assert_eq!(head_of("swap"), second);
+		assert!(repo.swap_branch("swap", Some(&second), None).unwrap());
+		assert!(repo.resolve_ref("refs/heads/swap").unwrap().is_none());
+		let config = fs::read_to_string(temp.path().join(".git/config")).unwrap();
+		assert!(!config.contains("[branch \"swap\"]"), "{config}");
+		assert!(config.contains("[branch \"other\"]"), "{config}");
+
+		// Deleting a branch that no longer exists is a failed expectation.
+		assert!(!repo.swap_branch("swap", Some(&second), None).unwrap());
+		assert!(repo.swap_branch("swap", Some("not-an-oid"), None).is_err());
+	}
+
+	#[test]
+	fn swap_branch_leaves_a_branch_checked_out_in_a_worktree() {
+		let (temp, repo) = fixture();
+		let first = git(temp.path(), &["rev-parse", "HEAD"]);
+		fs::write(temp.path().join("swap"), "x\n").unwrap();
+		git(temp.path(), &["add", "swap"]);
+		git(temp.path(), &["commit", "-qm", "second"]);
+		let second = git(temp.path(), &["rev-parse", "HEAD"]);
+		git(temp.path(), &["branch", "busy", &first]);
+		let linked = temp.path().join("../linked-swap-busy");
+		let _ = fs::remove_dir_all(&linked);
+		git(temp.path(), &["worktree", "add", linked.to_str().unwrap(), "busy"]);
+
+		assert!(
+			!repo
+				.swap_branch("busy", Some(&first), Some(&second))
+				.unwrap()
+		);
+		assert!(!repo.swap_branch("busy", Some(&first), None).unwrap());
+		assert_eq!(git(temp.path(), &["rev-parse", "--verify", "busy"]), first);
+		let _ = repo.worktree_remove(&linked, true);
+	}
+
+	/// Commit `name` with a file change and return its oid.
+	fn commit_file(dir: &Path, name: &str) -> String {
+		fs::write(dir.join(name), "x\n").unwrap();
+		git(dir, &["add", name]);
+		git(dir, &["commit", "-qm", name]);
+		git(dir, &["rev-parse", "HEAD"])
+	}
+
+	#[test]
+	fn swap_branch_checks_the_expected_value_under_the_ref_lock() {
+		let (temp, repo) = fixture();
+		let a = git(temp.path(), &["rev-parse", "HEAD"]);
+		let b = commit_file(temp.path(), "b");
+		let c = commit_file(temp.path(), "c");
+		git(temp.path(), &["config", "core.filesRefLockTimeout", "5000"]);
+		git(temp.path(), &["branch", "x", &a]);
+		let live = temp.path().join(".git/refs/heads/x");
+		let lock = temp.path().join(".git/refs/heads/x.lock");
+		fs::write(&lock, format!("{b}\n")).unwrap();
+
+		let result = std::thread::scope(|scope| {
+			let writer = scope.spawn(|| {
+				std::thread::sleep(std::time::Duration::from_millis(300));
+				fs::rename(&lock, &live).unwrap();
+			});
+			let result = repo.swap_branch("x", Some(&a), Some(&c));
+			writer.join().unwrap();
+			result
+		});
+
+		assert!(!result.unwrap());
+		assert_eq!(git(temp.path(), &["rev-parse", "--verify", "x"]), b);
+	}
+
+	#[test]
+	fn swap_branch_with_no_expected_and_no_target_reports_absence() {
+		let (temp, repo) = fixture();
+		let a = git(temp.path(), &["rev-parse", "HEAD"]);
+		assert!(repo.swap_branch("gone", None, None).unwrap());
+		git(temp.path(), &["branch", "here", &a]);
+		assert!(!repo.swap_branch("here", None, None).unwrap());
+		assert_eq!(git(temp.path(), &["rev-parse", "--verify", "here"]), a);
+	}
+
+	#[test]
+	fn swap_branch_holds_the_worktree_add_lock_across_the_checked_out_check() {
+		let (temp, repo) = fixture();
+		let a = git(temp.path(), &["rev-parse", "HEAD"]);
+		git(temp.path(), &["branch", "busy", &a]);
+		let linked = temp.path().join("../linked-swap-lock");
+		let _ = fs::remove_dir_all(&linked);
+
+		let guard = lock_worktree_adds(&repo.info().common_dir).unwrap();
+		let result = std::thread::scope(|scope| {
+			let swap = scope.spawn(|| repo.swap_branch("busy", Some(&a), None));
+			std::thread::sleep(std::time::Duration::from_millis(200));
+			assert!(!swap.is_finished(), "swap_branch ran without the worktree-add lock");
+			git(temp.path(), &["worktree", "add", linked.to_str().unwrap(), "busy"]);
+			drop(guard);
+			swap.join().unwrap()
+		});
+
+		assert!(!result.unwrap());
+		assert_eq!(git(temp.path(), &["rev-parse", "--verify", "busy"]), a);
+		let _ = repo.worktree_remove(&linked, true);
 	}
 
 	#[test]

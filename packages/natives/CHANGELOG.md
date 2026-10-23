@@ -11,6 +11,7 @@
 - Added `gitDir` to `worktrees()` entries, the worktree's git directory, which stays the same when `git worktree move` moves it ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Added `VcsGitRepo.worktreeReplaceSetupOwner(gitDir, expected, replacement?, signal?)`, which swaps or clears a worktree's setup mark only while it is still `expected`'s, atomically against worktree adds ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 - Added `VcsGitRepo.branchRenamedFrom(name, from, signal?)`, whether the branch's reflog shows `git branch -m` renamed it from `from` ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
+- Added `VcsGitRepo.swapBranch(name, expected?, target?, signal?)`, which creates, moves or deletes a local branch through `git update-ref` only while it is still at `expected` (or absent), never one checked out in a worktree ([#16123](https://github.com/can1357/oh-my-pi/pull/16123) by [@Dangerboi](https://github.com/Dangerboi))
 
 ### Changed
 

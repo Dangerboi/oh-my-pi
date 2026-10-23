@@ -798,6 +798,18 @@ export declare class VcsGitRepo {
   createBranch(name: string, start: string, force: boolean, signal?: unknown | undefined | null): Promise<undefined>
   /** Delete branch. */
   deleteBranch(name: string, force: boolean, signal?: unknown | undefined | null): Promise<boolean>
+  /**
+   * Compare-and-swap a local branch through `git update-ref`, which checks
+   * the old value under the ref lock (git must be on `PATH`).
+   *
+   * `expected` of `null`/absent requires the branch not to exist;
+   * otherwise it must resolve to exactly that full object id. `target`
+   * sets the branch to that commit, or deletes it (and its
+   * `[branch "<name>"]` config) when `null`/absent. Resolves `false`,
+   * changing nothing, when `expected` does not hold or when `expected` is
+   * set and the branch is checked out in any worktree.
+   */
+  swapBranch(name: string, expected?: string | undefined | null, target?: string | undefined | null, signal?: unknown | undefined | null): Promise<boolean>
   /** Create and checkout branch. */
   checkoutNewBranch(name: string, signal?: unknown | undefined | null): Promise<undefined>
   /** Restore paths. */

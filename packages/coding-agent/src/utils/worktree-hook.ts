@@ -118,8 +118,12 @@ export class WorktreeRemovedByHookError extends Error {
  * (a proven rename is kept: the returned branch is its new name). All of these are checked before
  * the setup mark is cleared. The discard itself takes no signal and runs to completion. A failed
  * `worktreeAdd` discards nothing: another process may own the path by then. If the hook removed
- * the worktree, the call fails with {@link WorktreeRemovedByHookError} and touches neither the path
- * nor the branch, which another process may have taken since.
+ * the worktree, or another process replaced it at the same git directory (a different setup mark,
+ * on the success and the failure path alike), the call fails with {@link WorktreeRemovedByHookError}
+ * (success path) or rethrows its own error (failure path) and touches neither the path nor the
+ * branch, which another process may have taken since. On the failure path `branch` is put back at
+ * its checkout tip only while provably this setup's: recreated while absent, or moved when this
+ * setup's own worktree was on it, always by compare-and-swap.
  */
 export async function addWorktreeWithHook(
 	repository: VcsGitRepo,
@@ -195,7 +199,8 @@ export async function addWorktreeWithHook(
 			// The hook may have moved the worktree before it was cut short; discard where it is now.
 			try {
 				const located = await currentWorktreeEntry(repository, gitDir);
-				if (located === undefined) gone = true;
+				// Missing, or a replacement at our git dir carrying another mark: either way not ours to touch.
+				if (located === undefined || (located !== null && located.setupOwner !== setupOwner)) gone = true;
 				else {
 					current = located?.path ?? current;
 					if (located && !located.detached && located.branch?.startsWith("refs/heads/")) {
@@ -219,7 +224,7 @@ export async function addWorktreeWithHook(
 			if (gitDir !== undefined && branchesBefore && hookBranch !== undefined) {
 				await deleteRenamedBranch(repository, branch, hookBranch, branchesBefore);
 			}
-			if (head) await restoreBranch(repository, branch, head);
+			if (head) await restoreBranch(repository, branch, head, hookBranch === branch);
 		}
 		throw error;
 	}
@@ -346,11 +351,36 @@ async function discardNewWorktree(
 	}
 }
 
-/** Put `branch` back at `head` if a cut-short hook moved or deleted it. Failures are logged. */
-async function restoreBranch(repository: VcsGitRepo, branch: string, head: string): Promise<void> {
+/**
+ * Put `branch` back at `head` after a cut-short hook, only while it is provably this setup's: it is
+ * recreated while absent, and moved off another commit only when this setup's own worktree was on it
+ * at rollback (`ownCheckout`). Anything else may be another process's branch and is left alone. The
+ * update is a compare-and-swap, so a branch changed since it was read is left too. Failures are logged.
+ */
+async function restoreBranch(
+	repository: VcsGitRepo,
+	branch: string,
+	head: string,
+	ownCheckout: boolean,
+): Promise<void> {
 	try {
 		const now = await repository.resolveRef(`refs/heads/${branch}`);
-		if (now !== head) await repository.createBranch(branch, head, true);
+		if (now === head) return;
+		if (now == null) {
+			if (!(await repository.swapBranch(branch, null, head))) {
+				logger.warn("a branch a cut-short post-checkout hook deleted was recreated meanwhile; leaving it", {
+					branch,
+				});
+			}
+		} else if (ownCheckout) {
+			if (!(await repository.swapBranch(branch, now, head))) {
+				logger.warn("a branch a cut-short post-checkout hook moved changed meanwhile; leaving it", { branch });
+			}
+		} else {
+			logger.warn("a branch moved while a post-checkout hook ran is not provably this setup's; leaving it", {
+				branch,
+			});
+		}
 	} catch (error) {
 		logger.warn("could not restore a branch moved by a cut-short post-checkout hook", {
 			branch,

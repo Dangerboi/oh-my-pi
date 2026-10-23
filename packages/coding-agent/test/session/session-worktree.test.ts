@@ -636,6 +636,39 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 			expect(worktreePaths(repo)).toEqual([repo]);
 		});
 
+		it("an abort keeps a branch another process created under the name the hook renamed away", async () => {
+			const renamed = `${branch}-moved`;
+			const signalPipe = path.join(root, "hook-recreated-started");
+			const commitFile = path.join(root, "hook-recreated-commit");
+			expect(Bun.spawnSync(["mkfifo", signalPipe]).exitCode).toBe(0);
+			await hook(
+				[
+					"unset GIT_DIR GIT_WORK_TREE",
+					`cd "${repo}"`,
+					`git branch -m "${branch}" "${renamed}"`,
+					"C=$(git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit-tree 'HEAD^{tree}' -p HEAD -m other)",
+					`git branch "${branch}" "$C"`,
+					`echo "$C" > "${commitFile}"`,
+					`echo started > "${signalPipe}"`,
+					"sleep 600",
+				].join("\n"),
+			);
+			try {
+				const controller = new AbortController();
+				const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+				await Bun.file(signalPipe).text();
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+
+				const other = (await Bun.file(commitFile).text()).trim();
+				expect(other).toMatch(/^[0-9a-f]{40}$/);
+				expect(branchSha(repo, branch)).toBe(other);
+			} finally {
+				Bun.spawnSync(["git", "branch", "-D", branch], { cwd: repo });
+				Bun.spawnSync(["git", "branch", "-D", renamed], { cwd: repo });
+			}
+		});
+
 		it("an abort keeps a branch the hook left its worktree on when its reflog shows no rename from the original", async () => {
 			const other = `${branch}-other`;
 			const signalPipe = path.join(root, "hook-other-started");
@@ -822,6 +855,43 @@ await runWorktreeCheckoutHook(${JSON.stringify(wt.path)}, ${JSON.stringify(wt.ba
 				expect(await exists(path.join(entry!.path, "tracked.txt"))).toBe(true);
 				expect(branchSha(repo, branch)).not.toBeNull();
 			} finally {
+				if (entry) git(repo, "worktree", "remove", "--force", entry.path);
+			}
+		});
+
+		it("an abort after another process replaced the removed worktree leaves the replacement and its mark alone", async () => {
+			const otherOwner = "other-live-owner";
+			const signalPipe = path.join(root, "hook-replaced-started");
+			expect(Bun.spawnSync(["mkfifo", signalPipe]).exitCode).toBe(0);
+			await hook(
+				[
+					'P="$PWD"',
+					"unset GIT_DIR GIT_WORK_TREE",
+					`cd "${repo}"`,
+					'git worktree remove --force "$P"',
+					`git -c core.hooksPath=/dev/null worktree add "$P" "${branch}"`,
+					`echo "${otherOwner}" > "$(git -C "$P" rev-parse --absolute-git-dir)/omp-setup"`,
+					`echo started > "${signalPipe}"`,
+					"sleep 600",
+				].join("\n"),
+			);
+
+			const findReplacement = async () =>
+				(await vcs.requireGit(repo).worktrees()).find(e => e.branch === `refs/heads/${branch}`);
+			try {
+				const controller = new AbortController();
+				const pending = createSessionWorktree(repo, Settings.isolated(), branch, { signal: controller.signal });
+				await Bun.file(signalPipe).text();
+				controller.abort();
+				await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+
+				const entry = await findReplacement();
+				expect(entry).toBeDefined();
+				expect(entry?.setupOwner).toBe(otherOwner);
+				expect(await exists(path.join(entry!.path, "tracked.txt"))).toBe(true);
+				expect(branchSha(repo, branch)).not.toBeNull();
+			} finally {
+				const entry = await findReplacement();
 				if (entry) git(repo, "worktree", "remove", "--force", entry.path);
 			}
 		});
