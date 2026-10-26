@@ -53,8 +53,8 @@ async function forward(stream: ReadableStream<Uint8Array>, stop: Promise<void>):
 		for (;;) {
 			const chunk = await reader.read();
 			if (chunk.done) break;
-			// A false return means the sink's buffer is full; wait for it to drain so a slow or
-			// redirected stderr cannot make the buffer grow without bound.
+			// A false return means process.stderr's buffer is full; wait for it to drain instead of
+			// growing it. Bun.spawn still reads the hook's pipes eagerly, so this doesn't slow the hook.
 			if (!process.stderr.write(chunk.value)) {
 				const { promise, resolve } = Promise.withResolvers<void>();
 				const done = () => {
