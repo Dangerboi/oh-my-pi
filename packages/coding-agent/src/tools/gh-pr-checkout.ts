@@ -4,7 +4,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { IsoBackendKind, VcsGitRepo, VcsWorktreeEntry } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { getWorktreeDir, hashPath, isEnoent, logger, slugify } from "@oh-my-pi/pi-utils";
+import { getWorktreeDir, hashPath, isEnoent, logger, slugify, untilAborted } from "@oh-my-pi/pi-utils";
 import { github } from "../utils/github";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 import { withRepoLock } from "../utils/repo-lock";
@@ -399,6 +399,20 @@ export interface PrCheckoutOutcome {
 	warning?: string;
 }
 
+/**
+ * Post-checkout hooks still running, keyed by resolved worktree path. Each
+ * promise resolves (never rejects) to the hook's display warning, `undefined`
+ * on success. In-process only; lets a concurrent checkout that reuses the
+ * worktree wait until it is initialized.
+ */
+const inFlightHooks = new Map<string, Promise<string | undefined>>();
+
+interface PendingHook {
+	promise: Promise<string | undefined>;
+	resolve: (warning: string | undefined) => void;
+	headOid: string;
+}
+
 export async function checkoutPullRequest(
 	session: ToolSession,
 	signal: AbortSignal | undefined,
@@ -523,6 +537,15 @@ export async function checkoutPullRequest(
 				? undefined
 				: await repository.resolveRef(toLocalBranchRef(localBranch), signal);
 
+			// Registered before the lock is released so the next caller to take the
+			// lock and find this worktree already sees the pending hook.
+			let hook: PendingHook | undefined;
+			if (headOid) {
+				const { promise, resolve } = Promise.withResolvers<string | undefined>();
+				inFlightHooks.set(resolvedWorktreePath, promise);
+				hook = { promise, resolve, headOid };
+			}
+
 			const outcome: PrCheckoutOutcome = {
 				data,
 				localBranch,
@@ -533,18 +556,35 @@ export async function checkoutPullRequest(
 				reused: Boolean(existingWorktree),
 				clonedWith,
 			};
-			return { outcome, headOid };
+			return { outcome, hook };
 		},
 		signal,
 	);
 
 	// Runs after the repo lock is released so a slow hook never blocks other
-	// git operations on this repository. Only a newly created worktree gets it.
-	const { outcome, headOid } = locked;
-	if (outcome.reused || !headOid) return outcome;
-	const hookResult = await runPostCheckoutHook(outcome.worktreePath, headOid, { signal });
-	if (hookResult.status === "cancelled") throwIfAborted(signal);
-	return { ...outcome, warning: formatPostCheckoutHookWarning(hookResult) };
+	// git operations on this repository. Only a newly created worktree runs it.
+	const { outcome, hook } = locked;
+	if (!hook) {
+		// A reused worktree may still be initializing in a concurrent call.
+		const pending = inFlightHooks.get(outcome.worktreePath);
+		if (!pending) return outcome;
+		try {
+			return { ...outcome, warning: await untilAborted(signal, pending) };
+		} catch (error) {
+			throwIfAborted(signal);
+			throw error;
+		}
+	}
+	let warning: string | undefined;
+	try {
+		const hookResult = await runPostCheckoutHook(outcome.worktreePath, hook.headOid, { signal });
+		warning = formatPostCheckoutHookWarning(hookResult);
+		if (hookResult.status === "cancelled") throwIfAborted(signal);
+	} finally {
+		if (inFlightHooks.get(outcome.worktreePath) === hook.promise) inFlightHooks.delete(outcome.worktreePath);
+		hook.resolve(warning);
+	}
+	return { ...outcome, warning };
 }
 
 export function outcomeToSummary(outcome: PrCheckoutOutcome): GhPrCheckoutSummary {

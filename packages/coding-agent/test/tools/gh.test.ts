@@ -1379,6 +1379,25 @@ echo ok
 			expect(result.details?.checkouts?.[0]?.reused).toBe(false);
 		}, 30_000);
 
+		it("makes a concurrent checkout of the same PR wait for the running hook", async () => {
+			const marker = path.join(fixture.baseDir, "hook-done");
+			await installHook(`sleep 1\necho run >> "${hookLog}"\ntouch "${marker}"`);
+			mockPr(305);
+			mockPr(305);
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const settle = async (id: string) => {
+				const result = await tool.execute(id, { op: "pr_checkout", pr: "305" });
+				return { result, markerExists: await Bun.file(marker).exists() };
+			};
+			const [a, b] = await Promise.all([settle("pr-checkout-a"), settle("pr-checkout-b")]);
+
+			expect(a.markerExists).toBe(true);
+			expect(b.markerExists).toBe(true);
+			expect(await readHookLines()).toEqual(["run"]);
+			const reused = [a, b].map(entry => entry.result.details?.checkouts?.[0]?.reused);
+			expect(reused.filter(Boolean)).toHaveLength(1);
+		}, 30_000);
+
 		it("does not hold the repo lock while the hook runs", async () => {
 			const started = path.join(fixture.baseDir, "hook-started");
 			await installHook(`touch "${started}"\nsleep 30`);
