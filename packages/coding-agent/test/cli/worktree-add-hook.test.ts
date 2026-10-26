@@ -68,7 +68,12 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 			expect(elapsed).toBeLessThan(10_000);
 			expect((await fs.stat(worktree)).isDirectory()).toBe(true);
 		} finally {
-			const pid = Number.parseInt(await Bun.file(pidFile).text().catch(() => ""), 10);
+			const pid = Number.parseInt(
+				await Bun.file(pidFile)
+					.text()
+					.catch(() => ""),
+				10,
+			);
 			if (Number.isInteger(pid)) {
 				try {
 					process.kill(pid, "SIGKILL");
