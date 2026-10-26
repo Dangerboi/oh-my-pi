@@ -1726,6 +1726,8 @@ export class CommandController {
 			// Esc aborts the loader's signal only: the checkout runs to completion and the
 			// post-checkout hook sees the abort, so the worktree is kept and the session moves.
 			const loader = new BorderedLoader(this.ctx.ui, theme, `Creating worktree on ${branchName}…`);
+			const previousChildren = [...this.ctx.editorContainer.children];
+			const previousFocus = this.ctx.ui.getFocused();
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(loader);
 			this.ctx.ui.setFocus(loader);
@@ -1741,9 +1743,16 @@ export class CommandController {
 				return false;
 			} finally {
 				loader.dispose();
-				this.ctx.editorContainer.clear();
-				this.ctx.editorContainer.addChild(this.ctx.editor);
-				this.ctx.ui.setFocus(this.ctx.editor);
+				// A dialog may have taken the slot while the checkout ran; only restore if the loader is still ours.
+				if (this.ctx.editorContainer.children.includes(loader)) {
+					this.ctx.editorContainer.clear();
+					for (const child of previousChildren) this.ctx.editorContainer.addChild(child);
+					this.ctx.ui.setFocus(
+						previousFocus && previousChildren.includes(previousFocus)
+							? previousFocus
+							: (previousChildren[0] ?? this.ctx.editor),
+					);
+				}
 			}
 			if (worktree.cloneError) {
 				logger.warn("worktree clone fell back to plain checkout", {
