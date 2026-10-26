@@ -4,7 +4,7 @@
 
 ### Removed
 
-- Removed `runPostCheckoutHook` from `@oh-my-pi/pi-natives/vcs`; `omp worktree add` now runs the hook itself
+- Removed `runPostCheckoutHook` from `@oh-my-pi/pi-natives/vcs`; `omp worktree add` now runs the hook itself ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
 
 ## [18.13.0] - 2026-10-26
 

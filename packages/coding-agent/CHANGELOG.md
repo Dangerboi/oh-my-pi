@@ -4,14 +4,14 @@
 
 ### Added
 
-- The `github` tool's `pr_checkout` now runs the `post-checkout` hook for a newly created PR worktree like `git worktree add`, after the repository lock is released; a failing hook adds a `Warning: post-checkout hook exited with <N>: <last line>` line to the result, aborting stops the hook and rejects the call, and a reused worktree doesn't rerun it
-- `/wt` (including `worktree.onStart` and ACP) now runs the new worktree's `post-checkout` hook like `git worktree add`; a failing or cancelled hook (Esc in the TUI, prompt cancel in ACP) keeps the worktree, shows a warning, and skips `worktree.cleanSource`
+- The `github` tool's `pr_checkout` now runs the `post-checkout` hook for a newly created PR worktree like `git worktree add`, after the repository lock is released; a failing hook adds a `Warning: post-checkout hook exited with <N>: <last line>` line to the result, aborting stops the hook and rejects the call, and a reused worktree doesn't rerun it ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
+- `/wt` (including `worktree.onStart` and ACP) now runs the new worktree's `post-checkout` hook like `git worktree add`; a failing or cancelled hook (Esc in the TUI, prompt cancel in ACP) keeps the worktree, shows a warning, and skips `worktree.cleanSource` ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
 - Added `tools.restrictedFolders`: every action on a listed folder (the folder and everything below it) asks for an explicit Approve/Deny in every approval mode, `yolo` included, and no remembered grant, session approval, or ACP "Always allow" covers it; recursive searches rooted above a restricted folder ask too, commands are matched by the directory they run in, and a `deny` policy still denies ([#16049](https://github.com/can1357/oh-my-pi/pull/16049) by [@Peribunt](https://github.com/Peribunt))
 - `/pause` shows draining turns and running jobs across the main agent's subagent tree, without waiting on finished turns, safely parked agents, or suspended advisor reviews ([#17073](https://github.com/can1357/oh-my-pi/pull/17073) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
 
 ### Changed
 
-- `omp worktree add` runs the `post-checkout` hook through the same runner as `/wt`, forwarding the hook's output to stderr as it arrives, and still exits with the hook's failure status
+- `omp worktree add` runs the `post-checkout` hook through the same runner as `/wt`, forwarding the hook's output to stderr as it arrives, and still exits with the hook's failure status ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
 
 ### Fixed
 
