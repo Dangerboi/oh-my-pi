@@ -375,6 +375,12 @@ describe.skipIf(process.platform === "win32")("session worktree post-checkout ho
 		expect(wt.hookWarning).toBe("post-checkout hook exited with 7: boom   bad");
 	});
 
+	it("warns with the last carriage-return progress frame rather than gluing frames together", async () => {
+		await installHook("printf 'copy 10 percent\\rcopy 55 percent\\rcopy 100 percent\\r' >&2; exit 4");
+		const wt = await create();
+		expect(wt.hookWarning).toBe("post-checkout hook exited with 4: copy 100 percent");
+	});
+
 	it("creates the worktree without a warning when no git executable exists to run the hook", async () => {
 		const bunDir = path.join(root, "bin");
 		await fs.mkdir(bunDir);

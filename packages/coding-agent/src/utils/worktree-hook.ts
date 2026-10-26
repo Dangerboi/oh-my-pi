@@ -181,9 +181,13 @@ export function formatPostCheckoutHookWarning(result: PostCheckoutHookResult): s
 			text = `post-checkout hook could not run: ${result.message}`;
 			break;
 		case "failed": {
-			const last = sanitizeText(result.output)
+			// A carriage return rewrites the line in place, so only the text after the last one is what the user saw.
+			const last = result.output
 				.split("\n")
-				.map(line => line.trim())
+				.map(line => {
+					const frame = line.replace(/\r+$/, "");
+					return sanitizeText(frame.slice(frame.lastIndexOf("\r") + 1)).trim();
+				})
 				.filter(Boolean)
 				.at(-1);
 			text = `post-checkout hook exited with ${result.exitCode}${last ? `: ${last}` : ""}`;
