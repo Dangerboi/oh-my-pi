@@ -672,8 +672,8 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	subreaper?: boolean;
 	/**
 	 * `"full"` exposes `child.stderr` and retains complete stderr for a later `wait({ stderr: "full" })`.
-	 * `"stream"` exposes `child.stderr` only; chunks are not retained, so memory stays bounded
-	 * (the internal tail is still capped) for callers that consume the stream themselves.
+	 * `"stream"` exposes `child.stderr` only; ptree retains no chunks (its internal tail stays
+	 * capped). The exposed stream is a tee branch, so a consumer that stalls still buffers.
 	 */
 	stderr?: "full" | "stream" | null;
 	/**

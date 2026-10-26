@@ -44,8 +44,10 @@ function tail(text: string): string {
 async function forward(stream: ReadableStream<Uint8Array>, stop: Promise<void>): Promise<void> {
 	const reader = stream.getReader();
 	// `stop` is observed once; a pending drain wait registers its release here instead of adding a reaction per write.
+	let stopped = false;
 	let releaseDrain: (() => void) | undefined;
 	void stop.then(() => {
+		stopped = true;
 		releaseDrain?.();
 		return reader.cancel().catch(() => {});
 	});
@@ -55,7 +57,8 @@ async function forward(stream: ReadableStream<Uint8Array>, stop: Promise<void>):
 			if (chunk.done) break;
 			// A false return means process.stderr's buffer is full; wait for it to drain instead of
 			// growing it. Bun.spawn still reads the hook's pipes eagerly, so this doesn't slow the hook.
-			if (!process.stderr.write(chunk.value)) {
+			// Once forwarding is cut, nothing would release the wait, so don't start one.
+			if (!process.stderr.write(chunk.value) && !stopped) {
 				const { promise, resolve } = Promise.withResolvers<void>();
 				const done = () => {
 					process.stderr.off("drain", done);
