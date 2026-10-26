@@ -72,6 +72,14 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 		expect(result.stderr.toString()).toContain("checkout-refused");
 	});
 
+	it("preserves the status when git hook run itself dies of a signal", async () => {
+		await hook("kill -TERM $PPID");
+		const { worktree, result } = await add("signalled");
+
+		expect(result.exitCode).toBe(143);
+		expect((await fs.stat(worktree)).isDirectory()).toBe(true);
+	});
+
 	it("returns promptly with a failing hook's status when it leaves a background process holding its output", async () => {
 		const pidFile = path.join(root, "bg.pid");
 		await hook(`sleep 30 &\necho $! > "${pidFile}"\nexit 3`);
