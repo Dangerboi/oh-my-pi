@@ -127,7 +127,10 @@ export async function runPostCheckoutHook(
 		};
 	} catch (error) {
 		if (signal?.aborted) return { status: "cancelled" };
-		if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" && !Bun.which("git", { PATH: env.PATH ?? "" })) {
+		if (
+			(error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" &&
+			!Bun.which("git", { PATH: env.PATH ?? "" })
+		) {
 			return { status: "no-git" };
 		}
 		return { status: "error", message: error instanceof Error ? error.message : String(error) };
