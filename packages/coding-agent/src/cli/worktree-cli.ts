@@ -166,6 +166,7 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	if (hook.status === "failed") process.exitCode = hook.exitCode;
 	else if (hook.status === "error") {
 		console.error(chalk.dim(`warning: ${formatPostCheckoutHookWarning(hook)}`));
+		process.exitCode = 1;
 	}
 }
 

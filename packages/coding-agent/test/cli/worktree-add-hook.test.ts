@@ -48,6 +48,22 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 		expect(result.stderr.toString()).toContain("hook-output");
 	});
 
+	it("exits 1 with a warning and keeps the worktree when git cannot be launched for the hook", async () => {
+		const worktree = path.join(root, "nogit");
+		const bunDir = path.join(root, "bin");
+		await fs.mkdir(bunDir);
+		await fs.symlink(process.execPath, path.join(bunDir, "bun"));
+		const result = await $`${process.execPath} ${cli} worktree add --detach ${worktree} HEAD`
+			.cwd(repo)
+			.env({ ...process.env, PATH: bunDir })
+			.quiet()
+			.nothrow();
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr.toString()).toContain("warning:");
+		expect((await fs.stat(worktree)).isDirectory()).toBe(true);
+	});
+
 	it("preserves a refusing hook's failure status and stderr", async () => {
 		await hook("echo checkout-refused >&2; exit 17");
 		const { result } = await add("refused");
