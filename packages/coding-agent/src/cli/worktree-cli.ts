@@ -165,7 +165,6 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	const hook = await runPostCheckoutHook(worktreePath, commit.sha, { output: "inherit" });
 	if (hook.status === "failed") process.exitCode = hook.exitCode;
 	else if (hook.status === "error") {
-		process.exitCode = 1;
 		console.error(chalk.dim(`warning: ${formatPostCheckoutHookWarning(hook)}`));
 	}
 }

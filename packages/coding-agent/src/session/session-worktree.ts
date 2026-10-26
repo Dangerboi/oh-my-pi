@@ -76,12 +76,12 @@ export function defaultSessionWorktreeBranch(now = new Date()): string {
 	return `wt/${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 }
 
-/** One-line confirmation shown after the session moved into `worktree`. */
 /** Notice shown with a hook warning: the source checkout is not cleaned. */
 export function formatHookWarningNotice(worktree: SessionWorktree): string {
 	return `Worktree created, but ${worktree.hookWarning}. The source checkout was left as it is.`;
 }
 
+/** One-line confirmation shown after the session moved into `worktree`. */
 export function formatSessionWorktreeSummary(worktree: SessionWorktree, sourceCleaned = false): string {
 	const how =
 		worktree.clonedWith === undefined ? "checked out" : `cloned via ${formatIsolationBackend(worktree.clonedWith)}`;

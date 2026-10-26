@@ -36,7 +36,11 @@ function tail(text: string): string {
 	return text.length > HOOK_OUTPUT_TAIL_CHARS ? text.slice(-HOOK_OUTPUT_TAIL_CHARS) : text;
 }
 
-/** Forward a pipe to `process.stderr` chunk by chunk until it closes or `stop` settles. */
+/**
+ * Forward a pipe to `process.stderr` chunk by chunk until it closes or `stop` settles.
+ * Live forwarding needs a manual reader loop; `inherit` is only used by the standalone
+ * `omp worktree add` CLI, where `process.stderr` is the output sink.
+ */
 async function forward(stream: ReadableStream<Uint8Array>, stop: Promise<void>): Promise<void> {
 	const reader = stream.getReader();
 	void stop.then(() => reader.cancel().catch(() => {}));
@@ -67,11 +71,11 @@ export async function runPostCheckoutHook(
 				env: filterChildShellEnv(process.env, worktreeRoot),
 				detached: true,
 				signal,
-				exitGraceMs: HOOK_EXIT_GRACE_MS,
+				exitGraceMs: output === "capture" ? HOOK_EXIT_GRACE_MS : undefined,
 				stderr: output === "inherit" ? "full" : undefined,
 			},
 		);
-		if (output === "inherit") return await inheritOutput(child, signal);
+		if (output === "inherit") return await inheritOutput(child);
 		const result = await child.wait({ allowNonZero: true, allowAbort: true });
 		if (result.exitError?.aborted) return { status: "cancelled" };
 		if (result.ok) return { status: "ok" };
@@ -86,10 +90,7 @@ export async function runPostCheckoutHook(
 	}
 }
 
-async function inheritOutput(
-	child: ptree.ChildProcess,
-	signal: AbortSignal | undefined,
-): Promise<PostCheckoutHookResult> {
+async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHookResult> {
 	const { promise: stop, resolve: cut } = Promise.withResolvers<void>();
 	const pumps = Promise.all([forward(child.stdout, stop), child.stderr ? forward(child.stderr, stop) : undefined]);
 	let aborted = false;
@@ -104,7 +105,7 @@ async function inheritOutput(
 	await pumps;
 	clearTimeout(timer);
 	cut();
-	if (aborted || signal?.aborted) return { status: "cancelled" };
+	if (aborted) return { status: "cancelled" };
 	const exitCode = child.exitCode ?? -1;
 	return exitCode === 0 ? { status: "ok" } : { status: "failed", exitCode, output: "" };
 }
