@@ -23,8 +23,10 @@ export interface PostCheckoutHookOptions {
 	output?: "capture" | "inherit";
 	/**
 	 * Kills the hook's process group on POSIX (native tree kill on Windows). A descendant that
-	 * `setsid`s into its own session is not reached; git does not reach it either. An
-	 * already-aborted signal skips the hook.
+	 * `setsid`s into its own session is not reached; git does not reach it either. On Windows,
+	 * Git runs hooks through MSYS `sh`, whose child processes have no living Windows parent, so
+	 * the tree kill ends git and the call returns, but commands the hook started keep running.
+	 * An already-aborted signal skips the hook.
 	 */
 	signal?: AbortSignal;
 }

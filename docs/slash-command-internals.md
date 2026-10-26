@@ -407,6 +407,10 @@ session still moves into it; the output is `Worktree created, but
 post-checkout hook exited with <N>: <last line>` (or `... cancelled`), and
 `worktree.cleanSource` is skipped so the source checkout is left as it is.
 Without a `git` executable no hook runs and nothing is reported.
+Cancelling stops the hook's process group (on Windows, its process tree). On
+Windows, Git runs hooks through MSYS `sh`, and the commands that shell starts
+are out of reach of the tree kill: `/wt` returns with the cancelled warning, but
+those commands keep running until they finish.
 About 250 ms after git's hook process exits, `/wt` (and `pr_checkout`) stop
 reading pipes a background process started by the hook still holds. That process
 keeps running, but its later writes to stdout/stderr fail with EPIPE.

@@ -157,7 +157,7 @@ Worktree and metadata behavior:
   - `branch.pr-<number>.ompPrMaintainerCanModify`
 - When no matching worktree exists, an existing `refs/heads/pr-<number>` at a different commit fails unless `force=true`, which resets the branch to the fetched head.
 - An existing matching worktree is reused with `reused: true`; the remote is fetched and push metadata refreshed, but its local branch is not reset, even with `force=true`.
-- The `post-checkout` hook runs only for a newly created worktree, with the new branch commit as head, after `withRepoLock()` returns (a slow hook never blocks other git operations on the repository) and with the tool's abort signal. A failing hook keeps the worktree and adds a `Warning: post-checkout hook exited with <N>: <last line>` line to the result text. Aborting during the hook rejects the call as aborted and keeps the worktree. A reused worktree does not rerun the hook. A concurrent `pr_checkout` of the same PR in the same process waits for the running hook before returning and reports its warning.
+- The `post-checkout` hook runs only for a newly created worktree, with the new branch commit as head, after `withRepoLock()` returns (a slow hook never blocks other git operations on the repository) and with the tool's abort signal. A failing hook keeps the worktree and adds a `Warning: post-checkout hook exited with <N>: <last line>` line to the result text. Aborting during the hook rejects the call as aborted and keeps the worktree; on Windows, commands the hook's MSYS shell started keep running (the tree kill can't reach them). A reused worktree does not rerun the hook. A concurrent `pr_checkout` of the same PR in the same process waits for the running hook before returning and reports its warning.
 
 ### `pr_push`
 
