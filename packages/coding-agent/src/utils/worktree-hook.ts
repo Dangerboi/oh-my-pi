@@ -69,7 +69,9 @@ export async function runPostCheckoutHook(
 			{
 				cwd: worktreeRoot,
 				env: filterChildShellEnv(process.env, worktreeRoot),
-				detached: true,
+				// Capture mode gets its own process group so an abort kills the whole hook tree. Inherit mode
+				// (`omp worktree add`, no signal) stays in omp's group so the terminal's Ctrl-C reaches the hook, as with git.
+				detached: output !== "inherit",
 				signal,
 				exitGraceMs: HOOK_EXIT_GRACE_MS,
 				stderr: output === "inherit" ? "full" : undefined,

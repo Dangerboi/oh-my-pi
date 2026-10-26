@@ -83,4 +83,57 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 			}
 		}
 	}, 15_000);
+
+	// Real child processes and signals: the polls below wait on OS state, which fake timers cannot drive.
+	it("stops the hook when the terminal's process group receives Ctrl-C", async () => {
+		const pidFile = path.join(root, "hook.pid");
+		await hook(`echo $$ > "${pidFile}"\nsleep 30`);
+		const child = Bun.spawn(["bun", cli, "worktree", "add", "--detach", path.join(root, "interrupted"), "HEAD"], {
+			cwd: repo,
+			detached: true,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		let pid = Number.NaN;
+		try {
+			const pollDeadline = Date.now() + 10_000;
+			while (Date.now() < pollDeadline && !Number.isInteger(pid)) {
+				const text = await Bun.file(pidFile)
+					.text()
+					.catch(() => "");
+				const parsed = Number.parseInt(text, 10);
+				if (Number.isInteger(parsed)) pid = parsed;
+				else await Bun.sleep(50);
+			}
+			expect(Number.isInteger(pid)).toBe(true);
+
+			process.kill(-child.pid, "SIGINT");
+
+			const alive = () => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			const goneDeadline = Date.now() + 5_000;
+			while (Date.now() < goneDeadline && alive()) await Bun.sleep(50);
+			expect(alive()).toBe(false);
+		} finally {
+			if (Number.isInteger(pid)) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+			try {
+				process.kill(-child.pid, "SIGKILL");
+			} catch {
+				// Group already gone.
+			}
+		}
+	}, 20_000);
 });
