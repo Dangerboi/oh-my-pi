@@ -129,11 +129,13 @@ async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHoo
 	const pumps = Promise.all([forward(child.stdout, stop), child.stderr ? forward(child.stderr, stop) : undefined]);
 	let aborted = false;
 	let failure: unknown;
+	let exitCode: number | undefined;
 	try {
-		await child.exited;
+		exitCode = await child.exited;
 	} catch (error) {
 		if (!(error instanceof ptree.Exception)) failure = error;
-		else aborted = error.aborted;
+		else if (error.aborted) aborted = true;
+		else exitCode = error.exitCode;
 	}
 	// ptree's own grace releases its readers; this timer only cancels the forwarding reads
 	// a background process still holds.
@@ -146,8 +148,8 @@ async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHoo
 	}
 	if (failure !== undefined) throw failure;
 	if (aborted) return { status: "cancelled" };
-	const exitCode = child.exitCode ?? -1;
-	return exitCode === 0 ? { status: "ok" } : { status: "failed", exitCode, output: "" };
+	const status = exitCode ?? child.exitCode ?? -1;
+	return status === 0 ? { status: "ok" } : { status: "failed", exitCode: status, output: "" };
 }
 
 /** One-line, display-ready warning for a hook result, or undefined when nothing went wrong. */
