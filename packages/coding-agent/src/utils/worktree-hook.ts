@@ -1,0 +1,94 @@
+/**
+ * Runs a new linked worktree's `post-checkout` hook the way `git worktree add`
+ * does: git's new-worktree arguments (null old HEAD, new HEAD, branch flag `1`),
+ * with the worktree as working directory. Git decides whether a hook exists.
+ *
+ * A failed or cancelled hook never discards anything; callers keep the worktree
+ * and surface {@link formatPostCheckoutHookWarning}.
+ */
+import { filterChildShellEnv, ptree, sanitizeText } from "@oh-my-pi/pi-utils";
+import { sanitizeDisplayWarning, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
+
+/** After git's hook process exits, stop waiting on pipes a background process still holds. */
+const HOOK_EXIT_GRACE_MS = 250;
+/** Captured output kept per stream; only the last line is ever shown. */
+const HOOK_OUTPUT_TAIL_CHARS = 4096;
+
+export interface PostCheckoutHookOptions {
+	/**
+	 * `capture` keeps a bounded tail of the hook's output for the warning.
+	 * (A later mode forwards the output live to the terminal.)
+	 */
+	output?: "capture";
+	/** Stops the hook's whole process tree. An already-aborted signal skips the hook. */
+	signal?: AbortSignal;
+}
+
+export type PostCheckoutHookResult =
+	| { status: "ok" }
+	| { status: "failed"; exitCode: number; output: string }
+	| { status: "cancelled" }
+	/** Git could not run the hook at all (spawn failure); `message` is git's or the OS's own text. */
+	| { status: "error"; message: string };
+
+function tail(text: string): string {
+	return text.length > HOOK_OUTPUT_TAIL_CHARS ? text.slice(-HOOK_OUTPUT_TAIL_CHARS) : text;
+}
+
+/** Run `post-checkout` for a worktree just created at `worktreeRoot` whose HEAD is `head`. */
+export async function runPostCheckoutHook(
+	worktreeRoot: string,
+	head: string,
+	options: PostCheckoutHookOptions = {},
+): Promise<PostCheckoutHookResult> {
+	const { signal } = options;
+	if (signal?.aborted) return { status: "cancelled" };
+	try {
+		const child = ptree.spawn(
+			["git", "hook", "run", "--ignore-missing", "post-checkout", "--", "0".repeat(head.length), head, "1"],
+			{
+				cwd: worktreeRoot,
+				env: filterChildShellEnv(process.env, worktreeRoot),
+				detached: true,
+				signal,
+				exitGraceMs: HOOK_EXIT_GRACE_MS,
+			},
+		);
+		const result = await child.wait({ allowNonZero: true, allowAbort: true });
+		if (result.exitError?.aborted) return { status: "cancelled" };
+		if (result.ok) return { status: "ok" };
+		return {
+			status: "failed",
+			exitCode: result.exitCode ?? -1,
+			output: `${tail(result.stdout)}\n${tail(result.stderr)}`,
+		};
+	} catch (error) {
+		if (signal?.aborted) return { status: "cancelled" };
+		return { status: "error", message: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+/** One-line, display-ready warning for a hook result, or undefined when nothing went wrong. */
+export function formatPostCheckoutHookWarning(result: PostCheckoutHookResult): string | undefined {
+	let text: string;
+	switch (result.status) {
+		case "ok":
+			return undefined;
+		case "cancelled":
+			text = "post-checkout hook cancelled";
+			break;
+		case "error":
+			text = `post-checkout hook could not run: ${result.message}`;
+			break;
+		case "failed": {
+			const last = sanitizeText(result.output)
+				.split("\n")
+				.map(line => line.trim())
+				.filter(Boolean)
+				.at(-1);
+			text = `post-checkout hook exited with ${result.exitCode}${last ? `: ${last}` : ""}`;
+			break;
+		}
+	}
+	return truncateToWidth(sanitizeDisplayWarning(text), TRUNCATE_LENGTHS.LONG);
+}

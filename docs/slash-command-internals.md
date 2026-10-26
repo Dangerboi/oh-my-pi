@@ -398,6 +398,16 @@ unsaved checkpoint therefore leaves neither a new directory nor a moved session.
 The `/wt` gate is acquired before creating a branch or checkout and remains held
 through session relocation and configured source cleanup, so a busy refusal does
 not leave an unused worktree.
+After the checkout, `/wt` runs the new worktree's `post-checkout` hook the way
+`git worktree add` does (`git hook run --ignore-missing post-checkout`, git's
+new-worktree arguments, worktree as working directory, repository-location
+variables such as `GIT_DIR` removed from the environment). A hook that fails,
+or is cancelled through the ACP prompt signal, keeps the worktree and the
+session still moves into it; the output is `Worktree created, but
+post-checkout hook exited with <N>: <last line>` (or `... cancelled`), and
+`worktree.cleanSource` is skipped so the source checkout is left as it is.
+Once git's hook process exits, `/wt` stops waiting on pipes a background process
+started by the hook still holds.
 The `!cd` guard runs before shell execution and remains held through cwd adoption
 or rollback, so a refused command cannot leave the shell in a different directory.
 Cancelled pickers, invalid destinations, and failed moves retain the BTW conversation.

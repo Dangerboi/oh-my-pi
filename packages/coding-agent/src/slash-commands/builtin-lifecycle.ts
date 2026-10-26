@@ -16,6 +16,7 @@ import {
 	cleanSourceCheckoutIfConfigured,
 	createSessionWorktree,
 	defaultSessionWorktreeBranch,
+	formatHookWarningNotice,
 	formatSessionWorktreeSummary,
 	type SessionWorktree,
 } from "../session/session-worktree";
@@ -759,13 +760,16 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			const sourceCwd = runtime.sessionManager.getCwd();
 			let worktree: SessionWorktree;
 			try {
-				worktree = await createSessionWorktree(sourceCwd, runtime.settings, branch);
+				worktree = await createSessionWorktree(sourceCwd, runtime.settings, branch, { signal: runtime.signal });
 			} catch (err) {
 				return usage(`Worktree creation failed: ${errorMessage(err)}`, runtime);
 			}
 			const failure = await relocateHeadlessSession(runtime, worktree.path);
 			if (failure) return failure;
-			const cleanup = await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings);
+			if (worktree.hookWarning) await runtime.output(`Warning: ${formatHookWarningNotice(worktree)}`);
+			const cleanup = worktree.hookWarning
+				? { cleaned: false, errorMessage: undefined }
+				: await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings);
 			if (cleanup.errorMessage !== undefined) {
 				await runtime.output(
 					`Warning: Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`,

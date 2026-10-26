@@ -71,6 +71,7 @@ import {
 	cleanSourceCheckoutIfConfigured,
 	createSessionWorktree,
 	defaultSessionWorktreeBranch,
+	formatHookWarningNotice,
 	formatSessionWorktreeSummary,
 	type SessionWorktree,
 } from "../../session/session-worktree";
@@ -1750,7 +1751,8 @@ export class CommandController {
 			}
 			if (!(await this.#relocateSession(worktree.path))) return false;
 			created = worktree;
-			const cleanup = worktree.keptChanges
+			if (worktree.hookWarning) this.ctx.showWarning(formatHookWarningNotice(worktree));
+			const cleanup = worktree.keptChanges && !worktree.hookWarning
 				? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
 				: { cleaned: false, errorMessage: undefined };
 			if (cleanup.errorMessage !== undefined) {

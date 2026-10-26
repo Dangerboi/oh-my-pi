@@ -190,6 +190,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	/** Readers of piped stdio; the timeout cancels them so pending reads settle. */
 	#pipeReaders = new Set<{ cancel(reason?: unknown): Promise<void> }>();
 	#timeoutTimer?: NodeJS.Timeout;
+	#exitGraceMs = 0;
 	#stderrStream?: ReadableStream<Uint8Array>;
 	// Termination in flight after kill(); aborted exits await it before reporting.
 	#terminating?: Promise<boolean | void>;
@@ -252,6 +253,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		proc.exited
 			.catch(() => null)
 			.then(async exitCode => {
+				this.#startExitGrace();
 				if (this.#exitReasonPending) {
 					this.#exitReason = this.#exitReasonPending;
 					reject(this.#exitReasonPending);
@@ -620,11 +622,30 @@ export class ChildProcess<In extends InMask = InMask> {
 			) {
 				this.kill(new TimeoutError(ms, this.#stderrTail), -1);
 			}
-			this.#cutoff = true;
-			for (const reader of this.#pipeReaders) reader.cancel().catch(() => {});
+			this.#cutOffPipes();
 		}, ms);
 		timer.unref?.();
 		this.#timeoutTimer = timer;
+	}
+
+	/**
+	 * Once the root process has exited, stop reading its pipes after `ms`. A
+	 * descendant that kept stdout/stderr open no longer holds the readers; it
+	 * is not killed and gets EPIPE on later writes.
+	 */
+	attachExitGrace(ms: number): void {
+		if (ms > 0) this.#exitGraceMs = ms;
+	}
+
+	#startExitGrace(): void {
+		if (this.#exitGraceMs <= 0) return;
+		const timer = setTimeout(() => this.#cutOffPipes(), this.#exitGraceMs);
+		timer.unref?.();
+	}
+
+	#cutOffPipes(): void {
+		this.#cutoff = true;
+		for (const reader of this.#pipeReaders) reader.cancel().catch(() => {});
 	}
 
 	[Symbol.dispose](): void {
@@ -651,6 +672,12 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	subreaper?: boolean;
 	/** Expose and retain complete stderr for a later `wait({ stderr: "full" })`. */
 	stderr?: "full" | null;
+	/**
+	 * Opt-in: once the root process exits, stop reading stdout/stderr after this
+	 * many milliseconds even if a descendant still holds the pipes open. Kills
+	 * nothing; the descendant gets EPIPE on later writes.
+	 */
+	exitGraceMs?: number;
 };
 
 function spawnInternal<In extends InMask = InMask>(
@@ -658,7 +685,7 @@ function spawnInternal<In extends InMask = InMask>(
 	opts: ChildSpawnOptions<In> | undefined,
 	retainFullStderr: boolean,
 ): ChildProcess<In> {
-	const { timeout = -1, signal, stderr, detached, subreaper = false, ...rest } = opts ?? {};
+	const { timeout = -1, signal, stderr, detached, subreaper = false, exitGraceMs = 0, ...rest } = opts ?? {};
 	const useSubreaper = subreaper && process.platform === "linux";
 	const commandEnv = rest.env ?? Bun.env;
 	const child = Bun.spawn(useSubreaper ? [process.execPath, "-e", LINUX_SUBREAPER_SCRIPT] : cmd, {
@@ -680,6 +707,7 @@ function spawnInternal<In extends InMask = InMask>(
 	const cp = new ChildProcess(child, stderr === "full", retainFullStderr, detached === true, useSubreaper);
 	if (signal) cp.attachSignal(signal);
 	if (timeout > 0) cp.attachTimeout(timeout);
+	cp.attachExitGrace(exitGraceMs);
 	return cp;
 }
 

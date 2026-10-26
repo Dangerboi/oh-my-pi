@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added an opt-in `exitGraceMs` spawn option to `ptree` that stops reading stdout/stderr a short time after the root process exits, so a descendant holding the pipes open no longer blocks `wait()`; it kills nothing
 - Added an optional `maxFractionDigits` to `formatNumber()` that caps decimals on values below 1,000 ([#16973](https://github.com/can1357/oh-my-pi/pull/16973) by [@DusKing1](https://github.com/DusKing1))
 
 ## [18.13.0] - 2026-10-26

@@ -17,10 +17,13 @@ import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { Settings } from "../config/settings";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 import { resolveAvailableWorktreePath } from "../tools/gh-pr-checkout";
+import { formatPostCheckoutHookWarning, runPostCheckoutHook } from "../utils/worktree-hook";
 
 import { cfgIsolationBackend, cfgWorktreeCleanSource, cfgWorktreeClone } from "../task/settings";
 
 export interface SessionWorktree {
+	/** Display-ready warning when the `post-checkout` hook failed or was cancelled; the worktree is kept. */
+	hookWarning?: string;
 	/** Absolute, realpath'd worktree root. */
 	path: string;
 	/** Branch checked out in the worktree (created from the source `HEAD`). */
@@ -74,6 +77,11 @@ export function defaultSessionWorktreeBranch(now = new Date()): string {
 }
 
 /** One-line confirmation shown after the session moved into `worktree`. */
+/** Notice shown with a hook warning: the source checkout is not cleaned. */
+export function formatHookWarningNotice(worktree: SessionWorktree): string {
+	return `Worktree created, but ${worktree.hookWarning}. The source checkout was left as it is.`;
+}
+
 export function formatSessionWorktreeSummary(worktree: SessionWorktree, sourceCleaned = false): string {
 	const how =
 		worktree.clonedWith === undefined ? "checked out" : `cloned via ${formatIsolationBackend(worktree.clonedWith)}`;
@@ -110,14 +118,16 @@ export async function cleanSourceCheckoutIfConfigured(
 	}
 }
 /**
- * Create the worktree for `/wt`. Throws with a user-facing message when `cwd`
+ * Create the worktree for `/wt` and run its `post-checkout` hook like
+ * `git worktree add`; a failed or cancelled hook is reported in `hookWarning`
+ * and keeps the worktree. Throws with a user-facing message when `cwd`
  * is not a git checkout, `branch` already exists, or git refuses.
  */
 export async function createSessionWorktree(
 	cwd: string,
 	settings: Settings,
 	branch: string,
-	options: { keepChanges?: boolean } = {},
+	options: { keepChanges?: boolean; signal?: AbortSignal } = {},
 ): Promise<SessionWorktree> {
 	const keepChanges = options.keepChanges ?? true;
 	try {
@@ -153,8 +163,13 @@ export async function createSessionWorktree(
 		backend: parseIsolationBackend(cfgIsolationBackend.get(settings)),
 		keepChanges,
 	});
+	const realPath = await fs.realpath(worktreePath);
+	const hookWarning = formatPostCheckoutHookWarning(
+		await runPostCheckoutHook(realPath, baseCommit, { signal: options.signal }),
+	);
 	return {
-		path: await fs.realpath(worktreePath),
+		path: realPath,
+		hookWarning,
 		branch,
 		clonedWith: result.clonedWith ?? undefined,
 		cloneError: result.cloneError ?? undefined,
