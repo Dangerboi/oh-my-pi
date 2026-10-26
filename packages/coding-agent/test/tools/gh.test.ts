@@ -1398,6 +1398,60 @@ echo ok
 			expect(reused.filter(Boolean)).toHaveLength(1);
 		}, 30_000);
 
+		it("hands a reusing checkout the first hook's warning even when the hook finishes while it is inside the lock", async () => {
+			const started = path.join(fixture.baseDir, "hook-started");
+			const release = path.join(fixture.baseDir, "hook-release");
+			await installHook(
+				`touch "${started}"\nwhile [ ! -f "${release}" ]; do sleep 0.02; done\necho "boom: nope" >&2\nexit 7`,
+			);
+			mockPr(306);
+			mockPr(306);
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const first = tool.execute("pr-checkout-a", { op: "pr_checkout", pr: "306" });
+			const deadline = Date.now() + 15_000;
+			while (!(await Bun.file(started).exists())) {
+				if (Date.now() > deadline) throw new Error("hook never started");
+				// A real child process signals readiness only through the filesystem; there is no event to await.
+				await Bun.sleep(25);
+			}
+
+			// Hold the second call inside its lock section, at its fetch, until the first hook has finished.
+			const { promise: gate, resolve: openGate } = Promise.withResolvers<void>();
+			const { promise: insideLock, resolve: markInsideLock } = Promise.withResolvers<void>();
+			const realRequireGit = vcs.requireGit;
+			const requireGitSpy = vi.spyOn(vcs, "requireGit").mockImplementation(root => {
+				const repo = realRequireGit(root);
+				return new Proxy(repo, {
+					get(target, prop) {
+						const value = Reflect.get(target, prop, target);
+						if (prop !== "fetch") return typeof value === "function" ? value.bind(target) : value;
+						return async (...args: unknown[]) => {
+							markInsideLock();
+							await gate;
+							return (value as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+						};
+					},
+				});
+			});
+			try {
+				const second = tool.execute("pr-checkout-b", { op: "pr_checkout", pr: "306" });
+				await insideLock;
+				await fs.writeFile(release, "");
+				const firstResult = await first;
+				openGate();
+				const secondResult = await second;
+
+				const textOf = (result: typeof firstResult) =>
+					result.content[0]?.type === "text" ? result.content[0].text : "";
+				expect(secondResult.details?.checkouts?.[0]?.reused).toBe(true);
+				expect(textOf(firstResult)).toContain("post-checkout hook exited with 7");
+				expect(textOf(secondResult)).toContain("post-checkout hook exited with 7");
+			} finally {
+				openGate();
+				requireGitSpy.mockRestore();
+			}
+		}, 30_000);
+
 		it("does not hold the repo lock while the hook runs", async () => {
 			const started = path.join(fixture.baseDir, "hook-started");
 			await installHook(`touch "${started}"\nsleep 30`);

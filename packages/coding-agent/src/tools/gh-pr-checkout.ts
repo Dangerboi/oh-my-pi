@@ -456,6 +456,11 @@ export async function checkoutPullRequest(
 			const repository = vcs.requireGit(repoRoot);
 			const existingWorktrees = await repository.worktrees(signal);
 			const existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
+			// Snapshot now: the creating call's hook may finish and drop its map
+			// entry while this call is still fetching or writing config.
+			const pendingHook = existingWorktree
+				? inFlightHooks.get(await fs.realpath(existingWorktree.path))
+				: undefined;
 
 			const remote = await ensurePrRemoteWithRepo(repoRoot, data, repository, signal);
 			await repository.fetch(
@@ -556,20 +561,19 @@ export async function checkoutPullRequest(
 				reused: Boolean(existingWorktree),
 				clonedWith,
 			};
-			return { outcome, hook };
+			return { outcome, hook, pendingHook };
 		},
 		signal,
 	);
 
 	// Runs after the repo lock is released so a slow hook never blocks other
 	// git operations on this repository. Only a newly created worktree runs it.
-	const { outcome, hook } = locked;
+	const { outcome, hook, pendingHook } = locked;
 	if (!hook) {
 		// A reused worktree may still be initializing in a concurrent call.
-		const pending = inFlightHooks.get(outcome.worktreePath);
-		if (!pending) return outcome;
+		if (!pendingHook) return outcome;
 		try {
-			return { ...outcome, warning: await untilAborted(signal, pending) };
+			return { ...outcome, warning: await untilAborted(signal, pendingHook) };
 		} catch (error) {
 			throwIfAborted(signal);
 			throw error;
