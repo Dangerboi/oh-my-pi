@@ -58,7 +58,7 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		withBtwSessionMove,
 		updateEditorBorderColor: vi.fn(),
 		reloadTodos: vi.fn(async () => {}),
-		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), setFocus: vi.fn() },
+		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), setFocus: vi.fn(), getFocused: vi.fn(() => editor) },
 		statusContainer: new Container(),
 		editor,
 		editorContainer,
@@ -178,6 +178,27 @@ describe("CommandController /move", () => {
 			expect(ctx.session.moveSession).not.toHaveBeenCalled();
 			expect(ctx.editorContainer.children).toEqual([ctx.editor]);
 			expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("Branch already exists"));
+		} finally {
+			await fs.rm(sourceDir, { recursive: true, force: true });
+		}
+	});
+
+	it("leaves a dialog that replaced the loader in place and focused", async () => {
+		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-dialog-"));
+		try {
+			const { ctx } = createMoveContext(sourceDir);
+			const dialog = new Container();
+			vi.spyOn(sessionWorktree, "createSessionWorktree").mockImplementation(async () => {
+				ctx.editorContainer.clear();
+				ctx.editorContainer.addChild(dialog);
+				ctx.ui.setFocus(dialog);
+				throw new Error("boom");
+			});
+			await new CommandController(ctx).handleWorktreeCommand("feature");
+
+			expect(ctx.editorContainer.children).toEqual([dialog]);
+			const focused = (ctx.ui.setFocus as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0]);
+			expect(focused.at(-1)).toBe(dialog);
 		} finally {
 			await fs.rm(sourceDir, { recursive: true, force: true });
 		}
