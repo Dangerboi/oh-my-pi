@@ -8,6 +8,7 @@ import { getWorktreeDir, hashPath, isEnoent, logger, slugify } from "@oh-my-pi/p
 import { github } from "../utils/github";
 import { formatIsolationBackend, parseIsolationBackend } from "../task/worktree";
 import { withRepoLock } from "../utils/repo-lock";
+import { formatPostCheckoutHookWarning, runPostCheckoutHook } from "../utils/worktree-hook";
 import type { ToolSession } from ".";
 import type { GhPrCheckoutSummary, GhToolDetails } from "@oh-my-pi/pi-tui/tools/github";
 import {
@@ -256,8 +257,9 @@ export function formatPrCheckoutResult(options: {
 	remoteUrl: string;
 	reused: boolean;
 	clonedWith?: IsoBackendKind;
+	warning?: string;
 }): string {
-	const { data, localBranch, worktreePath, remoteName, remoteUrl, reused, clonedWith } = options;
+	const { data, localBranch, worktreePath, remoteName, remoteUrl, reused, clonedWith, warning } = options;
 	const lines: string[] = [
 		reused ? `# Pull Request #${data.number ?? "?"} Worktree` : `# Checked Out Pull Request #${data.number ?? "?"}`,
 		"",
@@ -276,6 +278,7 @@ export function formatPrCheckoutResult(options: {
 	pushLine(lines, "Remote URL", remoteUrl);
 	pushLine(lines, "Cross repository", data.isCrossRepository);
 	pushLine(lines, "Maintainer can modify", data.maintainerCanModify);
+	pushLine(lines, "Warning", warning);
 	lines.push("");
 	lines.push(
 		reused
@@ -392,6 +395,8 @@ export interface PrCheckoutOutcome {
 	headRefName: string;
 	reused: boolean;
 	clonedWith?: IsoBackendKind;
+	/** Display-ready post-checkout hook warning; set only when the hook failed. */
+	warning?: string;
 }
 
 export async function checkoutPullRequest(
@@ -431,7 +436,7 @@ export async function checkoutPullRequest(
 	// races and surface "could not lock config file" / "Another git process
 	// seems to be running" errors. The gh API call above stays outside the
 	// lock so multiple checkouts can fetch PR metadata in parallel.
-	return withRepoLock(
+	const locked = await withRepoLock(
 		repoRoot,
 		async () => {
 			const repository = vcs.requireGit(repoRoot);
@@ -513,7 +518,12 @@ export async function checkoutPullRequest(
 			}
 			const resolvedWorktreePath = await fs.realpath(finalWorktreePath);
 
-			return {
+			// The new worktree's HEAD is the local PR branch, so hand that exact commit to the hook.
+			const headOid = existingWorktree
+				? undefined
+				: await repository.resolveRef(toLocalBranchRef(localBranch), signal);
+
+			const outcome: PrCheckoutOutcome = {
 				data,
 				localBranch,
 				worktreePath: resolvedWorktreePath,
@@ -523,9 +533,18 @@ export async function checkoutPullRequest(
 				reused: Boolean(existingWorktree),
 				clonedWith,
 			};
+			return { outcome, headOid };
 		},
 		signal,
 	);
+
+	// Runs after the repo lock is released so a slow hook never blocks other
+	// git operations on this repository. Only a newly created worktree gets it.
+	const { outcome, headOid } = locked;
+	if (outcome.reused || !headOid) return outcome;
+	const hookResult = await runPostCheckoutHook(outcome.worktreePath, headOid, { signal });
+	if (hookResult.status === "cancelled") throwIfAborted(signal);
+	return { ...outcome, warning: formatPostCheckoutHookWarning(hookResult) };
 }
 
 export function outcomeToSummary(outcome: PrCheckoutOutcome): GhPrCheckoutSummary {

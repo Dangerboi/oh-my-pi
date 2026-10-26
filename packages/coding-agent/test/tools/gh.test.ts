@@ -1296,6 +1296,116 @@ echo ok
 		}
 	});
 
+	describe("pr_checkout post-checkout hook", () => {
+		let fixture: PrFixture;
+		let tempHome: TempHome;
+		let hookLog: string;
+		beforeAll(async () => {
+			tempHome = await setupTempHome();
+		});
+		afterAll(async () => {
+			await tempHome.cleanup();
+		});
+		beforeEach(async () => {
+			fixture = await createPrFixture();
+			hookLog = path.join(fixture.baseDir, "hook.log");
+		});
+		afterEach(async () => {
+			await removeWithRetries(fixture.baseDir);
+		});
+
+		async function installHook(body: string): Promise<void> {
+			const hookPath = path.join(fixture.repoRoot, ".git", "hooks", "post-checkout");
+			await fs.mkdir(path.dirname(hookPath), { recursive: true });
+			await fs.writeFile(hookPath, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+		}
+
+		function mockPr(number: number): void {
+			vi.spyOn(github, "json").mockResolvedValueOnce({
+				number,
+				title: `PR ${number}`,
+				url: `https://github.com/owner/repo/pull/${number}`,
+				baseRefName: "main",
+				headRefName: fixture.headRefName,
+				headRefOid: fixture.headRefOid,
+				isCrossRepository: false,
+				maintainerCanModify: true,
+			});
+		}
+
+		async function readHookLines(): Promise<string[]> {
+			const text = await Bun.file(hookLog)
+				.text()
+				.catch(() => "");
+			return text.split("\n").filter(Boolean);
+		}
+
+		it("runs the hook in a new PR worktree with the PR head", async () => {
+			await installHook(`echo "$(pwd -P)|$1|$2|$3" >> "${hookLog}"`);
+			mockPr(301);
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const result = await tool.execute("pr-checkout", { op: "pr_checkout", pr: "301" });
+			const worktree = result.details?.checkouts?.[0]?.worktreePath ?? "";
+			const zeros = "0".repeat(fixture.headRefOid.length);
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+			expect(await readHookLines()).toContain(`${worktree}|${zeros}|${fixture.headRefOid}|1`);
+			expect(text).not.toContain("Warning:");
+		}, 30_000);
+
+		it("does not run the hook when the PR worktree is reused", async () => {
+			await installHook(`echo "$(pwd -P)|$2" >> "${hookLog}"`);
+			mockPr(302);
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			await tool.execute("pr-checkout", { op: "pr_checkout", pr: "302" });
+			const afterFirst = await readHookLines();
+			expect(afterFirst.length).toBeGreaterThan(0);
+
+			mockPr(302);
+			const second = await tool.execute("pr-checkout", { op: "pr_checkout", pr: "302" });
+
+			expect(second.details?.checkouts?.[0]?.reused).toBe(true);
+			expect(await readHookLines()).toEqual(afterFirst);
+		}, 30_000);
+
+		it("reports a failing hook as a warning in the result text", async () => {
+			await installHook(`echo "first line" >&2\necho "boom: nope" >&2\nexit 7`);
+			mockPr(303);
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const result = await tool.execute("pr-checkout", { op: "pr_checkout", pr: "303" });
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+			expect(text).toContain("Warning: post-checkout hook exited with 7: boom: nope");
+			expect(result.details?.checkouts?.[0]?.reused).toBe(false);
+		}, 30_000);
+
+		it("does not hold the repo lock while the hook runs", async () => {
+			const started = path.join(fixture.baseDir, "hook-started");
+			await installHook(`touch "${started}"\nsleep 30`);
+			mockPr(304);
+			const abort = new AbortController();
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const settled = tool.execute("pr-checkout", { op: "pr_checkout", pr: "304" }, abort.signal).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			try {
+				const deadline = Date.now() + 15_000;
+				while (!(await Bun.file(started).exists())) {
+					if (Date.now() > deadline) throw new Error("hook never started");
+					// A real child process signals readiness only through the filesystem; there is no event to await.
+					await Bun.sleep(25);
+				}
+				const lockStart = Date.now();
+				await withRepoLock(fixture.repoRoot, async () => undefined);
+				expect(Date.now() - lockStart).toBeLessThan(2_000);
+			} finally {
+				abort.abort();
+				await settled;
+			}
+		}, 30_000);
+	});
+
 	describe("pr_checkout arrays and pr_push metadata", () => {
 		// One mutable fixture covers disjoint branches and worktrees for both contracts.
 		let fixture: PrFixture;
