@@ -74,7 +74,7 @@ export async function runPostCheckoutHook(
 				detached: output !== "inherit",
 				signal,
 				exitGraceMs: HOOK_EXIT_GRACE_MS,
-				stderr: output === "inherit" ? "full" : undefined,
+				stderr: output === "inherit" ? "stream" : undefined,
 			},
 		);
 		if (output === "inherit") return await inheritOutput(child);

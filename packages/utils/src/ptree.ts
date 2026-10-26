@@ -670,8 +670,12 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	 * descendant that creates a new session and reparents to launchd.
 	 */
 	subreaper?: boolean;
-	/** Expose and retain complete stderr for a later `wait({ stderr: "full" })`. */
-	stderr?: "full" | null;
+	/**
+	 * `"full"` exposes `child.stderr` and retains complete stderr for a later `wait({ stderr: "full" })`.
+	 * `"stream"` exposes `child.stderr` only; chunks are not retained, so memory stays bounded
+	 * (the internal tail is still capped) for callers that consume the stream themselves.
+	 */
+	stderr?: "full" | "stream" | null;
 	/**
 	 * Opt-in: once the root process exits, stop reading stdout/stderr after this
 	 * many milliseconds even if a descendant still holds the pipes open. Kills
@@ -704,7 +708,7 @@ function spawnInternal<In extends InMask = InMask>(
 				}
 			: rest.env,
 	});
-	const cp = new ChildProcess(child, stderr === "full", retainFullStderr, detached === true, useSubreaper);
+	const cp = new ChildProcess(child, stderr === "full" || stderr === "stream", retainFullStderr, detached === true, useSubreaper);
 	if (signal) cp.attachSignal(signal);
 	if (timeout > 0) cp.attachTimeout(timeout);
 	cp.attachExitGrace(exitGraceMs);
