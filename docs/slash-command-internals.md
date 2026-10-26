@@ -406,6 +406,7 @@ or is cancelled (Esc in the TUI, or the ACP prompt's cancellation signal), keeps
 session still moves into it; the output is `Worktree created, but
 post-checkout hook exited with <N>: <last line>` (or `... cancelled`), and
 `worktree.cleanSource` is skipped so the source checkout is left as it is.
+Without a `git` executable no hook runs and nothing is reported.
 Once git's hook process exits, `/wt` stops waiting on pipes a background process
 started by the hook still holds. That process keeps running, but its later writes
 to stdout/stderr fail with EPIPE. `pr_checkout` and `omp worktree add` behave the

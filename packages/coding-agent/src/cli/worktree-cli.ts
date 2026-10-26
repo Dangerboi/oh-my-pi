@@ -167,6 +167,9 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	else if (hook.status === "error") {
 		console.error(chalk.dim(`warning: ${formatPostCheckoutHookWarning(hook)}`));
 		process.exitCode = 1;
+	} else if (hook.status === "no-git") {
+		console.error(chalk.dim("warning: post-checkout hook not run: git executable not found"));
+		process.exitCode = 1;
 	}
 }
 

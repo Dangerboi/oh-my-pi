@@ -374,6 +374,24 @@ describe.skipIf(process.platform === "win32")("session worktree post-checkout ho
 		expect(wt.hookWarning).toBe("post-checkout hook exited with 7: boom   bad");
 	});
 
+	it("creates the worktree without a warning when no git executable exists to run the hook", async () => {
+		const bunDir = path.join(root, "bin");
+		await fs.mkdir(bunDir);
+		await fs.symlink(process.execPath, path.join(bunDir, "bun"));
+		const savedPath = process.env.PATH;
+		process.env.PATH = bunDir;
+		procmgr.__resetShellConfigCacheForTests();
+		try {
+			const wt = await create();
+			expect(worktreePaths(repo)).toContain(wt.path);
+			expect(wt.hookWarning).toBeUndefined();
+		} finally {
+			if (savedPath === undefined) delete process.env.PATH;
+			else process.env.PATH = savedPath;
+			procmgr.__resetShellConfigCacheForTests();
+		}
+	});
+
 	it("does not pass omp's GIT_DIR to the hook", async () => {
 		await installHook('printf "%s" "${GIT_DIR-unset}" > hook.out');
 		const ompGitDir = path.join(root, "omp-start-repo", ".git");

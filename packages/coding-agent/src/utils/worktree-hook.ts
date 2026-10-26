@@ -30,7 +30,9 @@ export type PostCheckoutHookResult =
 	| { status: "failed"; exitCode: number; output: string }
 	| { status: "cancelled" }
 	/** Git could not run the hook at all (spawn failure); `message` is git's or the OS's own text. */
-	| { status: "error"; message: string };
+	| { status: "error"; message: string }
+	/** No `git` executable could be found to run the hook; nothing ran and nothing is reported. */
+	| { status: "no-git" };
 
 function tail(text: string): string {
 	return text.length > HOOK_OUTPUT_TAIL_CHARS ? text.slice(-HOOK_OUTPUT_TAIL_CHARS) : text;
@@ -120,6 +122,7 @@ export async function runPostCheckoutHook(
 		};
 	} catch (error) {
 		if (signal?.aborted) return { status: "cancelled" };
+		if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return { status: "no-git" };
 		return { status: "error", message: error instanceof Error ? error.message : String(error) };
 	}
 }
@@ -157,6 +160,7 @@ export function formatPostCheckoutHookWarning(result: PostCheckoutHookResult): s
 	let text: string;
 	switch (result.status) {
 		case "ok":
+		case "no-git":
 			return undefined;
 		case "cancelled":
 			text = "post-checkout hook cancelled";
