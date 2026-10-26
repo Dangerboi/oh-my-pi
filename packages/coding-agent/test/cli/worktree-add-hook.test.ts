@@ -55,4 +55,27 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 		expect(result.exitCode).toBe(17);
 		expect(result.stderr.toString()).toContain("checkout-refused");
 	});
+
+	it("returns promptly with a failing hook's status when it leaves a background process holding its output", async () => {
+		const pidFile = path.join(root, "bg.pid");
+		await hook(`sleep 30 &\necho $! > "${pidFile}"\nexit 3`);
+		try {
+			const started = performance.now();
+			const { worktree, result } = await add("background");
+			const elapsed = performance.now() - started;
+
+			expect(result.exitCode).toBe(3);
+			expect(elapsed).toBeLessThan(10_000);
+			expect((await fs.stat(worktree)).isDirectory()).toBe(true);
+		} finally {
+			const pid = Number.parseInt(await Bun.file(pidFile).text().catch(() => ""), 10);
+			if (Number.isInteger(pid)) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+		}
+	}, 15_000);
 });

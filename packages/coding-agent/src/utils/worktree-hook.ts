@@ -71,7 +71,7 @@ export async function runPostCheckoutHook(
 				env: filterChildShellEnv(process.env, worktreeRoot),
 				detached: true,
 				signal,
-				exitGraceMs: output === "capture" ? HOOK_EXIT_GRACE_MS : undefined,
+				exitGraceMs: HOOK_EXIT_GRACE_MS,
 				stderr: output === "inherit" ? "full" : undefined,
 			},
 		);
@@ -100,7 +100,8 @@ async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHoo
 		if (!(error instanceof ptree.Exception && error.aborted)) throw error;
 		aborted = true;
 	}
-	// Stop reading pipes a background process still holds once the grace period passes.
+	// ptree's own grace releases its readers; this timer only cancels the forwarding reads
+	// a background process still holds.
 	const timer = setTimeout(cut, HOOK_EXIT_GRACE_MS);
 	await pumps;
 	clearTimeout(timer);

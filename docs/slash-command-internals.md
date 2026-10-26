@@ -402,7 +402,7 @@ After the checkout, `/wt` runs the new worktree's `post-checkout` hook the way
 `git worktree add` does (`git hook run --ignore-missing post-checkout`, git's
 new-worktree arguments, worktree as working directory, repository-location
 variables such as `GIT_DIR` removed from the environment). A hook that fails,
-or is cancelled through the ACP prompt signal, keeps the worktree and the
+or is cancelled (Esc in the TUI, or the ACP prompt's cancellation signal), keeps the worktree and the
 session still moves into it; the output is `Worktree created, but
 post-checkout hook exited with <N>: <last line>` (or `... cancelled`), and
 `worktree.cleanSource` is skipped so the source checkout is left as it is.
