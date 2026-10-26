@@ -21,7 +21,11 @@ export interface PostCheckoutHookOptions {
 	 * hook's stdout to stderr) and reports a failure with an empty `output`.
 	 */
 	output?: "capture" | "inherit";
-	/** Stops the hook's whole process tree. An already-aborted signal skips the hook. */
+	/**
+	 * Kills the hook's process group on POSIX (native tree kill on Windows). A descendant that
+	 * `setsid`s into its own session is not reached; git does not reach it either. An
+	 * already-aborted signal skips the hook.
+	 */
 	signal?: AbortSignal;
 }
 
@@ -31,7 +35,7 @@ export type PostCheckoutHookResult =
 	| { status: "cancelled" }
 	/** Git could not run the hook at all (spawn failure); `message` is git's or the OS's own text. */
 	| { status: "error"; message: string }
-	/** No `git` executable could be found to run the hook; nothing ran and nothing is reported. */
+	/** `git` is not on the hook environment's PATH; nothing ran and nothing is reported. Any other spawn failure is `error`. */
 	| { status: "no-git" };
 
 function tail(text: string): string {
@@ -97,12 +101,13 @@ export async function runPostCheckoutHook(
 ): Promise<PostCheckoutHookResult> {
 	const { signal, output = "capture" } = options;
 	if (signal?.aborted) return { status: "cancelled" };
+	const env = hookEnv();
 	try {
 		const child = ptree.spawn(
 			["git", "hook", "run", "--ignore-missing", "post-checkout", "--", "0".repeat(head.length), head, "1"],
 			{
 				cwd: worktreeRoot,
-				env: hookEnv(),
+				env,
 				// Capture mode gets its own process group so an abort kills the whole hook tree. Inherit mode
 				// (`omp worktree add`, no signal) stays in omp's group so the terminal's Ctrl-C reaches the hook, as with git.
 				detached: output !== "inherit",
@@ -122,7 +127,9 @@ export async function runPostCheckoutHook(
 		};
 	} catch (error) {
 		if (signal?.aborted) return { status: "cancelled" };
-		if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return { status: "no-git" };
+		if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" && !Bun.which("git", { PATH: env.PATH ?? "" })) {
+			return { status: "no-git" };
+		}
 		return { status: "error", message: error instanceof Error ? error.message : String(error) };
 	}
 }

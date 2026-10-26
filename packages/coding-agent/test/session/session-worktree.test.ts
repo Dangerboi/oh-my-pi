@@ -16,6 +16,7 @@ import {
 	type SessionWorktreeState,
 	type WorktreeExitAction,
 } from "../../src/session/session-worktree";
+import { runPostCheckoutHook } from "../../src/utils/worktree-hook";
 
 const clean: SessionWorktreeState = { dirty: false, moved: false, offBranch: false };
 
@@ -390,6 +391,11 @@ describe.skipIf(process.platform === "win32")("session worktree post-checkout ho
 			else process.env.PATH = savedPath;
 			procmgr.__resetShellConfigCacheForTests();
 		}
+	});
+
+	it("reports an error, not no-git, when the hook's cwd is missing but git is on PATH", async () => {
+		const result = await runPostCheckoutHook(path.join(root, "does-not-exist"), "a".repeat(40));
+		expect(result.status).toBe("error");
 	});
 
 	it("does not pass omp's GIT_DIR to the hook", async () => {
