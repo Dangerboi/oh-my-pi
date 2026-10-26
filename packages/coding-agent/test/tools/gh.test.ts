@@ -1296,7 +1296,8 @@ echo ok
 		}
 	});
 
-	describe("pr_checkout post-checkout hook", () => {
+	// Hook scripts and their path/signal assertions are POSIX sh, like the other hook suites.
+	describe.skipIf(process.platform === "win32")("pr_checkout post-checkout hook", () => {
 		let fixture: PrFixture;
 		let tempHome: TempHome;
 		let hookLog: string;
