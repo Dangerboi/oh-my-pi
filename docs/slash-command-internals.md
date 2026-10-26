@@ -407,10 +407,12 @@ session still moves into it; the output is `Worktree created, but
 post-checkout hook exited with <N>: <last line>` (or `... cancelled`), and
 `worktree.cleanSource` is skipped so the source checkout is left as it is.
 Without a `git` executable no hook runs and nothing is reported.
-Once git's hook process exits, `/wt` stops waiting on pipes a background process
-started by the hook still holds. That process keeps running, but its later writes
-to stdout/stderr fail with EPIPE. `pr_checkout` and `omp worktree add` behave the
-same way.
+About 250 ms after git's hook process exits, `/wt` (and `pr_checkout`) stop
+reading pipes a background process started by the hook still holds. That process
+keeps running, but its later writes to stdout/stderr fail with EPIPE.
+`omp worktree add` instead keeps forwarding until the output has been idle for
+250 ms, so a slow terminal still gets all of the hook's output; a background
+process that keeps writing holds the command open until it stops (Ctrl-C ends it).
 The `!cd` guard runs before shell execution and remains held through cwd adoption
 or rollback, so a refused command cannot leave the shell in a different directory.
 Cancelled pickers, invalid destinations, and failed moves retain the BTW conversation.

@@ -166,10 +166,12 @@ async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHoo
 	// After the hook exits the forwarders are cut only once idle for the grace period, so a slow
 	// `process.stderr` consumer keeps its buffered output while a background holder of the pipes is dropped.
 	let exited = false;
+	let aborted = false;
 	let busy = 0;
 	let timer: NodeJS.Timeout | undefined;
 	const arm = () => {
-		if (!exited) return;
+		// An aborted hook keeps its fixed cut; later output must not push it back.
+		if (!exited || aborted) return;
 		clearTimeout(timer);
 		timer = setTimeout(() => {
 			if (busy === 0) cut();
@@ -185,7 +187,6 @@ async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHoo
 		forward(child.stdout, stop, activity),
 		child.stderr ? forward(child.stderr, stop, activity) : undefined,
 	]);
-	let aborted = false;
 	let failure: unknown;
 	let exitCode: number | undefined;
 	try {
