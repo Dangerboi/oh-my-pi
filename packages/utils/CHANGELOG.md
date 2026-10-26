@@ -5,7 +5,7 @@
 ### Added
 
 - Added an opt-in `exitGraceMs` spawn option to `ptree` that stops reading stdout/stderr a short time after the root process exits, so a descendant holding the pipes open no longer blocks `wait()`; it kills nothing ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
-- Added a `stderr: "stream"` spawn option to `ptree` that hands `child.stderr` to the caller without retaining or draining it, so a stalled consumer backpressures the child ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
+- Added a `stderr: "stream"` spawn option to `ptree` that exposes `child.stderr` without retaining every chunk ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
 - Added `procmgr.getChildShellEnv()`, the launch-pinned child-shell environment the bash tool spawns with ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
 - Added an optional `maxFractionDigits` to `formatNumber()` that caps decimals on values below 1,000 ([#16973](https://github.com/can1357/oh-my-pi/pull/16973) by [@DusKing1](https://github.com/DusKing1))
 
