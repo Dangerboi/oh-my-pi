@@ -764,9 +764,10 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			} catch (err) {
 				return usage(`Worktree creation failed: ${errorMessage(err)}`, runtime);
 			}
+			// Report the hook first: a failed relocation still leaves the worktree it set up.
+			if (worktree.hookWarning) await runtime.output(`Warning: ${formatHookWarningNotice(worktree)}`);
 			const failure = await relocateHeadlessSession(runtime, worktree.path);
 			if (failure) return failure;
-			if (worktree.hookWarning) await runtime.output(`Warning: ${formatHookWarningNotice(worktree)}`);
 			const cleanup = worktree.hookWarning
 				? { cleaned: false, errorMessage: undefined }
 				: await cleanSourceCheckoutIfConfigured(sourceCwd, runtime.settings);

@@ -1363,6 +1363,65 @@ describe("wave 3 commands", () => {
 		},
 	);
 
+	it.skipIf(process.platform === "win32")(
+		"/wt: reports a failed hook's warning even when relocating the session then fails",
+		async () => {
+			const { output, runtime, fakeSessionManager } = createRuntime();
+			spyOn(runtime.session, "moveSession").mockRejectedValue(new Error("session move denied"));
+			const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-hook-reloc-")));
+			const repoDir = path.join(root, "repo");
+			const originalProjectDir = process.cwd();
+			const envKeys = [
+				"OMP_WORKTREE_DIR",
+				"GIT_CONFIG_GLOBAL",
+				"GIT_CONFIG_SYSTEM",
+				"GIT_CONFIG_NOSYSTEM",
+				"GIT_DIR",
+			];
+			const savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+			const git = async (...args: string[]) => {
+				const proc = Bun.spawn(["git", ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+				const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+				expect(code).toBe(0);
+				return stdout.trim();
+			};
+			try {
+				// Isolate from the developer's global git config (core.hooksPath).
+				await Bun.write(path.join(root, "gitconfig"), "");
+				process.env.GIT_CONFIG_GLOBAL = path.join(root, "gitconfig");
+				process.env.GIT_CONFIG_SYSTEM = path.join(root, "gitconfig");
+				process.env.GIT_CONFIG_NOSYSTEM = "1";
+				delete process.env.GIT_DIR;
+				process.env.OMP_WORKTREE_DIR = path.join(root, "wt");
+				await fs.mkdir(repoDir, { recursive: true });
+				await git("init", "-q", "-b", "main");
+				await git("config", "user.email", "t@example.com");
+				await git("config", "user.name", "t");
+				await Bun.write(path.join(repoDir, "tracked.txt"), "committed\n");
+				await git("add", "-A");
+				await git("commit", "-qm", "init");
+				const hookPath = path.join(repoDir, ".git", "hooks", "post-checkout");
+				await Bun.write(hookPath, "#!/bin/sh\necho 'setup broke' >&2\nexit 5\n");
+				await fs.chmod(hookPath, 0o755);
+				fakeSessionManager._cwd = repoDir;
+
+				await executeAcpBuiltinSlashCommand("/wt feature/reloc-fail", runtime);
+
+				const text = output.join("\n");
+				expect(text).toContain("post-checkout hook exited with 5: setup broke");
+				expect(text).toContain("Move failed: session move denied");
+				expect(await git("worktree", "list", "--porcelain")).toContain("branch refs/heads/feature/reloc-fail");
+			} finally {
+				setProjectDir(originalProjectDir);
+				for (const key of envKeys) {
+					if (savedEnv[key] === undefined) delete process.env[key];
+					else process.env[key] = savedEnv[key];
+				}
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("/wt: aborts and leaves source checkout untouched when settings flush fails", async () => {
 		const { output, runtime, fakeSessionManager } = createRuntime();
 		spyOn(runtime.settings, "flush").mockRejectedValue(new Error("disk full"));

@@ -6,7 +6,7 @@
  * A failed or cancelled hook never discards anything; callers keep the worktree
  * and surface {@link formatPostCheckoutHookWarning}.
  */
-import { procmgr, ptree, sanitizeText, stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils";
+import { $which, procmgr, ptree, sanitizeText, stripGitRepoLocationEnv, WhichCachePolicy } from "@oh-my-pi/pi-utils";
 import { sanitizeDisplayWarning, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 
 /** After git's hook process exits, stop waiting on pipes a background process still holds. */
@@ -155,7 +155,7 @@ export async function runPostCheckoutHook(
 		if (signal?.aborted) return { status: "cancelled" };
 		if (
 			(error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" &&
-			!Bun.which("git", { PATH: pathValue(env) })
+			!$which("git", { PATH: pathValue(env), cache: WhichCachePolicy.Fresh })
 		) {
 			return { status: "no-git" };
 		}

@@ -202,8 +202,7 @@ describe("CommandController /move", () => {
 			await new CommandController(ctx).handleWorktreeCommand("feature");
 
 			expect(ctx.editorContainer.children).toEqual([dialog]);
-			const focused = (ctx.ui.setFocus as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0]);
-			expect(focused.at(-1)).toBe(dialog);
+			expect(ctx.ui.setFocus).toHaveBeenLastCalledWith(dialog);
 		} finally {
 			await fs.rm(sourceDir, { recursive: true, force: true });
 		}
