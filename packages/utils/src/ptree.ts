@@ -708,7 +708,13 @@ function spawnInternal<In extends InMask = InMask>(
 				}
 			: rest.env,
 	});
-	const cp = new ChildProcess(child, stderr === "full" || stderr === "stream", retainFullStderr, detached === true, useSubreaper);
+	const cp = new ChildProcess(
+		child,
+		stderr === "full" || stderr === "stream",
+		retainFullStderr,
+		detached === true,
+		useSubreaper,
+	);
 	if (signal) cp.attachSignal(signal);
 	if (timeout > 0) cp.attachTimeout(timeout);
 	cp.attachExitGrace(exitGraceMs);
