@@ -35,6 +35,9 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		if (moved) state.completedBtwVisible = false;
 		return moved;
 	});
+	const editor = new Container();
+	const editorContainer = new Container();
+	editorContainer.addChild(editor);
 	const ctx = {
 		session: { isStreaming: false, moveSession },
 		sessionManager: {
@@ -55,8 +58,10 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		withBtwSessionMove,
 		updateEditorBorderColor: vi.fn(),
 		reloadTodos: vi.fn(async () => {}),
-		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
+		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), setFocus: vi.fn() },
 		statusContainer: new Container(),
+		editor,
+		editorContainer,
 		present,
 		shutdown,
 	} as unknown as InteractiveModeContext;
@@ -89,7 +94,7 @@ describe("CommandController /move", () => {
 			expect(state.completedBtwVisible).toBe(true);
 			expect(ctx.session.moveSession).not.toHaveBeenCalled();
 			expect(ctx.present).not.toHaveBeenCalled();
-			expect(ctx.statusContainer.children).toHaveLength(0);
+			expect(ctx.editorContainer.children).toEqual([ctx.editor]);
 		} finally {
 			await fs.rm(sourceDir, { recursive: true, force: true });
 		}
@@ -151,7 +156,7 @@ describe("CommandController /move", () => {
 			expect(commits).toBe(1);
 			expect(state.cwd).toBe(target);
 			expect(ctx.present).toHaveBeenCalled();
-			expect(ctx.statusContainer.children).toHaveLength(0);
+			expect(ctx.editorContainer.children).toEqual([ctx.editor]);
 		} finally {
 			created.resolve();
 			relocated.resolve();
@@ -171,7 +176,7 @@ describe("CommandController /move", () => {
 			expect(state.cwd).toBe(sourceDir);
 			expect(state.completedBtwVisible).toBe(true);
 			expect(ctx.session.moveSession).not.toHaveBeenCalled();
-			expect(ctx.statusContainer.children).toHaveLength(0);
+			expect(ctx.editorContainer.children).toEqual([ctx.editor]);
 			expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("Branch already exists"));
 		} finally {
 			await fs.rm(sourceDir, { recursive: true, force: true });
