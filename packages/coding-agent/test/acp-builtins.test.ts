@@ -1264,7 +1264,7 @@ describe("wave 3 commands", () => {
 		}
 	});
 
-	it("/wt: a cancelled runtime signal stops the hanging post-checkout hook, keeps the worktree and the source", async () => {
+	it.skipIf(process.platform === "win32")("/wt: a cancelled runtime signal stops the hanging post-checkout hook, keeps the worktree and the source", async () => {
 		const { output, runtime, fakeSessionManager } = createRuntime();
 		cfgWorktreeCleanSource.override(runtime.settings, true);
 		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-cancel-")));
@@ -1295,6 +1295,8 @@ describe("wave 3 commands", () => {
 			expect(code).toBe(0);
 			return stdout.trim();
 		};
+		const controller = new AbortController();
+		let pending: Promise<unknown> | undefined;
 		try {
 			// Isolate from the developer's global git config (core.hooksPath).
 			await Bun.write(path.join(root, "gitconfig"), "");
@@ -1317,9 +1319,7 @@ describe("wave 3 commands", () => {
 			await Bun.write(hookPath, "#!/bin/sh\nsleep 30 &\necho $! > child.pid\nwait\n");
 			await fs.chmod(hookPath, 0o755);
 			fakeSessionManager._cwd = repoDir;
-			const controller = new AbortController();
-
-			const pending = executeAcpBuiltinSlashCommand("/wt feature/cancel", {
+			pending = executeAcpBuiltinSlashCommand("/wt feature/cancel", {
 				...runtime,
 				signal: controller.signal,
 			});
@@ -1348,6 +1348,8 @@ describe("wave 3 commands", () => {
 			expect(await Bun.file(path.join(repoDir, "tracked.txt")).text()).toBe("edited\n");
 			expect(await git("worktree", "list", "--porcelain")).toContain("branch refs/heads/feature/cancel");
 		} finally {
+			controller.abort();
+			await pending?.catch(() => {});
 			if (childPid !== undefined && alive(childPid)) process.kill(childPid, "SIGKILL");
 			setProjectDir(originalProjectDir);
 			for (const key of envKeys) {

@@ -94,18 +94,23 @@ async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHoo
 	const { promise: stop, resolve: cut } = Promise.withResolvers<void>();
 	const pumps = Promise.all([forward(child.stdout, stop), child.stderr ? forward(child.stderr, stop) : undefined]);
 	let aborted = false;
+	let failure: unknown;
 	try {
 		await child.exited;
 	} catch (error) {
-		if (!(error instanceof ptree.Exception && error.aborted)) throw error;
-		aborted = true;
+		if (!(error instanceof ptree.Exception)) failure = error;
+		else aborted = error.aborted;
 	}
 	// ptree's own grace releases its readers; this timer only cancels the forwarding reads
 	// a background process still holds.
 	const timer = setTimeout(cut, HOOK_EXIT_GRACE_MS);
-	await pumps;
-	clearTimeout(timer);
-	cut();
+	try {
+		await pumps;
+	} finally {
+		clearTimeout(timer);
+		cut();
+	}
+	if (failure !== undefined) throw failure;
 	if (aborted) return { status: "cancelled" };
 	const exitCode = child.exitCode ?? -1;
 	return exitCode === 0 ? { status: "ok" } : { status: "failed", exitCode, output: "" };
