@@ -458,9 +458,7 @@ export async function checkoutPullRequest(
 			const existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
 			// Snapshot now: the creating call's hook may finish and drop its map
 			// entry while this call is still fetching or writing config.
-			const pendingHook = existingWorktree
-				? inFlightHooks.get(await fs.realpath(existingWorktree.path))
-				: undefined;
+			const pendingHook = existingWorktree ? inFlightHooks.get(await fs.realpath(existingWorktree.path)) : undefined;
 
 			const remote = await ensurePrRemoteWithRepo(repoRoot, data, repository, signal);
 			await repository.fetch(
