@@ -1752,9 +1752,10 @@ export class CommandController {
 			if (!(await this.#relocateSession(worktree.path))) return false;
 			created = worktree;
 			if (worktree.hookWarning) this.ctx.showWarning(formatHookWarningNotice(worktree));
-			const cleanup = worktree.keptChanges && !worktree.hookWarning
-				? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
-				: { cleaned: false, errorMessage: undefined };
+			const cleanup =
+				worktree.keptChanges && !worktree.hookWarning
+					? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
+					: { cleaned: false, errorMessage: undefined };
 			if (cleanup.errorMessage !== undefined) {
 				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
 			}
