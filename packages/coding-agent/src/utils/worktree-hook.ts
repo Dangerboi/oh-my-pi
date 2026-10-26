@@ -86,7 +86,10 @@ export async function runPostCheckoutHook(
 	}
 }
 
-async function inheritOutput(child: ptree.ChildProcess, signal: AbortSignal | undefined): Promise<PostCheckoutHookResult> {
+async function inheritOutput(
+	child: ptree.ChildProcess,
+	signal: AbortSignal | undefined,
+): Promise<PostCheckoutHookResult> {
 	const { promise: stop, resolve: cut } = Promise.withResolvers<void>();
 	const pumps = Promise.all([forward(child.stdout, stop), child.stderr ? forward(child.stderr, stop) : undefined]);
 	let aborted = false;
