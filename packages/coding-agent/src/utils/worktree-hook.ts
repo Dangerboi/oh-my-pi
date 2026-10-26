@@ -110,7 +110,9 @@ export async function runPostCheckoutHook(
 				env,
 				// Capture mode gets its own process group so an abort kills the whole hook tree. Inherit mode
 				// (`omp worktree add`, no signal) stays in omp's group so the terminal's Ctrl-C reaches the hook, as with git.
-				detached: output !== "inherit",
+				// Windows has no process groups to kill: `detached` there only means no console (child consoles pop up),
+				// and ptree's abort already kills the whole tree natively, so it is POSIX-only.
+				detached: output !== "inherit" && process.platform !== "win32",
 				signal,
 				exitGraceMs: HOOK_EXIT_GRACE_MS,
 				stderr: output === "inherit" ? "stream" : undefined,
