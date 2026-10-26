@@ -42,12 +42,24 @@ function tail(text: string): string {
 	return text.length > HOOK_OUTPUT_TAIL_CHARS ? text.slice(-HOOK_OUTPUT_TAIL_CHARS) : text;
 }
 
+/** Progress signals the forwarders give `inheritOutput`, which cuts them only once they have gone idle. */
+interface ForwardActivity {
+	/** A chunk was read or a drain wait ended. */
+	touch(): void;
+	/** `+1` while waiting on `process.stderr` to drain, `-1` when that wait ends. */
+	busy(delta: 1 | -1): void;
+}
+
 /**
  * Forward a pipe to `process.stderr` chunk by chunk until it closes or `stop` settles.
  * Live forwarding needs a manual reader loop; `inherit` is only used by the standalone
  * `omp worktree add` CLI, where `process.stderr` is the output sink.
  */
-async function forward(stream: ReadableStream<Uint8Array>, stop: Promise<void>): Promise<void> {
+async function forward(
+	stream: ReadableStream<Uint8Array>,
+	stop: Promise<void>,
+	activity: ForwardActivity,
+): Promise<void> {
 	const reader = stream.getReader();
 	// `stop` is observed once; a pending drain wait registers its release here instead of adding a reaction per write.
 	let stopped = false;
@@ -61,6 +73,7 @@ async function forward(stream: ReadableStream<Uint8Array>, stop: Promise<void>):
 		for (;;) {
 			const chunk = await reader.read();
 			if (chunk.done) break;
+			activity.touch();
 			// A false return means process.stderr's buffer is full; wait for it to drain instead of
 			// growing it. Bun.spawn still reads the hook's pipes eagerly, so this doesn't slow the hook.
 			// Once forwarding is cut, nothing would release the wait, so don't start one.
@@ -75,7 +88,10 @@ async function forward(stream: ReadableStream<Uint8Array>, stop: Promise<void>):
 				process.stderr.once("drain", done);
 				process.stderr.once("close", done);
 				releaseDrain = done;
+				activity.busy(1);
 				await promise;
+				activity.busy(-1);
+				activity.touch();
 			}
 		}
 	} catch {
@@ -91,6 +107,12 @@ function hookEnv(): Record<string, string> {
 	const env = procmgr.getChildShellEnv();
 	stripGitRepoLocationEnv(env);
 	return env;
+}
+
+/** `PATH` from an env whose key may be spelled `Path` (Windows env keys are case-insensitive). */
+function pathValue(env: Record<string, string>): string {
+	const key = Object.keys(env).find(name => name.toUpperCase() === "PATH");
+	return key === undefined ? "" : env[key];
 }
 
 /** Run `post-checkout` for a worktree just created at `worktreeRoot` whose HEAD is `head`. */
@@ -131,7 +153,7 @@ export async function runPostCheckoutHook(
 		if (signal?.aborted) return { status: "cancelled" };
 		if (
 			(error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" &&
-			!Bun.which("git", { PATH: env.PATH ?? "" })
+			!Bun.which("git", { PATH: pathValue(env) })
 		) {
 			return { status: "no-git" };
 		}
@@ -141,7 +163,28 @@ export async function runPostCheckoutHook(
 
 async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHookResult> {
 	const { promise: stop, resolve: cut } = Promise.withResolvers<void>();
-	const pumps = Promise.all([forward(child.stdout, stop), child.stderr ? forward(child.stderr, stop) : undefined]);
+	// After the hook exits the forwarders are cut only once idle for the grace period, so a slow
+	// `process.stderr` consumer keeps its buffered output while a background holder of the pipes is dropped.
+	let exited = false;
+	let busy = 0;
+	let timer: NodeJS.Timeout | undefined;
+	const arm = () => {
+		if (!exited) return;
+		clearTimeout(timer);
+		timer = setTimeout(() => {
+			if (busy === 0) cut();
+		}, HOOK_EXIT_GRACE_MS);
+	};
+	const activity: ForwardActivity = {
+		touch: arm,
+		busy: delta => {
+			busy += delta;
+		},
+	};
+	const pumps = Promise.all([
+		forward(child.stdout, stop, activity),
+		child.stderr ? forward(child.stderr, stop, activity) : undefined,
+	]);
 	let aborted = false;
 	let failure: unknown;
 	let exitCode: number | undefined;
@@ -152,9 +195,10 @@ async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHoo
 		else if (error.aborted) aborted = true;
 		else exitCode = error.exitCode;
 	}
-	// ptree's own grace releases its readers; this timer only cancels the forwarding reads
-	// a background process still holds.
-	const timer = setTimeout(cut, HOOK_EXIT_GRACE_MS);
+	exited = true;
+	// An aborted hook is not waited on for a slow consumer: forwarding ends after the grace regardless.
+	if (aborted) timer = setTimeout(cut, HOOK_EXIT_GRACE_MS);
+	else arm();
 	try {
 		await pumps;
 	} finally {

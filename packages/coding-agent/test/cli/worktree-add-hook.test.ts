@@ -108,6 +108,15 @@ describe.skipIf(process.platform === "win32")("worktree add checkout hooks", () 
 		}
 	}, 15_000);
 
+	it("delivers all hook output to a slow stderr consumer after the hook exits", async () => {
+		const bytes = 20_000_000;
+		await hook(`head -c ${bytes} /dev/zero | tr '\\0' '\\1' >&2`);
+		// The consumer is a real pipe reader that starts late; a stalled OS pipe is the scenario, so no fake timers.
+		const script = '"$0" "$1" worktree add --detach "$2" HEAD 2>&1 | { sleep 2; tr -cd "\\001" | wc -c; }';
+		const result = await $`sh -c ${script} ${process.execPath} ${cli} ${path.join(root, "slow")}`.cwd(repo).quiet().nothrow();
+		expect(Number.parseInt(result.stdout.toString().trim(), 10)).toBe(bytes);
+	}, 30_000);
+
 	// Real child processes and signals: the polls below wait on OS state, which fake timers cannot drive.
 	it("stops the hook when the terminal's process group receives Ctrl-C", async () => {
 		const pidFile = path.join(root, "hook.pid");
