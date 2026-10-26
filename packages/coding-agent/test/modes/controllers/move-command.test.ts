@@ -58,7 +58,12 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		withBtwSessionMove,
 		updateEditorBorderColor: vi.fn(),
 		reloadTodos: vi.fn(async () => {}),
-		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), setFocus: vi.fn(), getFocused: vi.fn(() => editor) },
+		ui: {
+			requestRender: vi.fn(),
+			requestComponentRender: vi.fn(),
+			setFocus: vi.fn(),
+			getFocused: vi.fn(() => editor),
+		},
 		statusContainer: new Container(),
 		editor,
 		editorContainer,
