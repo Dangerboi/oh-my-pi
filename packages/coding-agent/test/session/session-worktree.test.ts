@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
-import { setWorktreesDir } from "@oh-my-pi/pi-utils";
+import { __resetProjectDirCacheForTests, procmgr, setProjectDir, setWorktreesDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import {
 	canAutoCreateWorktree,
@@ -383,6 +383,26 @@ describe.skipIf(process.platform === "win32")("session worktree post-checkout ho
 		// Git itself points GIT_DIR at the new worktree's gitdir; it must not be omp's.
 		expect(seen).toContain(path.join(repo, ".git", "worktrees"));
 		expect(seen).not.toBe(ompGitDir);
+	});
+
+	it("does not pass the launch project's dotenv-only values to the hook", async () => {
+		const launch = path.join(root, "launch");
+		await fs.mkdir(launch);
+		await Bun.write(path.join(launch, ".env"), "OMP_HOOK_DOTENV_ONLY=from-launch-dotenv\n");
+		await installHook('printf "%s" "${OMP_HOOK_DOTENV_ONLY-unset}" > hook.out');
+		// Bun loads the launch project's dotenv into process.env; the new worktree has no .env of its own.
+		procmgr.__resetShellConfigCacheForTests();
+		__resetProjectDirCacheForTests();
+		setProjectDir(launch);
+		process.env.OMP_HOOK_DOTENV_ONLY = "from-launch-dotenv";
+		try {
+			const wt = await create();
+			expect(await Bun.file(path.join(wt.path, "hook.out")).text()).toBe("unset");
+		} finally {
+			delete process.env.OMP_HOOK_DOTENV_ONLY;
+			procmgr.__resetShellConfigCacheForTests();
+			__resetProjectDirCacheForTests();
+		}
 	});
 
 	it("returns promptly when the hook leaves a background process holding its output", async () => {

@@ -6,7 +6,7 @@
  * A failed or cancelled hook never discards anything; callers keep the worktree
  * and surface {@link formatPostCheckoutHookWarning}.
  */
-import { filterChildShellEnv, ptree, sanitizeText } from "@oh-my-pi/pi-utils";
+import { procmgr, ptree, sanitizeText, stripGitRepoLocationEnv } from "@oh-my-pi/pi-utils";
 import { sanitizeDisplayWarning, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 
 /** After git's hook process exits, stop waiting on pipes a background process still holds. */
@@ -48,11 +48,37 @@ async function forward(stream: ReadableStream<Uint8Array>, stop: Promise<void>):
 		for (;;) {
 			const chunk = await reader.read();
 			if (chunk.done) break;
-			process.stderr.write(chunk.value);
+			// A false return means the sink's buffer is full; wait for it to drain so a slow or
+			// redirected stderr cannot make the buffer grow without bound.
+			if (!process.stderr.write(chunk.value)) await drained(stop);
 		}
 	} catch {
 		// A cancelled read ends the forwarding.
 	}
+}
+
+/** Resolve when `process.stderr` emits `drain`, or when `stop` settles (forwarding is cut). */
+function drained(stop: Promise<void>): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const done = () => {
+		process.stderr.off("drain", done);
+		process.stderr.off("close", done);
+		resolve();
+	};
+	process.stderr.once("drain", done);
+	process.stderr.once("close", done);
+	void stop.then(done);
+	return promise;
+}
+
+/**
+ * The bash tool's child-shell env (dotenv values of the launch project filtered out, as procmgr
+ * pinned them), re-stripped of git repository-location vars in case they were set after the capture.
+ */
+function hookEnv(): Record<string, string> {
+	const env = procmgr.getChildShellEnv();
+	stripGitRepoLocationEnv(env);
+	return env;
 }
 
 /** Run `post-checkout` for a worktree just created at `worktreeRoot` whose HEAD is `head`. */
@@ -68,7 +94,7 @@ export async function runPostCheckoutHook(
 			["git", "hook", "run", "--ignore-missing", "post-checkout", "--", "0".repeat(head.length), head, "1"],
 			{
 				cwd: worktreeRoot,
-				env: filterChildShellEnv(process.env, worktreeRoot),
+				env: hookEnv(),
 				// Capture mode gets its own process group so an abort kills the whole hook tree. Inherit mode
 				// (`omp worktree add`, no signal) stays in omp's group so the terminal's Ctrl-C reaches the hook, as with git.
 				detached: output !== "inherit",

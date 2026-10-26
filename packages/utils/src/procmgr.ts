@@ -38,13 +38,22 @@ let capturedChildShellEnv: Record<string, string> | undefined;
 let spawnEnvProjectDir: string | undefined;
 
 /**
+ * The dotenv-filtered child-shell environment the bash tool builds on: the capture from
+ * {@link refreshShellConfigCache} when there is one, else the live environment filtered
+ * against the launch project. A fresh copy; callers may mutate it.
+ */
+export function getChildShellEnv(): Record<string, string> {
+	spawnEnvProjectDir ??= getProjectDir();
+	return { ...(capturedChildShellEnv ?? filterChildShellEnv(Bun.env, spawnEnvProjectDir)) };
+}
+
+/**
  * Build the spawn environment (cached).
  */
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $env.PI_BASH_NO_CI || $env.CLAUDE_BASH_NO_CI;
-	spawnEnvProjectDir ??= getProjectDir();
 	return {
-		...(capturedChildShellEnv ?? filterChildShellEnv(Bun.env, spawnEnvProjectDir)),
+		...getChildShellEnv(),
 		SHELL: shell,
 		GIT_EDITOR: "true",
 		GPG_TTY: "not a tty",
