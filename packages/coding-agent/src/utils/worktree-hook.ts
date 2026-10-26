@@ -43,32 +43,35 @@ function tail(text: string): string {
  */
 async function forward(stream: ReadableStream<Uint8Array>, stop: Promise<void>): Promise<void> {
 	const reader = stream.getReader();
-	void stop.then(() => reader.cancel().catch(() => {}));
+	// `stop` is observed once; a pending drain wait registers its release here instead of adding a reaction per write.
+	let releaseDrain: (() => void) | undefined;
+	void stop.then(() => {
+		releaseDrain?.();
+		return reader.cancel().catch(() => {});
+	});
 	try {
 		for (;;) {
 			const chunk = await reader.read();
 			if (chunk.done) break;
 			// A false return means the sink's buffer is full; wait for it to drain so a slow or
 			// redirected stderr cannot make the buffer grow without bound.
-			if (!process.stderr.write(chunk.value)) await drained(stop);
+			if (!process.stderr.write(chunk.value)) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				const done = () => {
+					process.stderr.off("drain", done);
+					process.stderr.off("close", done);
+					releaseDrain = undefined;
+					resolve();
+				};
+				process.stderr.once("drain", done);
+				process.stderr.once("close", done);
+				releaseDrain = done;
+				await promise;
+			}
 		}
 	} catch {
 		// A cancelled read ends the forwarding.
 	}
-}
-
-/** Resolve when `process.stderr` emits `drain`, or when `stop` settles (forwarding is cut). */
-function drained(stop: Promise<void>): Promise<void> {
-	const { promise, resolve } = Promise.withResolvers<void>();
-	const done = () => {
-		process.stderr.off("drain", done);
-		process.stderr.off("close", done);
-		resolve();
-	};
-	process.stderr.once("drain", done);
-	process.stderr.once("close", done);
-	void stop.then(done);
-	return promise;
 }
 
 /**
