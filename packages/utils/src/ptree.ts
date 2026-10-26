@@ -8,6 +8,8 @@
  */
 
 import { Process, type ProcessTerminateOptions } from "@oh-my-pi/pi-natives";
+import { spawn as nodeSpawn } from "node:child_process";
+import { Readable } from "node:stream";
 import type { Spawn, Subprocess } from "bun";
 
 type InMask = "pipe" | "ignore" | Buffer | Uint8Array | null;
@@ -218,8 +220,12 @@ export class ChildProcess<In extends InMask = InMask> {
 			if (this.#stderrTail.length > NonZeroExitError.MAX_TRACE)
 				this.#stderrTail = this.#stderrTail.slice(-NonZeroExitError.MAX_TRACE);
 		};
+		const streamOnly = exposeStderr && !retainFullStderr;
 		let stderrStream = proc.stderr;
-		if (exposeStderr) {
+		if (streamOnly) {
+			// The caller owns the raw pipe; ptree never reads it, so a stalled consumer backpressures the child.
+			this.#stderrStream = stderrStream;
+		} else if (exposeStderr) {
 			const [teeStream, drainStream] = stderrStream.tee();
 			this.#stderrStream = teeStream;
 			stderrStream = drainStream;
@@ -228,32 +234,45 @@ export class ChildProcess<In extends InMask = InMask> {
 		const { promise, resolve, reject } = Promise.withResolvers<number>();
 		this.#exited = promise;
 
-		this.#stderrDone = (async () => {
-			const reader = stderrStream.getReader();
-			this.#pipeReaders.add(reader);
-			try {
-				for (;;) {
-					if (this.#cutoff) {
-						await reader.cancel().catch(() => {});
-						break;
-					}
-					const r = await reader.read();
-					if (r.done) break;
-					this.#stderrChunks?.push(r.value);
-					this.#stderrTail += dec.decode(r.value, { stream: true });
-					trim();
-				}
-			} catch {}
-			this.#pipeReaders.delete(reader);
+		if (streamOnly) {
 			this.#openPipeReaders--;
-			this.#stderrTail += dec.decode();
-			trim();
-		})();
+			this.#stderrDone = Promise.resolve();
+		} else {
+			this.#stderrDone = (async () => {
+				const reader = stderrStream.getReader();
+				this.#pipeReaders.add(reader);
+				try {
+					for (;;) {
+						if (this.#cutoff) {
+							await reader.cancel().catch(() => {});
+							break;
+						}
+						const r = await reader.read();
+						if (r.done) break;
+						this.#stderrChunks?.push(r.value);
+						this.#stderrTail += dec.decode(r.value, { stream: true });
+						trim();
+					}
+				} catch {}
+				this.#pipeReaders.delete(reader);
+				this.#openPipeReaders--;
+				this.#stderrTail += dec.decode();
+				trim();
+			})();
+		}
 
+		let launchFailure: unknown;
 		proc.exited
-			.catch(() => null)
+			.catch(error => {
+				if (error !== null && typeof error === "object" && launchFailures.has(error)) launchFailure = error;
+				return null;
+			})
 			.then(async exitCode => {
 				this.#startExitGrace();
+				if (launchFailure !== undefined) {
+					reject(launchFailure);
+					return;
+				}
 				if (this.#exitReasonPending) {
 					this.#exitReason = this.#exitReasonPending;
 					reject(this.#exitReasonPending);
@@ -672,8 +691,11 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	subreaper?: boolean;
 	/**
 	 * `"full"` exposes `child.stderr` and retains complete stderr for a later `wait({ stderr: "full" })`.
-	 * `"stream"` exposes `child.stderr` only; chunks are not retained, so memory stays bounded
-	 * (the internal tail is still capped) for callers that consume the stream themselves.
+	 * `"stream"` hands the stderr pipe to the caller as `child.stderr`: ptree never reads it, so a stalled
+	 * consumer backpressures the child (Bun's own pipes buffer unboundedly, so this mode spawns through
+	 * `node:child_process`; stdout is backpressured too and only `stdin: "ignore"` is supported). The
+	 * caller MUST consume (or cancel) both streams; there is no stderr tail, so `NonZeroExitError.stderr`
+	 * and `peekStderr()` stay empty. A command that cannot be launched rejects `exited` with the launch error.
 	 */
 	stderr?: "full" | "stream" | null;
 	/**
@@ -684,6 +706,60 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	exitGraceMs?: number;
 };
 
+/** Launch errors of the node-backed spawn; the exit handler rethrows them instead of reporting an exit code. */
+const launchFailures = new WeakSet<object>();
+
+/**
+ * Spawn through `node:child_process`, whose pipes honour consumer backpressure. Bun's own
+ * `Subprocess` stdout/stderr are read natively at full speed into an unbounded buffer, so a stalled
+ * consumer never blocks the child. Only the members ptree uses are provided.
+ */
+function spawnBackpressured<In extends InMask>(
+	cmd: string[],
+	opts: { cwd?: string; env?: Record<string, string | undefined>; detached?: boolean; stdin?: unknown },
+): PipedSubprocess<In> {
+	if (opts.stdin !== undefined && opts.stdin !== "ignore") {
+		throw new Error('spawn with stderr: "stream" supports only stdin: "ignore"');
+	}
+	const child = nodeSpawn(cmd[0], cmd.slice(1), {
+		cwd: opts.cwd,
+		env: opts.env,
+		detached: opts.detached,
+		windowsHide: true,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	const { promise: exited, resolve, reject } = Promise.withResolvers<number | null>();
+	child.on("error", error => {
+		// Without a pid the process never started; with one, the error is a failed kill and the exit event still follows.
+		if (child.pid !== undefined) return;
+		launchFailures.add(error);
+		reject(error);
+	});
+	child.once("exit", code => resolve(code));
+	// stdout/stderr are null only if the spawn failed.
+	const toWeb = (readable: Readable | null) =>
+		readable ? (Readable.toWeb(readable) as ReadableStream<Uint8Array>) : new ReadableStream<Uint8Array>();
+	const proc = {
+		pid: child.pid ?? -1,
+		exited,
+		stdin: null,
+		stdout: toWeb(child.stdout),
+		stderr: toWeb(child.stderr),
+		get exitCode() {
+			// A process that never started has nothing to kill; a non-null code short-circuits ptree's kill paths.
+			return child.pid === undefined ? -1 : child.exitCode;
+		},
+		get signalCode() {
+			return child.signalCode;
+		},
+		get killed() {
+			return child.killed;
+		},
+		kill: (signal?: NodeJS.Signals | number) => child.kill(signal),
+	};
+	return proc as unknown as PipedSubprocess<In>;
+}
+
 function spawnInternal<In extends InMask = InMask>(
 	cmd: string[],
 	opts: ChildSpawnOptions<In> | undefined,
@@ -692,22 +768,27 @@ function spawnInternal<In extends InMask = InMask>(
 	const { timeout = -1, signal, stderr, detached, subreaper = false, exitGraceMs = 0, ...rest } = opts ?? {};
 	const useSubreaper = subreaper && process.platform === "linux";
 	const commandEnv = rest.env ?? Bun.env;
-	const child = Bun.spawn(useSubreaper ? [process.execPath, "-e", LINUX_SUBREAPER_SCRIPT] : cmd, {
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
-		windowsHide: true,
-		detached,
-		...rest,
-		env: useSubreaper
-			? {
-					...commandEnv,
-					BUN_BE_BUN: "1",
-					[LINUX_SUBREAPER_COMMAND_ENV]: JSON.stringify(cmd),
-					[LINUX_SUBREAPER_BUN_BE_BUN_ENV]: commandEnv.BUN_BE_BUN,
-				}
-			: rest.env,
-	});
+	const spawnCmd = useSubreaper ? [process.execPath, "-e", LINUX_SUBREAPER_SCRIPT] : cmd;
+	const spawnEnv = useSubreaper
+		? {
+				...commandEnv,
+				BUN_BE_BUN: "1",
+				[LINUX_SUBREAPER_COMMAND_ENV]: JSON.stringify(cmd),
+				[LINUX_SUBREAPER_BUN_BE_BUN_ENV]: commandEnv.BUN_BE_BUN,
+			}
+		: rest.env;
+	const child =
+		stderr === "stream"
+			? spawnBackpressured<In>(spawnCmd, { cwd: rest.cwd, env: spawnEnv, detached, stdin: rest.stdin })
+			: Bun.spawn(spawnCmd, {
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+					windowsHide: true,
+					detached,
+					...rest,
+					env: spawnEnv,
+				});
 	const cp = new ChildProcess(
 		child,
 		stderr === "full" || stderr === "stream",

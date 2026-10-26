@@ -97,4 +97,33 @@ describe("ptree stderr capture", () => {
 		expect(result.stderr).toEndWith(STDERR_TAIL);
 		expect(growth).toBeLessThan(8 * 1024 * 1024);
 	});
+
+	it("applies pipe backpressure to an unread stderr stream", async () => {
+		const size = 8 * 1024 * 1024;
+		using child = spawn(stderrFixture(size), { stderr: "stream" });
+		const stderrStream = child.stderr;
+		if (!stderrStream) throw new Error("Expected exposed stderr stream");
+
+		// Nobody reads yet: the pipe fills and the child blocks in its write.
+		await Bun.sleep(500);
+		expect(child.exitCode).toBeNull();
+
+		let received = 0;
+		for await (const chunk of stderrStream) received += chunk.byteLength;
+		expect(received).toBe(size);
+		expect(await child.exited).toBe(0);
+		expect(child.peekStderr()).toBe("");
+	});
+
+	it("surfaces the launch error when a streamed command cannot start", async () => {
+		// Bun reports a missing executable either by throwing from spawn or by an error event, depending on context.
+		let error: unknown;
+		try {
+			using child = spawn(["omp-no-such-command-for-ptree-test"], { stderr: "stream" });
+			await child.exited;
+		} catch (caught) {
+			error = caught;
+		}
+		expect((error as NodeJS.ErrnoException | undefined)?.code).toBe("ENOENT");
+	});
 });
