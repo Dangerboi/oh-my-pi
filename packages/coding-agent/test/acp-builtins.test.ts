@@ -1264,6 +1264,100 @@ describe("wave 3 commands", () => {
 		}
 	});
 
+	it("/wt: a cancelled runtime signal stops the hanging post-checkout hook, keeps the worktree and the source", async () => {
+		const { output, runtime, fakeSessionManager } = createRuntime();
+		cfgWorktreeCleanSource.override(runtime.settings, true);
+		const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-cancel-")));
+		const repoDir = path.join(root, "repo");
+		const worktreeBase = path.join(root, "wt");
+		const originalProjectDir = process.cwd();
+		const envKeys = [
+			"OMP_WORKTREE_DIR",
+			"GIT_CONFIG_GLOBAL",
+			"GIT_CONFIG_SYSTEM",
+			"GIT_CONFIG_NOSYSTEM",
+			"GIT_DIR",
+			"HOME",
+		];
+		const savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+		let childPid: number | undefined;
+		const alive = (pid: number) => {
+			try {
+				process.kill(pid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		const git = async (...args: string[]) => {
+			const proc = Bun.spawn(["git", ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+			const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+			expect(code).toBe(0);
+			return stdout.trim();
+		};
+		try {
+			// Isolate from the developer's global git config (core.hooksPath).
+			await Bun.write(path.join(root, "gitconfig"), "");
+			process.env.GIT_CONFIG_GLOBAL = path.join(root, "gitconfig");
+			process.env.GIT_CONFIG_SYSTEM = path.join(root, "gitconfig");
+			process.env.GIT_CONFIG_NOSYSTEM = "1";
+			process.env.HOME = root;
+			delete process.env.GIT_DIR;
+			process.env.OMP_WORKTREE_DIR = worktreeBase;
+			await fs.mkdir(repoDir, { recursive: true });
+			await git("init", "-q", "-b", "main");
+			await git("config", "user.email", "t@example.com");
+			await git("config", "user.name", "t");
+			await git("config", "core.autocrlf", "false");
+			await Bun.write(path.join(repoDir, "tracked.txt"), "committed\n");
+			await git("add", "-A");
+			await git("commit", "-qm", "init");
+			await Bun.write(path.join(repoDir, "tracked.txt"), "edited\n");
+			const hookPath = path.join(repoDir, ".git", "hooks", "post-checkout");
+			await Bun.write(hookPath, "#!/bin/sh\nsleep 30 &\necho $! > child.pid\nwait\n");
+			await fs.chmod(hookPath, 0o755);
+			fakeSessionManager._cwd = repoDir;
+			const controller = new AbortController();
+
+			const pending = executeAcpBuiltinSlashCommand("/wt feature/cancel", {
+				...runtime,
+				signal: controller.signal,
+			});
+			// Real subprocess: bounded polling for the hook's pid file; no event to await.
+			let pidFile: string | undefined;
+			for (let i = 0; i < 200 && !pidFile; i++) {
+				const entries = await fs.readdir(worktreeBase, { recursive: true }).catch(() => []);
+				const found = entries.find(entry => entry.endsWith("child.pid"));
+				if (found) pidFile = path.join(worktreeBase, found);
+				else await Bun.sleep(50);
+			}
+			if (!pidFile) throw new Error("hook never started");
+			await Bun.sleep(50);
+			childPid = Number((await Bun.file(pidFile).text()).trim());
+			controller.abort();
+			const result = await pending;
+
+			expect(result).toEqual({ consumed: true });
+			const movedTo = fakeSessionManager._movedTo;
+			expect(movedTo).toBeDefined();
+			expect(output.join("\n")).toContain("post-checkout hook cancelled");
+			expect(output.join("\n")).toContain(`Moved to worktree ${movedTo} on branch feature/cancel`);
+			for (let i = 0; i < 100 && alive(childPid); i++) await Bun.sleep(50);
+			expect(alive(childPid)).toBe(false);
+			// A cancelled hook keeps the source checkout as it was, despite cleanSource=true.
+			expect(await Bun.file(path.join(repoDir, "tracked.txt")).text()).toBe("edited\n");
+			expect(await git("worktree", "list", "--porcelain")).toContain("branch refs/heads/feature/cancel");
+		} finally {
+			if (childPid !== undefined && alive(childPid)) process.kill(childPid, "SIGKILL");
+			setProjectDir(originalProjectDir);
+			for (const key of envKeys) {
+				if (savedEnv[key] === undefined) delete process.env[key];
+				else process.env[key] = savedEnv[key];
+			}
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("/wt: aborts and leaves source checkout untouched when settings flush fails", async () => {
 		const { output, runtime, fakeSessionManager } = createRuntime();
 		spyOn(runtime.settings, "flush").mockRejectedValue(new Error("disk full"));
