@@ -114,11 +114,14 @@ behavior {
 			"aster-07-15" "gpt-image-2.5-sunburst" "gpt-image-2.5-flare" "gemini-3-pro-image-preview"
 	}
 	// Subscription eligibility for model-aware Codex credential routing.
+	// GPT-6.1 Terra launched for Plus, Pro, Enterprise, and Edu, not Free/Go
+	// (https://openai.com/index/introducing-gpt-6-1-terra/, 2026-10-26).
 	plan-requirement provider="openai-codex" {
 		tier "pro" substring="-spark"
 		tier "paid" exact="gpt-5.6" exact="gpt-5.6-sol" exact="gpt-5.6-sol-pro" \
 			exact="gpt-5.6-luna" exact="gpt-5.6-luna-pro" glob="*/gpt-5.6" glob="*/gpt-5.6-sol" \
-			glob="*/gpt-5.6-sol-pro" glob="*/gpt-5.6-luna" glob="*/gpt-5.6-luna-pro"
+			glob="*/gpt-5.6-sol-pro" glob="*/gpt-5.6-luna" glob="*/gpt-5.6-luna-pro" \
+			glob="gpt-6.1-terra*" glob="*/gpt-6.1-terra*"
 	}
 
 	// Z.AI and Zhipu emit timezone-naive account-reset wall clocks in Beijing
