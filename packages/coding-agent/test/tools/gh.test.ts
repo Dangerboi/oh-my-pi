@@ -1407,33 +1407,36 @@ echo ok
 			mockPr(306);
 			mockPr(306);
 			const tool = new GithubTool(createSession(fixture.repoRoot));
-			const first = tool.execute("pr-checkout-a", { op: "pr_checkout", pr: "306" });
-			const deadline = Date.now() + 15_000;
-			while (!(await Bun.file(started).exists())) {
-				if (Date.now() > deadline) throw new Error("hook never started");
-				// A real child process signals readiness only through the filesystem; there is no event to await.
-				await Bun.sleep(25);
-			}
-
-			// Hold the second call inside its lock section, at its fetch, until the first hook has finished.
-			const { promise: gate, resolve: openGate } = Promise.withResolvers<void>();
-			const { promise: insideLock, resolve: markInsideLock } = Promise.withResolvers<void>();
+			const abort = new AbortController();
+			const first = tool.execute("pr-checkout-a", { op: "pr_checkout", pr: "306" }, abort.signal);
+			const gateState = Promise.withResolvers<void>();
+			const openGate = gateState.resolve;
 			const realRequireGit = vcs.requireGit;
-			const requireGitSpy = vi.spyOn(vcs, "requireGit").mockImplementation(root => {
-				const repo = realRequireGit(root);
-				return new Proxy(repo, {
-					get(target, prop) {
-						const value = Reflect.get(target, prop, target);
-						if (prop !== "fetch") return typeof value === "function" ? value.bind(target) : value;
-						return async (...args: unknown[]) => {
-							markInsideLock();
-							await gate;
-							return (value as (...a: unknown[]) => Promise<unknown>).apply(target, args);
-						};
-					},
-				});
-			});
+			const requireGitSpy = vi.spyOn(vcs, "requireGit");
 			try {
+				const deadline = Date.now() + 15_000;
+				while (!(await Bun.file(started).exists())) {
+					if (Date.now() > deadline) throw new Error("hook never started");
+					// A real child process signals readiness only through the filesystem; there is no event to await.
+					await Bun.sleep(25);
+				}
+
+				// Hold the second call inside its lock section, at its fetch, until the first hook has finished.
+				const { promise: insideLock, resolve: markInsideLock } = Promise.withResolvers<void>();
+				requireGitSpy.mockImplementation(root => {
+					const repo = realRequireGit(root);
+					return new Proxy(repo, {
+						get(target, prop) {
+							const value = Reflect.get(target, prop, target);
+							if (prop !== "fetch") return typeof value === "function" ? value.bind(target) : value;
+							return async (...args: unknown[]) => {
+								markInsideLock();
+								await gateState.promise;
+								return (value as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+							};
+						},
+					});
+				});
 				const second = tool.execute("pr-checkout-b", { op: "pr_checkout", pr: "306" });
 				await insideLock;
 				await fs.writeFile(release, "");
@@ -1449,6 +1452,9 @@ echo ok
 			} finally {
 				openGate();
 				requireGitSpy.mockRestore();
+				await fs.writeFile(release, "").catch(() => {});
+				abort.abort();
+				await first.catch(() => {});
 			}
 		}, 30_000);
 
