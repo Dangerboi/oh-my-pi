@@ -17,9 +17,10 @@ const HOOK_OUTPUT_TAIL_CHARS = 4096;
 export interface PostCheckoutHookOptions {
 	/**
 	 * `capture` keeps a bounded tail of the hook's output for the warning.
-	 * (A later mode forwards the output live to the terminal.)
+	 * `inherit` forwards stdout and stderr live to `process.stderr` (git sends a
+	 * hook's stdout to stderr) and reports a failure with an empty `output`.
 	 */
-	output?: "capture";
+	output?: "capture" | "inherit";
 	/** Stops the hook's whole process tree. An already-aborted signal skips the hook. */
 	signal?: AbortSignal;
 }
@@ -35,13 +36,28 @@ function tail(text: string): string {
 	return text.length > HOOK_OUTPUT_TAIL_CHARS ? text.slice(-HOOK_OUTPUT_TAIL_CHARS) : text;
 }
 
+/** Forward a pipe to `process.stderr` chunk by chunk until it closes or `stop` settles. */
+async function forward(stream: ReadableStream<Uint8Array>, stop: Promise<void>): Promise<void> {
+	const reader = stream.getReader();
+	void stop.then(() => reader.cancel().catch(() => {}));
+	try {
+		for (;;) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			process.stderr.write(chunk.value);
+		}
+	} catch {
+		// A cancelled read ends the forwarding.
+	}
+}
+
 /** Run `post-checkout` for a worktree just created at `worktreeRoot` whose HEAD is `head`. */
 export async function runPostCheckoutHook(
 	worktreeRoot: string,
 	head: string,
 	options: PostCheckoutHookOptions = {},
 ): Promise<PostCheckoutHookResult> {
-	const { signal } = options;
+	const { signal, output = "capture" } = options;
 	if (signal?.aborted) return { status: "cancelled" };
 	try {
 		const child = ptree.spawn(
@@ -52,8 +68,10 @@ export async function runPostCheckoutHook(
 				detached: true,
 				signal,
 				exitGraceMs: HOOK_EXIT_GRACE_MS,
+				stderr: output === "inherit" ? "full" : undefined,
 			},
 		);
+		if (output === "inherit") return await inheritOutput(child, signal);
 		const result = await child.wait({ allowNonZero: true, allowAbort: true });
 		if (result.exitError?.aborted) return { status: "cancelled" };
 		if (result.ok) return { status: "ok" };
@@ -66,6 +84,26 @@ export async function runPostCheckoutHook(
 		if (signal?.aborted) return { status: "cancelled" };
 		return { status: "error", message: error instanceof Error ? error.message : String(error) };
 	}
+}
+
+async function inheritOutput(child: ptree.ChildProcess, signal: AbortSignal | undefined): Promise<PostCheckoutHookResult> {
+	const { promise: stop, resolve: cut } = Promise.withResolvers<void>();
+	const pumps = Promise.all([forward(child.stdout, stop), child.stderr ? forward(child.stderr, stop) : undefined]);
+	let aborted = false;
+	try {
+		await child.exited;
+	} catch (error) {
+		if (!(error instanceof ptree.Exception && error.aborted)) throw error;
+		aborted = true;
+	}
+	// Stop reading pipes a background process still holds once the grace period passes.
+	const timer = setTimeout(cut, HOOK_EXIT_GRACE_MS);
+	await pumps;
+	clearTimeout(timer);
+	cut();
+	if (aborted || signal?.aborted) return { status: "cancelled" };
+	const exitCode = child.exitCode ?? -1;
+	return exitCode === 0 ? { status: "ok" } : { status: "failed", exitCode, output: "" };
 }
 
 /** One-line, display-ready warning for a hook result, or undefined when nothing went wrong. */
