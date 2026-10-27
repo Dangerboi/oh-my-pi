@@ -16,11 +16,11 @@ const HOOK_OUTPUT_TAIL_CHARS = 4096;
 
 export interface PostCheckoutHookOptions {
 	/**
-	 * `capture` keeps a bounded tail of the hook's output for the warning.
-	 * `inherit` forwards stdout and stderr live to `process.stderr` (git sends a
-	 * hook's stdout to stderr) and reports a failure with an empty `output`.
+	 * Without a sink the runner keeps a bounded tail of the hook's output for the warning.
+	 * With one it forwards stdout and stderr live to it (git sends a hook's stdout to
+	 * stderr, so a CLI passes `process.stderr`) and reports a failure with an empty `output`.
 	 */
-	output?: "capture" | "inherit";
+	forwardTo?: NodeJS.WritableStream;
 	/**
 	 * Kills the hook's process group on POSIX (native tree kill on Windows). A descendant that
 	 * `setsid`s into its own session is not reached; git does not reach it either. On Windows,
@@ -44,21 +44,21 @@ function tail(text: string): string {
 	return text.length > HOOK_OUTPUT_TAIL_CHARS ? text.slice(-HOOK_OUTPUT_TAIL_CHARS) : text;
 }
 
-/** Progress signals the forwarders give `inheritOutput`, which cuts them only once they have gone idle. */
+/** Progress signals the forwarders give `forwardOutput`, which cuts them only once they have gone idle. */
 interface ForwardActivity {
 	/** A chunk was read or a drain wait ended. */
 	touch(): void;
-	/** `+1` while waiting on `process.stderr` to drain, `-1` when that wait ends. */
+	/** `+1` while waiting on the sink to drain, `-1` when that wait ends. */
 	busy(delta: 1 | -1): void;
 }
 
 /**
- * Forward a pipe to `process.stderr` chunk by chunk until it closes or `stop` settles.
- * Live forwarding needs a manual reader loop; `inherit` is only used by the standalone
- * `omp worktree add` CLI, where `process.stderr` is the output sink.
+ * Forward a pipe to `sink` chunk by chunk until it closes or `stop` settles.
+ * Live forwarding needs a manual reader loop: no central helper streams into a sink with a cut-off.
  */
 async function forward(
 	stream: ReadableStream<Uint8Array>,
+	sink: NodeJS.WritableStream,
 	stop: Promise<void>,
 	activity: ForwardActivity,
 ): Promise<void> {
@@ -76,19 +76,19 @@ async function forward(
 			const chunk = await reader.read();
 			if (chunk.done) break;
 			activity.touch();
-			// A false return means process.stderr's buffer is full; wait for it to drain instead of
+			// A false return means the sink's buffer is full; wait for it to drain instead of
 			// growing it. Bun.spawn still reads the hook's pipes eagerly, so this doesn't slow the hook.
 			// Once forwarding is cut, nothing would release the wait, so don't start one.
-			if (!process.stderr.write(chunk.value) && !stopped) {
+			if (!sink.write(chunk.value) && !stopped) {
 				const { promise, resolve } = Promise.withResolvers<void>();
 				const done = () => {
-					process.stderr.off("drain", done);
-					process.stderr.off("close", done);
+					sink.off("drain", done);
+					sink.off("close", done);
 					releaseDrain = undefined;
 					resolve();
 				};
-				process.stderr.once("drain", done);
-				process.stderr.once("close", done);
+				sink.once("drain", done);
+				sink.once("close", done);
 				releaseDrain = done;
 				activity.busy(1);
 				await promise;
@@ -123,11 +123,12 @@ export async function runPostCheckoutHook(
 	head: string,
 	options: PostCheckoutHookOptions = {},
 ): Promise<PostCheckoutHookResult> {
-	const { signal, output = "capture" } = options;
+	const { signal, forwardTo } = options;
 	if (signal?.aborted) return { status: "cancelled" };
 	const env = hookEnv();
-	// Spawn the git `$which` found (including its macOS Xcode/CLT fallback) so lookup and execution agree.
-	const git = $which("git", { PATH: pathValue(env), cache: WhichCachePolicy.Fresh });
+	// Spawn the git `$which` finds (including its macOS Xcode/CLT fallback) so lookup and execution agree;
+	// a relative PATH entry resolves against the hook's cwd, as a bare `git` spawn there would.
+	const git = $which("git", { PATH: pathValue(env), cwd: worktreeRoot, cache: WhichCachePolicy.Fresh });
 	if (!git) return { status: "no-git" };
 	try {
 		const child = ptree.spawn(
@@ -135,17 +136,17 @@ export async function runPostCheckoutHook(
 			{
 				cwd: worktreeRoot,
 				env,
-				// Capture mode gets its own process group so an abort kills the whole hook tree. Inherit mode
+				// Capture mode gets its own process group so an abort kills the whole hook tree. Forwarding
 				// (`omp worktree add`, no signal) stays in omp's group so the terminal's Ctrl-C reaches the hook, as with git.
 				// Windows has no process groups to kill: `detached` there only means no console (child consoles pop up),
 				// and ptree's abort already kills the whole tree natively, so it is POSIX-only.
-				detached: output !== "inherit" && process.platform !== "win32",
+				detached: forwardTo === undefined && process.platform !== "win32",
 				signal,
 				exitGraceMs: HOOK_EXIT_GRACE_MS,
-				stderr: output === "inherit" ? "stream" : undefined,
+				stderr: forwardTo ? "stream" : undefined,
 			},
 		);
-		if (output === "inherit") return await inheritOutput(child);
+		if (forwardTo) return await forwardOutput(child, forwardTo);
 		const result = await child.wait({ allowNonZero: true, allowAbort: true });
 		if (result.exitError?.aborted) return { status: "cancelled" };
 		if (result.ok) return { status: "ok" };
@@ -160,10 +161,10 @@ export async function runPostCheckoutHook(
 	}
 }
 
-async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHookResult> {
+async function forwardOutput(child: ptree.ChildProcess, sink: NodeJS.WritableStream): Promise<PostCheckoutHookResult> {
 	const { promise: stop, resolve: cut } = Promise.withResolvers<void>();
 	// After the hook exits the forwarders are cut only once idle for the grace period, so a slow
-	// `process.stderr` consumer keeps its buffered output while a background holder of the pipes is dropped.
+	// sink consumer keeps its buffered output while a background holder of the pipes is dropped.
 	let exited = false;
 	let aborted = false;
 	let busy = 0;
@@ -183,8 +184,8 @@ async function inheritOutput(child: ptree.ChildProcess): Promise<PostCheckoutHoo
 		},
 	};
 	const pumps = Promise.all([
-		forward(child.stdout, stop, activity),
-		child.stderr ? forward(child.stderr, stop, activity) : undefined,
+		forward(child.stdout, sink, stop, activity),
+		child.stderr ? forward(child.stderr, sink, stop, activity) : undefined,
 	]);
 	let failure: unknown;
 	let exitCode: number | undefined;

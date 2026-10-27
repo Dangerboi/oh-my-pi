@@ -162,7 +162,7 @@ export async function addWorktree(options: AddWorktreeOptions): Promise<void> {
 	if (result.cloneError) {
 		console.error(chalk.dim(`warning: worktree clone fell back to plain checkout: ${result.cloneError}`));
 	}
-	const hook = await runPostCheckoutHook(worktreePath, commit.sha, { output: "inherit" });
+	const hook = await runPostCheckoutHook(worktreePath, commit.sha, { forwardTo: process.stderr });
 	if (hook.status === "failed") process.exitCode = hook.exitCode;
 	else if (hook.status === "error") {
 		console.error(chalk.dim(`warning: ${formatPostCheckoutHookWarning(hook)}`));

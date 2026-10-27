@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
-import { __resetProjectDirCacheForTests, procmgr, setProjectDir, setWorktreesDir } from "@oh-my-pi/pi-utils";
+import { $which, __resetProjectDirCacheForTests, procmgr, setProjectDir, setWorktreesDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
 import {
 	canAutoCreateWorktree,
@@ -401,7 +401,8 @@ describe.skipIf(process.platform === "win32")("session worktree post-checkout ho
 
 	it("runs the hook with the git the lookup resolves when that git is not on the hook's PATH", async () => {
 		// Models $which's macOS fallback to Xcode/CLT git, which a bare `git` spawn on this PATH cannot find.
-		const realGit = Bun.which("git");
+		// $which calls Bun.which on every lookup, so spying on Bun.which is its test seam.
+		const realGit = $which("git");
 		const realWhich = Bun.which;
 		const bunDir = path.join(root, "bin");
 		await fs.mkdir(bunDir);
@@ -419,6 +420,26 @@ describe.skipIf(process.platform === "win32")("session worktree post-checkout ho
 			expect((await Bun.file(path.join(repo, "hook.out")).text()).trim()).toBe(repo);
 		} finally {
 			whichSpy.mockRestore();
+			if (savedPath === undefined) delete process.env.PATH;
+			else process.env.PATH = savedPath;
+			procmgr.__resetShellConfigCacheForTests();
+		}
+	});
+
+	it("resolves a relative PATH entry against the worktree, as a bare git spawn there would", async () => {
+		const realGit = $which("git");
+		const wrapper = path.join(repo, "hookbin", "git");
+		await Bun.write(wrapper, `#!/bin/sh\nexec '${realGit}' "$@"\n`);
+		await fs.chmod(wrapper, 0o755);
+		await installHook("pwd -P > hook.out");
+		const head = git(repo, "rev-parse", "HEAD").trim();
+		const savedPath = process.env.PATH;
+		process.env.PATH = "hookbin";
+		procmgr.__resetShellConfigCacheForTests();
+		try {
+			expect(await runPostCheckoutHook(repo, head)).toEqual({ status: "ok" });
+			expect((await Bun.file(path.join(repo, "hook.out")).text()).trim()).toBe(repo);
+		} finally {
 			if (savedPath === undefined) delete process.env.PATH;
 			else process.env.PATH = savedPath;
 			procmgr.__resetShellConfigCacheForTests();

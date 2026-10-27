@@ -264,6 +264,8 @@ export function formatPrCheckoutResult(options: {
 		reused ? `# Pull Request #${data.number ?? "?"} Worktree` : `# Checked Out Pull Request #${data.number ?? "?"}`,
 		"",
 	];
+	// First, so the collapsed tool card (which shows only the first lines) still shows it.
+	pushLine(lines, "Warning", warning);
 	pushLine(lines, "Title", data.title ?? undefined);
 	pushLine(lines, "URL", data.url);
 	pushLine(lines, "Base", data.baseRefName);
@@ -278,7 +280,6 @@ export function formatPrCheckoutResult(options: {
 	pushLine(lines, "Remote URL", remoteUrl);
 	pushLine(lines, "Cross repository", data.isCrossRepository);
 	pushLine(lines, "Maintainer can modify", data.maintainerCanModify);
-	pushLine(lines, "Warning", warning);
 	lines.push("");
 	lines.push(
 		reused

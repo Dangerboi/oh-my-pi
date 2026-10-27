@@ -17,6 +17,7 @@ import {
 import { parseIssueUrl, parsePullRequestUrl } from "@oh-my-pi/pi-coding-agent/tools/gh-common";
 import { sanitizeRemoteName } from "@oh-my-pi/pi-coding-agent/tools/gh-pr-checkout";
 import { github } from "@oh-my-pi/pi-coding-agent/utils/github";
+import { PREVIEW_LIMITS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { withRepoLock } from "@oh-my-pi/pi-coding-agent/utils/repo-lock";
 import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
@@ -1369,14 +1370,15 @@ echo ok
 			expect(await readHookLines()).toEqual(afterFirst);
 		}, 30_000);
 
-		it("reports a failing hook as a warning in the result text", async () => {
+		it("reports a failing hook as a warning within the collapsed card's lines", async () => {
 			await installHook(`echo "first line" >&2\necho "boom: nope" >&2\nexit 7`);
 			mockPr(303);
 			const tool = new GithubTool(createSession(fixture.repoRoot));
 			const result = await tool.execute("pr-checkout", { op: "pr_checkout", pr: "303" });
 			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 
-			expect(text).toContain("Warning: post-checkout hook exited with 7: boom: nope");
+			const preview = text.split("\n").slice(0, PREVIEW_LIMITS.OUTPUT_EXPANDED);
+			expect(preview).toContain("Warning: post-checkout hook exited with 7: boom: nope");
 			expect(result.details?.checkouts?.[0]?.reused).toBe(false);
 		}, 30_000);
 

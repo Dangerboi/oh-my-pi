@@ -4,7 +4,7 @@
 
 ### Added
 
-- `pr_checkout` now runs the `post-checkout` hook for a new PR worktree like `git worktree add`, and a failing hook adds a warning to the result ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
+- `pr_checkout` now runs the `post-checkout` hook for a new PR worktree like `git worktree add`; a failing hook adds a warning to the result, and a second checkout of the same PR waits for the running hook ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
 - `/wt` (including `worktree.onStart` and ACP) now runs the new worktree's `post-checkout` hook like `git worktree add`; a failing or cancelled hook (Esc in the TUI, prompt cancel in ACP) keeps the worktree, shows a warning, and skips `worktree.cleanSource` ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
 - Added `tools.restrictedFolders`: every action on a listed folder (the folder and everything below it) asks for an explicit Approve/Deny in every approval mode, `yolo` included, and no remembered grant, session approval, or ACP "Always allow" covers it; recursive searches rooted above a restricted folder ask too, commands are matched by the directory they run in, and a `deny` policy still denies ([#16049](https://github.com/can1357/oh-my-pi/pull/16049) by [@Peribunt](https://github.com/Peribunt))
 - `/pause` shows draining turns and running jobs across the main agent's subagent tree, without waiting on finished turns, safely parked agents, or suspended advisor reviews ([#17073](https://github.com/can1357/oh-my-pi/pull/17073) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
@@ -21,7 +21,7 @@
 - Reduced redraws during background subagent progress while keeping elapsed previews and native checklists current ([#17131](https://github.com/can1357/oh-my-pi/pull/17131) by [@iliaal](https://github.com/iliaal), based on [#16647](https://github.com/can1357/oh-my-pi/pull/16647) by [@Komzpa](https://github.com/Komzpa)).
 - Restoring a session with many subagents refreshes the running-subagent badge and lists once per burst instead of once per agent ([#16642](https://github.com/can1357/oh-my-pi/pull/16642) by [@Komzpa](https://github.com/Komzpa))
 - `ask` answers now name the option a note is on (`m: [X, Y] (note on Y: …)`, `User added note on Y: …`) ([#17126](https://github.com/can1357/oh-my-pi/pull/17126) by [@H4vC](https://github.com/H4vC))
-- `omp worktree add` shows the `post-checkout` hook's output as it arrives and still exits with the hook's failure status ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
+- `omp worktree add` shows the `post-checkout` hook's output as it arrives and exits with the hook's failure status, or 1 when git can't run the hook ([#17130](https://github.com/can1357/oh-my-pi/pull/17130) by [@Dangerboi](https://github.com/Dangerboi))
 
 ## [18.13.0] - 2026-10-26
 
