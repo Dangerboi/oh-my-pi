@@ -37,7 +37,7 @@ export type PostCheckoutHookResult =
 	| { status: "cancelled" }
 	/** Git could not run the hook at all (spawn failure); `message` is git's or the OS's own text. */
 	| { status: "error"; message: string }
-	/** `git` is not on the hook environment's PATH; nothing ran and nothing is reported. Any other spawn failure is `error`. */
+	/** No `git` executable was found for the hook environment's PATH; nothing ran and nothing is reported. Any other spawn failure is `error`. */
 	| { status: "no-git" };
 
 function tail(text: string): string {
@@ -126,9 +126,12 @@ export async function runPostCheckoutHook(
 	const { signal, output = "capture" } = options;
 	if (signal?.aborted) return { status: "cancelled" };
 	const env = hookEnv();
+	// Spawn the git `$which` found (including its macOS Xcode/CLT fallback) so lookup and execution agree.
+	const git = $which("git", { PATH: pathValue(env), cache: WhichCachePolicy.Fresh });
+	if (!git) return { status: "no-git" };
 	try {
 		const child = ptree.spawn(
-			["git", "hook", "run", "--ignore-missing", "post-checkout", "--", "0".repeat(head.length), head, "1"],
+			[git, "hook", "run", "--ignore-missing", "post-checkout", "--", "0".repeat(head.length), head, "1"],
 			{
 				cwd: worktreeRoot,
 				env,
@@ -153,12 +156,6 @@ export async function runPostCheckoutHook(
 		};
 	} catch (error) {
 		if (signal?.aborted) return { status: "cancelled" };
-		if (
-			(error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" &&
-			!$which("git", { PATH: pathValue(env), cache: WhichCachePolicy.Fresh })
-		) {
-			return { status: "no-git" };
-		}
 		return { status: "error", message: error instanceof Error ? error.message : String(error) };
 	}
 }

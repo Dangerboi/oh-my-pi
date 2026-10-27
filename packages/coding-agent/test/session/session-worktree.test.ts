@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -393,6 +393,32 @@ describe.skipIf(process.platform === "win32")("session worktree post-checkout ho
 			expect(worktreePaths(repo)).toContain(wt.path);
 			expect(wt.hookWarning).toBeUndefined();
 		} finally {
+			if (savedPath === undefined) delete process.env.PATH;
+			else process.env.PATH = savedPath;
+			procmgr.__resetShellConfigCacheForTests();
+		}
+	});
+
+	it("runs the hook with the git the lookup resolves when that git is not on the hook's PATH", async () => {
+		// Models $which's macOS fallback to Xcode/CLT git, which a bare `git` spawn on this PATH cannot find.
+		const realGit = Bun.which("git");
+		const realWhich = Bun.which;
+		const bunDir = path.join(root, "bin");
+		await fs.mkdir(bunDir);
+		await fs.symlink(process.execPath, path.join(bunDir, "bun"));
+		await installHook("pwd -P > hook.out");
+		const head = git(repo, "rev-parse", "HEAD").trim();
+		const savedPath = process.env.PATH;
+		process.env.PATH = bunDir;
+		procmgr.__resetShellConfigCacheForTests();
+		const whichSpy = vi
+			.spyOn(Bun, "which")
+			.mockImplementation((command, options) => (command === "git" ? realGit : realWhich(command, options)));
+		try {
+			expect(await runPostCheckoutHook(repo, head)).toEqual({ status: "ok" });
+			expect((await Bun.file(path.join(repo, "hook.out")).text()).trim()).toBe(repo);
+		} finally {
+			whichSpy.mockRestore();
 			if (savedPath === undefined) delete process.env.PATH;
 			else process.env.PATH = savedPath;
 			procmgr.__resetShellConfigCacheForTests();
