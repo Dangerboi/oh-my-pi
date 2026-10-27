@@ -97,7 +97,7 @@ export const cfgWorktreeCleanSource = register({
 		group: "Isolation",
 		label: "Clean Source Checkout on /wt",
 		description:
-			"When creating a worktree with `/wt`, reset tracked changes and remove untracked files from the original checkout after carrying them over",
+			"When creating a worktree with `/wt`, reset tracked changes and remove untracked files from the original checkout after carrying them over; skipped when the worktree's post-checkout hook fails or is cancelled",
 	},
 });
 

@@ -396,7 +396,7 @@ export interface PrCheckoutOutcome {
 	headRefName: string;
 	reused: boolean;
 	clonedWith?: IsoBackendKind;
-	/** Display-ready post-checkout hook warning; set only when the hook failed. */
+	/** Display-ready post-checkout hook warning: the hook failed or could not run, or (for a concurrent reuser) was cancelled. */
 	warning?: string;
 }
 
