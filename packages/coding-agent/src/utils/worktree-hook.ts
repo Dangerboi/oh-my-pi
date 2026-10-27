@@ -22,7 +22,8 @@ export interface PostCheckoutHookOptions {
 	 */
 	forwardTo?: NodeJS.WritableStream;
 	/**
-	 * Kills the hook's process group on POSIX (native tree kill on Windows). A descendant that
+	 * Kills the hook's process group on POSIX; with `forwardTo` (the hook stays in omp's group, see the
+	 * spawn) and on Windows, ptree's native tree kill is used instead. A descendant that
 	 * `setsid`s into its own session is not reached; git does not reach it either. On Windows,
 	 * Git runs hooks through MSYS `sh`, whose child processes have no living Windows parent, so
 	 * the tree kill ends git and the call returns, but commands the hook started keep running.
@@ -37,7 +38,7 @@ export type PostCheckoutHookResult =
 	| { status: "cancelled" }
 	/** Git could not run the hook at all (spawn failure); `message` is git's or the OS's own text. */
 	| { status: "error"; message: string }
-	/** No `git` executable was found for the hook environment's PATH; nothing ran and nothing is reported. Any other spawn failure is `error`. */
+	/** No `git` executable was found for the hook environment's PATH; nothing ran. Callers decide what to report: `/wt` and `pr_checkout` stay silent, `omp worktree add` warns and exits 1. Any other spawn failure is `error`. */
 	| { status: "no-git" };
 
 function tail(text: string): string {
@@ -75,6 +76,8 @@ async function forward(
 		for (;;) {
 			const chunk = await reader.read();
 			if (chunk.done) break;
+			// A sink that has ended or been destroyed takes no more output; stop forwarding this pipe.
+			if (!sink.writable) break;
 			activity.touch();
 			// A false return means the sink's buffer is full; wait for it to drain instead of
 			// growing it. Bun.spawn still reads the hook's pipes eagerly, so this doesn't slow the hook.
@@ -127,8 +130,9 @@ export async function runPostCheckoutHook(
 	if (signal?.aborted) return { status: "cancelled" };
 	const env = hookEnv();
 	// Spawn the git `$which` finds (including its macOS Xcode/CLT fallback) so lookup and execution agree;
-	// a relative PATH entry resolves against the hook's cwd, as a bare `git` spawn there would.
-	const git = $which("git", { PATH: pathValue(env), cwd: worktreeRoot, cache: WhichCachePolicy.Fresh });
+	// a relative PATH entry resolves against the hook's cwd, as a bare `git` spawn there would. Bypass the
+	// cache: its key includes the cwd, so every new worktree would add an entry never read again.
+	const git = $which("git", { PATH: pathValue(env), cwd: worktreeRoot, cache: WhichCachePolicy.Bypass });
 	if (!git) return { status: "no-git" };
 	try {
 		const child = ptree.spawn(
@@ -183,6 +187,10 @@ async function forwardOutput(child: ptree.ChildProcess, sink: NodeJS.WritableStr
 			busy += delta;
 		},
 	};
+	// A sink that fails (EPIPE once whoever read omp's stderr has gone) must neither crash omp nor
+	// hold a drain wait open: the rest of the output is dropped.
+	const onSinkError = () => cut();
+	sink.on("error", onSinkError);
 	const pumps = Promise.all([
 		forward(child.stdout, sink, stop, activity),
 		child.stderr ? forward(child.stderr, sink, stop, activity) : undefined,
@@ -205,6 +213,7 @@ async function forwardOutput(child: ptree.ChildProcess, sink: NodeJS.WritableStr
 	} finally {
 		clearTimeout(timer);
 		cut();
+		sink.off("error", onSinkError);
 	}
 	if (failure !== undefined) throw failure;
 	if (aborted) return { status: "cancelled" };

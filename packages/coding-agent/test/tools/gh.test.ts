@@ -1359,15 +1359,15 @@ echo ok
 			await installHook(`echo "$(pwd -P)|$2" >> "${hookLog}"`);
 			mockPr(302);
 			const tool = new GithubTool(createSession(fixture.repoRoot));
-			await tool.execute("pr-checkout", { op: "pr_checkout", pr: "302" });
-			const afterFirst = await readHookLines();
-			expect(afterFirst.length).toBeGreaterThan(0);
+			const first = await tool.execute("pr-checkout", { op: "pr_checkout", pr: "302" });
+			const worktree = first.details?.checkouts?.[0]?.worktreePath ?? "";
+			expect(await readHookLines()).toEqual([`${worktree}|${fixture.headRefOid}`]);
 
 			mockPr(302);
 			const second = await tool.execute("pr-checkout", { op: "pr_checkout", pr: "302" });
 
 			expect(second.details?.checkouts?.[0]?.reused).toBe(true);
-			expect(await readHookLines()).toEqual(afterFirst);
+			expect(await readHookLines()).toEqual([`${worktree}|${fixture.headRefOid}`]);
 		}, 30_000);
 
 		it("reports a failing hook as a warning within the collapsed card's lines", async () => {

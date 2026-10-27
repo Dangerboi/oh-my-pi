@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Writable } from "node:stream";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { $which, __resetProjectDirCacheForTests, procmgr, setProjectDir, setWorktreesDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
@@ -443,6 +444,22 @@ describe.skipIf(process.platform === "win32")("session worktree post-checkout ho
 			if (savedPath === undefined) delete process.env.PATH;
 			else process.env.PATH = savedPath;
 			procmgr.__resetShellConfigCacheForTests();
+		}
+	});
+
+	it("returns the hook's status when the output sink fails or is already destroyed", async () => {
+		await installHook("for i in 1 2 3 4 5; do echo line $i >&2; done; exit 3");
+		const head = git(repo, "rev-parse", "HEAD").trim();
+		// A failing write is what process.stderr does once its reader has gone (EPIPE).
+		const failing = new Writable({ write: (_chunk, _encoding, callback) => callback(new Error("EPIPE")) });
+		const destroyed = new Writable({ write: (_chunk, _encoding, callback) => callback() });
+		destroyed.destroy();
+		for (const sink of [failing, destroyed]) {
+			expect(await runPostCheckoutHook(repo, head, { forwardTo: sink })).toEqual({
+				status: "failed",
+				exitCode: 3,
+				output: "",
+			});
 		}
 	});
 
